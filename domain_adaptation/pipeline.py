@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, is_dataclass, replace
 from itertools import combinations
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
@@ -29,8 +29,23 @@ from .data_utils import (
 )
 from .models.cdtrans import CDTransConfig, CDTransPipeline
 from .models.common import ArrayDataset
+from .models.dl_erm import DLERMConfig, DLERMPipeline, DLERMRunResult
+from .models.dl_dann import DLDANNConfig, DLDANNPipeline, DLDANNRunResult
+from .models.dl_irm import DLIRMConfig, DLIRMPipeline, DLIRMRunResult
+from .models.dl_csd import DLCSConfig, DLCSDPipeline, DLCSRunResult
+from .models.dl_mldg import DLMldgConfig, DLMldgPipeline, DLMldgRunResult
+from .models.dl_clustering import DLClusteringConfig, DLClusteringPipeline, DLClusteringRunResult
+from .models.dl_siamese import DLSiameseConfig, DLSiamesePipeline, DLSiameseRunResult
+from .models.dl_reorder import DLReorderConfig, DLReorderPipeline, DLReorderRunResult
+from .models.dl_masf import DLMASFConfig, DLMASFPipeline, DLMASFRunResult
+from .models.tabpfn import TabPFNConfig, TabPFNPipeline, TabPFNRunResult
 from .models.tree import LightGBMConfig, LightGBMPipeline
 from .models.transformer import TransformerConfig, TransformerPipeline
+
+try:
+    import optuna
+except Exception:  # pragma: no cover
+    optuna = None
 
 
 @dataclass
@@ -124,13 +139,32 @@ def _to_array_dataset(
     scaler: StandardScaler,
     *,
     clip_value: Optional[float] = None,
+    domain_values: Optional[np.ndarray] = None,
+    domain_id: Optional[int] = None,
 ) -> ArrayDataset:
+    feature_dim = scaler.mean_.shape[0]
     if frame.empty:
-        return ArrayDataset(np.empty((0, scaler.mean_.shape[0]), dtype=np.float32), np.empty((0,), dtype=np.float32))
+        empty_X = np.empty((0, feature_dim), dtype=np.float32)
+        empty_y = np.empty((0,), dtype=np.float32)
+        if domain_values is not None:
+            domain_arr = np.empty((0,), dtype=np.int64)
+        elif domain_id is not None:
+            domain_arr = np.empty((0,), dtype=np.int64)
+        else:
+            domain_arr = None
+        return ArrayDataset(empty_X, empty_y, domain_arr)
+
     matrix = scaler.transform(frame.values).astype(np.float32)
     if clip_value is not None and clip_value > 0:
         matrix = np.clip(matrix, -clip_value, clip_value)
-    return ArrayDataset(matrix, labels.astype(np.float32))
+    domain_arr: Optional[np.ndarray]
+    if domain_values is not None:
+        domain_arr = np.asarray(domain_values, dtype=np.int64)
+    elif domain_id is not None:
+        domain_arr = np.full(labels.shape, int(domain_id), dtype=np.int64)
+    else:
+        domain_arr = None
+    return ArrayDataset(matrix, labels.astype(np.float32), domain_arr)
 
 
 def _combine_sources(datasets: Sequence[ArrayDataset]) -> ArrayDataset:
@@ -138,7 +172,11 @@ def _combine_sources(datasets: Sequence[ArrayDataset]) -> ArrayDataset:
         return ArrayDataset(np.empty((0, 0), dtype=np.float32), np.empty((0,), dtype=np.float32))
     X = np.vstack([ds.X for ds in datasets]) if len(datasets) > 1 else datasets[0].X
     y = np.concatenate([ds.y for ds in datasets]) if len(datasets) > 1 else datasets[0].y
-    return ArrayDataset(X, y)
+    if all(ds.domains is not None for ds in datasets):
+        domains = np.concatenate([ds.domains for ds in datasets]) if len(datasets) > 1 else datasets[0].domains
+    else:
+        domains = None
+    return ArrayDataset(X, y, domains)
 
 
 def _split_array_dataset(
@@ -150,17 +188,26 @@ def _split_array_dataset(
         return dataset, None
     ratio = max(0.0, min(float(val_ratio), 0.5 if val_ratio < 1.0 else 1.0))
     stratify = dataset.y if len(np.unique(dataset.y)) > 1 else None
+    indices = np.arange(dataset.X.shape[0])
     try:
-        X_train, X_val, y_train, y_val = train_test_split(
-            dataset.X,
-            dataset.y,
+        idx_train, idx_val = train_test_split(
+            indices,
             test_size=ratio,
             random_state=seed,
             stratify=stratify,
         )
     except ValueError:
         return dataset, None
-    return ArrayDataset(X_train, y_train), ArrayDataset(X_val, y_val)
+    X_train = dataset.X[idx_train]
+    y_train = dataset.y[idx_train]
+    X_val = dataset.X[idx_val]
+    y_val = dataset.y[idx_val]
+    if dataset.domains is not None:
+        d_train = dataset.domains[idx_train]
+        d_val = dataset.domains[idx_val]
+    else:
+        d_train = d_val = None
+    return ArrayDataset(X_train, y_train, d_train), ArrayDataset(X_val, y_val, d_val)
 
 
 def _resolve_target_ratios(
@@ -217,6 +264,151 @@ def _resolve_feature_strategy(strategy: str, fine_tune_ratios: Sequence[float]) 
     if all(r <= 0.0 for r in ratios):
         return "source_union"
     return "all_union"
+
+
+def _tuning_ratio(fine_tune_ratios: Sequence[float]) -> Optional[float]:
+    for ratio in fine_tune_ratios:
+        if ratio > 0:
+            return float(ratio)
+    return None
+
+
+def _suggest_dl_hyperparams(trial: "optuna.Trial") -> Dict[str, object]:
+    hidden_dim = trial.suggest_categorical("hidden_dim", [64, 128, 256, 512])
+    num_layers = trial.suggest_int("num_layers", 1, 4)
+    pretrain_epochs = trial.suggest_categorical("pretrain_epochs", [50, 100, 200, 300])
+    finetune_epochs = trial.suggest_categorical("finetune_epochs", [10, 25, 50, 100])
+    adapt_epochs = trial.suggest_categorical("adapt_epochs", [5, 10, 20, 40])
+    return {
+        "hidden_dims": tuple([int(hidden_dim)] * int(num_layers)),
+        "pretrain_epochs": int(pretrain_epochs),
+        "finetune_epochs": int(finetune_epochs),
+        "adapt_epochs": int(adapt_epochs),
+    }
+
+
+def _run_dl_tuning_trial(
+    model_name: str,
+    config: object,
+    *,
+    pretrain_train: ArrayDataset,
+    pretrain_val: Optional[ArrayDataset],
+    train: ArrayDataset,
+    val: ArrayDataset,
+    evaluation: ArrayDataset,
+    seed: int,
+) -> float:
+    if val.X.size == 0:
+        return float("-inf")
+    if model_name == "dl_erm":
+        pipeline = DLERMPipeline(config)
+    elif model_name == "dl_clustering":
+        pipeline = DLClusteringPipeline(config)
+    elif model_name == "dl_siamese":
+        pipeline = DLSiamesePipeline(config)
+    elif model_name == "dl_reorder":
+        pipeline = DLReorderPipeline(config)
+    elif model_name == "dl_masf":
+        pipeline = DLMASFPipeline(config)
+    elif model_name == "dl_dann":
+        pipeline = DLDANNPipeline(config)
+    elif model_name == "dl_irm":
+        pipeline = DLIRMPipeline(config)
+    elif model_name == "dl_csd":
+        pipeline = DLCSDPipeline(config)
+    elif model_name == "dl_mldg":
+        pipeline = DLMldgPipeline(config)
+        source_dataset = pretrain_train
+        if source_dataset.X.size == 0 or source_dataset.domains is None or source_dataset.domains.size == 0:
+            return float("-inf")
+        val_source = pretrain_val if pretrain_val is not None else source_dataset
+        result = pipeline.run(
+            seed=seed,
+            pretrain=source_dataset,
+            pretrain_val=val_source,
+            train=source_dataset,
+            val=val_source,
+            adapt=None,
+            evaluation=evaluation,
+        )
+        return float(result.val_auroc)
+    else:
+        raise ValueError(f"Unsupported DL model '{model_name}' for tuning")
+
+    result = pipeline.run(
+        seed=seed,
+        pretrain=pretrain_train,
+        pretrain_val=pretrain_val,
+        train=train,
+        val=val,
+        adapt=None,
+        evaluation=evaluation,
+    )
+    return float(result.val_auroc)
+
+
+def _tune_dl_model(
+    model_name: str,
+    base_config: object,
+    *,
+    pretrain_train: ArrayDataset,
+    pretrain_val: Optional[ArrayDataset],
+    train: ArrayDataset,
+    val: ArrayDataset,
+    evaluation: ArrayDataset,
+    seed: int,
+    trials: int,
+) -> object:
+    if optuna is None:
+        raise ImportError("optuna is required to tune DL models")
+    sampler = optuna.samplers.TPESampler(seed=seed)
+    study = optuna.create_study(direction="maximize", sampler=sampler)
+
+    def objective(trial: "optuna.Trial") -> float:
+        params = _suggest_dl_hyperparams(trial)
+        tuned_config = replace(base_config, **params)
+        score = _run_dl_tuning_trial(
+            model_name,
+            tuned_config,
+            pretrain_train=pretrain_train,
+            pretrain_val=pretrain_val,
+            train=train,
+            val=val,
+            evaluation=evaluation,
+            seed=seed + trial.number,
+        )
+        if not np.isfinite(score):
+            return float("-inf")
+        return float(score)
+
+    study.optimize(objective, n_trials=max(1, int(trials)))
+    if not study.best_trials:
+        return base_config
+    best_params = study.best_trial.params
+    tuned_params = {
+        "hidden_dims": tuple([int(best_params["hidden_dim"])] * int(best_params["num_layers"])),
+        "pretrain_epochs": int(best_params["pretrain_epochs"]),
+        "finetune_epochs": int(best_params["finetune_epochs"]),
+        "adapt_epochs": int(best_params["adapt_epochs"]),
+    }
+    return replace(base_config, **tuned_params)
+
+
+def _apply_tuned_config(base_config: object, tuned_config: object) -> object:
+    if tuned_config is None:
+        return base_config
+    if is_dataclass(tuned_config):
+        tuned_dict = asdict(tuned_config)
+    else:
+        tuned_dict = dict(tuned_config)
+    allowed = set(getattr(base_config, "__dataclass_fields__", {}).keys())
+    excluded = {"input_dim", "domain_count", "feature_names"}
+    filtered = {k: v for k, v in tuned_dict.items() if k in allowed and k not in excluded}
+    if "hidden_dims" in filtered and isinstance(filtered["hidden_dims"], list):
+        filtered["hidden_dims"] = tuple(filtered["hidden_dims"])
+    if not filtered:
+        return base_config
+    return replace(base_config, **filtered)
 
 
 def _filter_features_by_source_stats(
@@ -588,6 +780,7 @@ def _prepare_target_datasets(
     eval_idx: np.ndarray,
     *,
     clip_value: Optional[float] = None,
+    domain_id: Optional[int] = None,
 ) -> Tuple[ArrayDataset, ArrayDataset, ArrayDataset, Dict[str, int]]:
     train_frame = target_features.iloc[train_idx].reset_index(drop=True) if train_idx.size else pd.DataFrame(columns=target_features.columns)
     val_frame = target_features.iloc[val_idx].reset_index(drop=True) if val_idx.size else pd.DataFrame(columns=target_features.columns)
@@ -598,18 +791,21 @@ def _prepare_target_datasets(
         target_labels[train_idx] if train_idx.size else np.empty((0,), dtype=target_labels.dtype),
         scaler,
         clip_value=clip_value,
+        domain_id=domain_id,
     )
     val_dataset = _to_array_dataset(
         val_frame,
         target_labels[val_idx] if val_idx.size else np.empty((0,), dtype=target_labels.dtype),
         scaler,
         clip_value=clip_value,
+        domain_id=domain_id,
     )
     eval_dataset = _to_array_dataset(
         eval_frame,
         target_labels[eval_idx] if eval_idx.size else np.empty((0,), dtype=target_labels.dtype),
         scaler,
         clip_value=clip_value,
+        domain_id=domain_id,
     )
 
     counts = {
@@ -770,6 +966,26 @@ def run_experiment_scenario(
     include_target_in_scaler: bool = True,
     feature_clip_value: Optional[float] = 5.0,
     transformer_overrides: Optional[Dict[str, object]] = None,
+    dl_erm_config: Optional[DLERMConfig] = None,
+    dl_erm_overrides: Optional[Dict[str, object]] = None,
+    dl_dann_config: Optional[DLDANNConfig] = None,
+    dl_dann_overrides: Optional[Dict[str, object]] = None,
+    dl_irm_config: Optional[DLIRMConfig] = None,
+    dl_irm_overrides: Optional[Dict[str, object]] = None,
+    dl_csd_config: Optional[DLCSConfig] = None,
+    dl_csd_overrides: Optional[Dict[str, object]] = None,
+    dl_mldg_config: Optional[DLMldgConfig] = None,
+    dl_mldg_overrides: Optional[Dict[str, object]] = None,
+    dl_clustering_config: Optional[DLClusteringConfig] = None,
+    dl_clustering_overrides: Optional[Dict[str, object]] = None,
+    dl_siamese_config: Optional[DLSiameseConfig] = None,
+    dl_siamese_overrides: Optional[Dict[str, object]] = None,
+    dl_reorder_config: Optional[DLReorderConfig] = None,
+    dl_reorder_overrides: Optional[Dict[str, object]] = None,
+    dl_masf_config: Optional[DLMASFConfig] = None,
+    dl_masf_overrides: Optional[Dict[str, object]] = None,
+    # tabpfn_config: Optional[TabPFNConfig] = None,
+    # tabpfn_overrides: Optional[Dict[str, object]] = None,
     max_target_shift_std: float = 0.0,
     max_feature_correlation: float = 0.0,
     correlation_sample_rows: int = 2000,
@@ -777,6 +993,10 @@ def run_experiment_scenario(
     class_shift_max_samples: int = 5000,
     l1_feature_keep_ratio: float = 0.0,
     l1_max_samples: int = 5000,
+    optuna_tune: bool = False,
+    optuna_trials: int = 50,
+    optuna_seed: int = 42,
+    tuned_configs: Optional[Dict[str, object]] = None,
 ) -> List[Dict[str, object]]:
     dataset_names = scenario.sources + [scenario.target]
     split_seed = seeds[0] if seeds else 42
@@ -843,6 +1063,7 @@ def run_experiment_scenario(
     if lightgbm_config is None:
         lightgbm_config = LightGBMConfig()
     feature_tuple = tuple(feature_list)
+    domain_count = len(source_bundles) + 1
     if transformer_config is None:
         transformer_config = TransformerConfig(input_dim=len(feature_list), feature_names=feature_tuple)
     else:
@@ -852,11 +1073,275 @@ def run_experiment_scenario(
             transformer_config = replace(transformer_config, **transformer_overrides)
         except TypeError as exc:
             raise ValueError(f"Invalid transformer override: {exc}") from exc
+    if dl_erm_config is None:
+        dl_erm_config = DLERMConfig(input_dim=len(feature_list))
+    else:
+        dl_erm_config = replace(dl_erm_config, input_dim=len(feature_list))
+    if dl_erm_overrides:
+        try:
+            dl_erm_config = replace(dl_erm_config, **dl_erm_overrides)
+        except TypeError as exc:
+            raise ValueError(f"Invalid dl_erm override: {exc}") from exc
+    if dl_dann_config is None:
+        dl_dann_config = DLDANNConfig(input_dim=len(feature_list))
+    else:
+        dl_dann_config = replace(dl_dann_config, input_dim=len(feature_list))
+    if dl_dann_overrides:
+        try:
+            dl_dann_config = replace(dl_dann_config, **dl_dann_overrides)
+        except TypeError as exc:
+            raise ValueError(f"Invalid dl_dann override: {exc}") from exc
+    if dl_irm_config is None:
+        dl_irm_config = DLIRMConfig(input_dim=len(feature_list))
+    else:
+        dl_irm_config = replace(dl_irm_config, input_dim=len(feature_list))
+    if dl_irm_overrides:
+        try:
+            dl_irm_config = replace(dl_irm_config, **dl_irm_overrides)
+        except TypeError as exc:
+            raise ValueError(f"Invalid dl_irm override: {exc}") from exc
+    if dl_csd_config is None:
+        dl_csd_config = DLCSConfig(input_dim=len(feature_list), domain_count=domain_count)
+    else:
+        dl_csd_config = replace(dl_csd_config, input_dim=len(feature_list), domain_count=domain_count)
+    if dl_csd_overrides:
+        try:
+            dl_csd_config = replace(dl_csd_config, **dl_csd_overrides)
+        except TypeError as exc:
+            raise ValueError(f"Invalid dl_csd override: {exc}") from exc
+    if dl_mldg_config is None:
+        dl_mldg_config = DLMldgConfig(input_dim=len(feature_list), hidden_dims=tuple(dl_erm_config.hidden_dims))
+    else:
+        dl_mldg_config = replace(dl_mldg_config, input_dim=len(feature_list))
+    if dl_mldg_overrides:
+        try:
+            dl_mldg_config = replace(dl_mldg_config, **dl_mldg_overrides)
+        except TypeError as exc:
+            raise ValueError(f"Invalid dl_mldg override: {exc}") from exc
+    if dl_clustering_config is None:
+        dl_clustering_config = DLClusteringConfig(input_dim=len(feature_list))
+    else:
+        dl_clustering_config = replace(dl_clustering_config, input_dim=len(feature_list))
+    if dl_clustering_overrides:
+        try:
+            dl_clustering_config = replace(dl_clustering_config, **dl_clustering_overrides)
+        except TypeError as exc:
+            raise ValueError(f"Invalid dl_clustering override: {exc}") from exc
+    if dl_siamese_config is None:
+        dl_siamese_config = DLSiameseConfig(input_dim=len(feature_list))
+    else:
+        dl_siamese_config = replace(dl_siamese_config, input_dim=len(feature_list))
+    if dl_siamese_overrides:
+        try:
+            dl_siamese_config = replace(dl_siamese_config, **dl_siamese_overrides)
+        except TypeError as exc:
+            raise ValueError(f"Invalid dl_siamese override: {exc}") from exc
+    if dl_reorder_config is None:
+        dl_reorder_config = DLReorderConfig(input_dim=len(feature_list))
+    else:
+        dl_reorder_config = replace(dl_reorder_config, input_dim=len(feature_list))
+    if dl_reorder_overrides:
+        try:
+            dl_reorder_config = replace(dl_reorder_config, **dl_reorder_overrides)
+        except TypeError as exc:
+            raise ValueError(f"Invalid dl_reorder override: {exc}") from exc
+    if dl_masf_config is None:
+        dl_masf_config = DLMASFConfig(input_dim=len(feature_list))
+    else:
+        dl_masf_config = replace(dl_masf_config, input_dim=len(feature_list))
+    if dl_masf_overrides:
+        try:
+            dl_masf_config = replace(dl_masf_config, **dl_masf_overrides)
+        except TypeError as exc:
+            raise ValueError(f"Invalid dl_masf override: {exc}") from exc
     cdtrans_base_config = (
         CDTransConfig(input_dim=len(feature_list), feature_names=feature_tuple)
         if cdtrans_config is None
         else replace(cdtrans_config, input_dim=len(feature_list), feature_names=feature_tuple)
     )
+    # if tabpfn_config is None:
+    #     tabpfn_config = TabPFNConfig()
+    # if tabpfn_overrides:
+    #     try:
+    #         tabpfn_config = replace(tabpfn_config, **tabpfn_overrides)
+    #     except TypeError as exc:
+    #         raise ValueError(f"Invalid TabPFN override: {exc}") from exc
+
+    tuned_configs = tuned_configs if tuned_configs is not None else {}
+    tuning_ratio = _tuning_ratio(fine_tune_ratios)
+    if optuna_tune and tuning_ratio is not None:
+        split_entry = scenario_splits[0]
+        split = split_entry.split
+        split_meta = dict(split_entry.metadata)
+        split_meta.setdefault("split_seed", split_seed)
+        source_frames = [bundle.features.reset_index(drop=True) for bundle in source_bundles]
+        if split_meta.get("split_strategy") == "stratified_shuffle":
+            target_frame_full = target_bundle.features.reset_index(drop=True)
+            target_labels_full = target_bundle.labels.astype(int)
+        else:
+            target_frame_full = split.test_features.reset_index(drop=True)
+            target_labels_full = split.test_labels.astype(int)
+        extra_frames = [target_frame_full] if include_target_in_scaler else []
+        scaler = _fit_scaler(source_frames, extra_frames)
+        source_datasets = []
+        for domain_idx, (frame, bundle) in enumerate(zip(source_frames, source_bundles)):
+            source_datasets.append(
+                _to_array_dataset(
+                    frame,
+                    bundle.labels.astype(np.float32),
+                    scaler,
+                    clip_value=feature_clip_value,
+                    domain_id=domain_idx,
+                )
+            )
+        combined_pretrain = _combine_sources(source_datasets)
+        pretrain_train_dataset, pretrain_val_dataset = _split_array_dataset(
+            combined_pretrain,
+            pretrain_val_ratio,
+            seed=split_seed,
+        )
+        train_idx, val_idx, eval_idx, _ = _split_target_indices(
+            target_labels_full,
+            tuning_ratio,
+            fine_tune_val_ratio,
+            optuna_seed,
+        )
+        train_dataset, val_dataset, eval_dataset, _ = _prepare_target_datasets(
+            target_frame_full,
+            target_labels_full,
+            scaler,
+            train_idx,
+            val_idx,
+            eval_idx,
+            clip_value=feature_clip_value,
+            domain_id=len(source_datasets),
+        )
+        if "dl_erm" in model_types and "dl_erm" not in tuned_configs:
+            tuned_configs["dl_erm"] = _tune_dl_model(
+                "dl_erm",
+                dl_erm_config,
+                pretrain_train=pretrain_train_dataset,
+                pretrain_val=pretrain_val_dataset,
+                train=train_dataset,
+                val=val_dataset,
+                evaluation=eval_dataset,
+                seed=optuna_seed,
+                trials=optuna_trials,
+            )
+        if "dl_clustering" in model_types and "dl_clustering" not in tuned_configs:
+            tuned_configs["dl_clustering"] = _tune_dl_model(
+                "dl_clustering",
+                dl_clustering_config,
+                pretrain_train=pretrain_train_dataset,
+                pretrain_val=pretrain_val_dataset,
+                train=train_dataset,
+                val=val_dataset,
+                evaluation=eval_dataset,
+                seed=optuna_seed,
+                trials=optuna_trials,
+            )
+        if "dl_siamese" in model_types and "dl_siamese" not in tuned_configs:
+            tuned_configs["dl_siamese"] = _tune_dl_model(
+                "dl_siamese",
+                dl_siamese_config,
+                pretrain_train=pretrain_train_dataset,
+                pretrain_val=pretrain_val_dataset,
+                train=train_dataset,
+                val=val_dataset,
+                evaluation=eval_dataset,
+                seed=optuna_seed,
+                trials=optuna_trials,
+            )
+        if "dl_reorder" in model_types and "dl_reorder" not in tuned_configs:
+            tuned_configs["dl_reorder"] = _tune_dl_model(
+                "dl_reorder",
+                dl_reorder_config,
+                pretrain_train=pretrain_train_dataset,
+                pretrain_val=pretrain_val_dataset,
+                train=train_dataset,
+                val=val_dataset,
+                evaluation=eval_dataset,
+                seed=optuna_seed,
+                trials=optuna_trials,
+            )
+        if "dl_masf" in model_types and "dl_masf" not in tuned_configs:
+            tuned_configs["dl_masf"] = _tune_dl_model(
+                "dl_masf",
+                dl_masf_config,
+                pretrain_train=pretrain_train_dataset,
+                pretrain_val=pretrain_val_dataset,
+                train=train_dataset,
+                val=val_dataset,
+                evaluation=eval_dataset,
+                seed=optuna_seed,
+                trials=optuna_trials,
+            )
+        if "dl_dann" in model_types and "dl_dann" not in tuned_configs:
+            tuned_configs["dl_dann"] = _tune_dl_model(
+                "dl_dann",
+                dl_dann_config,
+                pretrain_train=pretrain_train_dataset,
+                pretrain_val=pretrain_val_dataset,
+                train=train_dataset,
+                val=val_dataset,
+                evaluation=eval_dataset,
+                seed=optuna_seed,
+                trials=optuna_trials,
+            )
+        if "dl_irm" in model_types and "dl_irm" not in tuned_configs:
+            tuned_configs["dl_irm"] = _tune_dl_model(
+                "dl_irm",
+                dl_irm_config,
+                pretrain_train=pretrain_train_dataset,
+                pretrain_val=pretrain_val_dataset,
+                train=train_dataset,
+                val=val_dataset,
+                evaluation=eval_dataset,
+                seed=optuna_seed,
+                trials=optuna_trials,
+            )
+        if "dl_csd" in model_types and "dl_csd" not in tuned_configs:
+            tuned_configs["dl_csd"] = _tune_dl_model(
+                "dl_csd",
+                dl_csd_config,
+                pretrain_train=pretrain_train_dataset,
+                pretrain_val=pretrain_val_dataset,
+                train=train_dataset,
+                val=val_dataset,
+                evaluation=eval_dataset,
+                seed=optuna_seed,
+                trials=optuna_trials,
+            )
+        if "dl_mldg" in model_types and "dl_mldg" not in tuned_configs:
+            tuned_configs["dl_mldg"] = _tune_dl_model(
+                "dl_mldg",
+                dl_mldg_config,
+                pretrain_train=combined_pretrain,
+                pretrain_val=pretrain_val_dataset,
+                train=combined_pretrain,
+                val=pretrain_val_dataset if pretrain_val_dataset is not None else combined_pretrain,
+                evaluation=eval_dataset,
+                seed=optuna_seed,
+                trials=optuna_trials,
+            )
+    if "dl_erm" in tuned_configs:
+        dl_erm_config = _apply_tuned_config(dl_erm_config, tuned_configs["dl_erm"])
+    if "dl_clustering" in tuned_configs:
+        dl_clustering_config = _apply_tuned_config(dl_clustering_config, tuned_configs["dl_clustering"])
+    if "dl_siamese" in tuned_configs:
+        dl_siamese_config = _apply_tuned_config(dl_siamese_config, tuned_configs["dl_siamese"])
+    if "dl_reorder" in tuned_configs:
+        dl_reorder_config = _apply_tuned_config(dl_reorder_config, tuned_configs["dl_reorder"])
+    if "dl_masf" in tuned_configs:
+        dl_masf_config = _apply_tuned_config(dl_masf_config, tuned_configs["dl_masf"])
+    if "dl_dann" in tuned_configs:
+        dl_dann_config = _apply_tuned_config(dl_dann_config, tuned_configs["dl_dann"])
+    if "dl_irm" in tuned_configs:
+        dl_irm_config = _apply_tuned_config(dl_irm_config, tuned_configs["dl_irm"])
+    if "dl_csd" in tuned_configs:
+        dl_csd_config = _apply_tuned_config(dl_csd_config, tuned_configs["dl_csd"])
+    if "dl_mldg" in tuned_configs:
+        dl_mldg_config = _apply_tuned_config(dl_mldg_config, tuned_configs["dl_mldg"])
 
     for split_entry in scenario_splits:
         split = split_entry.split
@@ -874,16 +1359,20 @@ def run_experiment_scenario(
         extra_frames = [target_frame_full] if include_target_in_scaler else []
         scaler = _fit_scaler(source_frames, extra_frames)
 
-        source_datasets = [
-            _to_array_dataset(
-                frame,
-                bundle.labels.astype(np.float32),
-                scaler,
-                clip_value=feature_clip_value,
+        source_datasets = []
+        for domain_idx, (frame, bundle) in enumerate(zip(source_frames, source_bundles)):
+            source_datasets.append(
+                _to_array_dataset(
+                    frame,
+                    bundle.labels.astype(np.float32),
+                    scaler,
+                    clip_value=feature_clip_value,
+                    domain_id=domain_idx,
+                )
             )
-            for frame, bundle in zip(source_frames, source_bundles)
-        ]
         combined_pretrain = _combine_sources(source_datasets)
+        target_domain_id = len(source_datasets)
+        domain_count = target_domain_id + 1
         pretrain_train_dataset, pretrain_val_dataset = _split_array_dataset(
             combined_pretrain,
             pretrain_val_ratio,
@@ -891,6 +1380,8 @@ def run_experiment_scenario(
         )
 
         total_target_samples = int(target_labels_full.size)
+
+        # tabpfn_pipeline = TabPFNPipeline(tabpfn_config) if "tabpfn" in model_types else None
 
         for ratio in fine_tune_ratios:
             for seed in seeds:
@@ -909,6 +1400,7 @@ def run_experiment_scenario(
                     val_idx,
                     eval_idx,
                     clip_value=feature_clip_value,
+                    domain_id=target_domain_id,
                 )
 
                 common_payload = {
@@ -1080,6 +1572,694 @@ def run_experiment_scenario(
                             "best_iteration": None,
                         })
 
+                if "dl_erm" in model_types:
+                    dl_erm_cfg = replace(dl_erm_config, input_dim=len(feature_list))
+                    dl_erm_pipeline = DLERMPipeline(dl_erm_cfg)
+                    dl_erm_result = dl_erm_pipeline.run(
+                        seed=seed,
+                        pretrain=pretrain_train_dataset,
+                        pretrain_val=pretrain_val_dataset,
+                        train=train_dataset,
+                        val=val_dataset,
+                        adapt=None,
+                        evaluation=eval_dataset,
+                    )
+                    results.append({
+                        **common_payload,
+                        "model": "dl_erm",
+                        "mode": "pretrain_finetune",
+                        "train_auroc": dl_erm_result.train_auroc,
+                        "val_auroc": dl_erm_result.val_auroc,
+                        "test_auroc": dl_erm_result.test_auroc,
+                        "train_accuracy": dl_erm_result.train_accuracy,
+                        "val_accuracy": dl_erm_result.val_accuracy,
+                        "test_accuracy": dl_erm_result.test_accuracy,
+                        "train_auprc": dl_erm_result.train_auprc,
+                        "val_auprc": dl_erm_result.val_auprc,
+                        "test_auprc": dl_erm_result.test_auprc,
+                        "pretrain_seconds": dl_erm_result.stage_durations.get("pretrain_seconds"),
+                        "finetune_seconds": dl_erm_result.stage_durations.get("finetune_seconds"),
+                        "adapt_seconds": dl_erm_result.stage_durations.get("adapt_seconds"),
+                        "pretrain_epochs": dl_erm_result.stage_epochs.get("pretrain_epochs"),
+                        "finetune_epochs": dl_erm_result.stage_epochs.get("finetune_epochs"),
+                        "adapt_epochs": dl_erm_result.stage_epochs.get("adapt_epochs"),
+                        "pretrain_val_auroc": dl_erm_result.pretrain_val_auroc,
+                        "pretrain_val_accuracy": dl_erm_result.pretrain_val_accuracy,
+                        "pretrain_val_auprc": dl_erm_result.pretrain_val_auprc,
+                        "best_iteration": None,
+                    })
+
+                    if train_dataset.X.size > 0:
+                        dl_erm_target_cfg = replace(dl_erm_cfg, pretrain_epochs=0)
+                        dl_erm_target_pipeline = DLERMPipeline(dl_erm_target_cfg)
+                        dl_erm_target_result = dl_erm_target_pipeline.run(
+                            seed=seed,
+                            pretrain=None,
+                            pretrain_val=None,
+                            train=train_dataset,
+                            val=val_dataset,
+                            adapt=None,
+                            evaluation=eval_dataset,
+                        )
+                        results.append({
+                            **common_payload,
+                            "model": "dl_erm",
+                            "mode": "target_only",
+                            "train_auroc": dl_erm_target_result.train_auroc,
+                            "val_auroc": dl_erm_target_result.val_auroc,
+                            "test_auroc": dl_erm_target_result.test_auroc,
+                            "train_accuracy": dl_erm_target_result.train_accuracy,
+                            "val_accuracy": dl_erm_target_result.val_accuracy,
+                            "test_accuracy": dl_erm_target_result.test_accuracy,
+                            "train_auprc": dl_erm_target_result.train_auprc,
+                            "val_auprc": dl_erm_target_result.val_auprc,
+                            "test_auprc": dl_erm_target_result.test_auprc,
+                            "pretrain_seconds": dl_erm_target_result.stage_durations.get("pretrain_seconds"),
+                            "finetune_seconds": dl_erm_target_result.stage_durations.get("finetune_seconds"),
+                            "adapt_seconds": dl_erm_target_result.stage_durations.get("adapt_seconds"),
+                            "pretrain_epochs": dl_erm_target_result.stage_epochs.get("pretrain_epochs"),
+                            "finetune_epochs": dl_erm_target_result.stage_epochs.get("finetune_epochs"),
+                            "adapt_epochs": dl_erm_target_result.stage_epochs.get("adapt_epochs"),
+                            "pretrain_val_auroc": dl_erm_target_result.pretrain_val_auroc,
+                            "pretrain_val_accuracy": dl_erm_target_result.pretrain_val_accuracy,
+                            "pretrain_val_auprc": dl_erm_target_result.pretrain_val_auprc,
+                            "best_iteration": None,
+                        })
+
+                if "dl_clustering" in model_types:
+                    dl_clustering_cfg = replace(dl_clustering_config, input_dim=len(feature_list))
+                    dl_clustering_pipeline = DLClusteringPipeline(dl_clustering_cfg)
+                    dl_clustering_result = dl_clustering_pipeline.run(
+                        seed=seed,
+                        pretrain=pretrain_train_dataset,
+                        pretrain_val=pretrain_val_dataset,
+                        train=train_dataset,
+                        val=val_dataset,
+                        adapt=None,
+                        evaluation=eval_dataset,
+                    )
+                    results.append({
+                        **common_payload,
+                        "model": "dl_clustering",
+                        "mode": "pretrain_finetune",
+                        "train_auroc": dl_clustering_result.train_auroc,
+                        "val_auroc": dl_clustering_result.val_auroc,
+                        "test_auroc": dl_clustering_result.test_auroc,
+                        "train_accuracy": dl_clustering_result.train_accuracy,
+                        "val_accuracy": dl_clustering_result.val_accuracy,
+                        "test_accuracy": dl_clustering_result.test_accuracy,
+                        "train_auprc": dl_clustering_result.train_auprc,
+                        "val_auprc": dl_clustering_result.val_auprc,
+                        "test_auprc": dl_clustering_result.test_auprc,
+                        "pretrain_seconds": dl_clustering_result.stage_durations.get("pretrain_seconds"),
+                        "finetune_seconds": dl_clustering_result.stage_durations.get("finetune_seconds"),
+                        "adapt_seconds": dl_clustering_result.stage_durations.get("adapt_seconds"),
+                        "pretrain_epochs": dl_clustering_result.stage_epochs.get("pretrain_epochs"),
+                        "finetune_epochs": dl_clustering_result.stage_epochs.get("finetune_epochs"),
+                        "adapt_epochs": dl_clustering_result.stage_epochs.get("adapt_epochs"),
+                        "pretrain_val_auroc": dl_clustering_result.pretrain_val_auroc,
+                        "pretrain_val_accuracy": dl_clustering_result.pretrain_val_accuracy,
+                        "pretrain_val_auprc": dl_clustering_result.pretrain_val_auprc,
+                        "best_iteration": None,
+                    })
+
+                    if train_dataset.X.size > 0:
+                        dl_clustering_target_cfg = replace(dl_clustering_cfg, pretrain_epochs=0)
+                        dl_clustering_target_pipeline = DLClusteringPipeline(dl_clustering_target_cfg)
+                        dl_clustering_target_result = dl_clustering_target_pipeline.run(
+                            seed=seed,
+                            pretrain=None,
+                            pretrain_val=None,
+                            train=train_dataset,
+                            val=val_dataset,
+                            adapt=None,
+                            evaluation=eval_dataset,
+                        )
+                        results.append({
+                            **common_payload,
+                            "model": "dl_clustering",
+                            "mode": "target_only",
+                            "train_auroc": dl_clustering_target_result.train_auroc,
+                            "val_auroc": dl_clustering_target_result.val_auroc,
+                            "test_auroc": dl_clustering_target_result.test_auroc,
+                            "train_accuracy": dl_clustering_target_result.train_accuracy,
+                            "val_accuracy": dl_clustering_target_result.val_accuracy,
+                            "test_accuracy": dl_clustering_target_result.test_accuracy,
+                            "train_auprc": dl_clustering_target_result.train_auprc,
+                            "val_auprc": dl_clustering_target_result.val_auprc,
+                            "test_auprc": dl_clustering_target_result.test_auprc,
+                            "pretrain_seconds": dl_clustering_target_result.stage_durations.get("pretrain_seconds"),
+                            "finetune_seconds": dl_clustering_target_result.stage_durations.get("finetune_seconds"),
+                            "adapt_seconds": dl_clustering_target_result.stage_durations.get("adapt_seconds"),
+                            "pretrain_epochs": dl_clustering_target_result.stage_epochs.get("pretrain_epochs"),
+                            "finetune_epochs": dl_clustering_target_result.stage_epochs.get("finetune_epochs"),
+                            "adapt_epochs": dl_clustering_target_result.stage_epochs.get("adapt_epochs"),
+                            "pretrain_val_auroc": dl_clustering_target_result.pretrain_val_auroc,
+                            "pretrain_val_accuracy": dl_clustering_target_result.pretrain_val_accuracy,
+                            "pretrain_val_auprc": dl_clustering_target_result.pretrain_val_auprc,
+                            "best_iteration": None,
+                        })
+
+                if "dl_siamese" in model_types:
+                    dl_siamese_cfg = replace(dl_siamese_config, input_dim=len(feature_list))
+                    dl_siamese_pipeline = DLSiamesePipeline(dl_siamese_cfg)
+                    dl_siamese_result = dl_siamese_pipeline.run(
+                        seed=seed,
+                        pretrain=pretrain_train_dataset,
+                        pretrain_val=pretrain_val_dataset,
+                        train=train_dataset,
+                        val=val_dataset,
+                        adapt=None,
+                        evaluation=eval_dataset,
+                    )
+                    results.append({
+                        **common_payload,
+                        "model": "dl_siamese",
+                        "mode": "pretrain_finetune",
+                        "train_auroc": dl_siamese_result.train_auroc,
+                        "val_auroc": dl_siamese_result.val_auroc,
+                        "test_auroc": dl_siamese_result.test_auroc,
+                        "train_accuracy": dl_siamese_result.train_accuracy,
+                        "val_accuracy": dl_siamese_result.val_accuracy,
+                        "test_accuracy": dl_siamese_result.test_accuracy,
+                        "train_auprc": dl_siamese_result.train_auprc,
+                        "val_auprc": dl_siamese_result.val_auprc,
+                        "test_auprc": dl_siamese_result.test_auprc,
+                        "pretrain_seconds": dl_siamese_result.stage_durations.get("pretrain_seconds"),
+                        "finetune_seconds": dl_siamese_result.stage_durations.get("finetune_seconds"),
+                        "adapt_seconds": dl_siamese_result.stage_durations.get("adapt_seconds"),
+                        "pretrain_epochs": dl_siamese_result.stage_epochs.get("pretrain_epochs"),
+                        "finetune_epochs": dl_siamese_result.stage_epochs.get("finetune_epochs"),
+                        "adapt_epochs": dl_siamese_result.stage_epochs.get("adapt_epochs"),
+                        "pretrain_val_auroc": dl_siamese_result.pretrain_val_auroc,
+                        "pretrain_val_accuracy": dl_siamese_result.pretrain_val_accuracy,
+                        "pretrain_val_auprc": dl_siamese_result.pretrain_val_auprc,
+                        "best_iteration": None,
+                    })
+
+                    if train_dataset.X.size > 0:
+                        dl_siamese_target_cfg = replace(dl_siamese_cfg, pretrain_epochs=0)
+                        dl_siamese_target_pipeline = DLSiamesePipeline(dl_siamese_target_cfg)
+                        dl_siamese_target_result = dl_siamese_target_pipeline.run(
+                            seed=seed,
+                            pretrain=None,
+                            pretrain_val=None,
+                            train=train_dataset,
+                            val=val_dataset,
+                            adapt=None,
+                            evaluation=eval_dataset,
+                        )
+                        results.append({
+                            **common_payload,
+                            "model": "dl_siamese",
+                            "mode": "target_only",
+                            "train_auroc": dl_siamese_target_result.train_auroc,
+                            "val_auroc": dl_siamese_target_result.val_auroc,
+                            "test_auroc": dl_siamese_target_result.test_auroc,
+                            "train_accuracy": dl_siamese_target_result.train_accuracy,
+                            "val_accuracy": dl_siamese_target_result.val_accuracy,
+                            "test_accuracy": dl_siamese_target_result.test_accuracy,
+                            "train_auprc": dl_siamese_target_result.train_auprc,
+                            "val_auprc": dl_siamese_target_result.val_auprc,
+                            "test_auprc": dl_siamese_target_result.test_auprc,
+                            "pretrain_seconds": dl_siamese_target_result.stage_durations.get("pretrain_seconds"),
+                            "finetune_seconds": dl_siamese_target_result.stage_durations.get("finetune_seconds"),
+                            "adapt_seconds": dl_siamese_target_result.stage_durations.get("adapt_seconds"),
+                            "pretrain_epochs": dl_siamese_target_result.stage_epochs.get("pretrain_epochs"),
+                            "finetune_epochs": dl_siamese_target_result.stage_epochs.get("finetune_epochs"),
+                            "adapt_epochs": dl_siamese_target_result.stage_epochs.get("adapt_epochs"),
+                            "pretrain_val_auroc": dl_siamese_target_result.pretrain_val_auroc,
+                            "pretrain_val_accuracy": dl_siamese_target_result.pretrain_val_accuracy,
+                            "pretrain_val_auprc": dl_siamese_target_result.pretrain_val_auprc,
+                            "best_iteration": None,
+                        })
+
+                if "dl_reorder" in model_types:
+                    dl_reorder_cfg = replace(dl_reorder_config, input_dim=len(feature_list))
+                    dl_reorder_pipeline = DLReorderPipeline(dl_reorder_cfg)
+                    dl_reorder_result = dl_reorder_pipeline.run(
+                        seed=seed,
+                        pretrain=pretrain_train_dataset,
+                        pretrain_val=pretrain_val_dataset,
+                        train=train_dataset,
+                        val=val_dataset,
+                        adapt=None,
+                        evaluation=eval_dataset,
+                    )
+                    results.append({
+                        **common_payload,
+                        "model": "dl_reorder",
+                        "mode": "pretrain_finetune",
+                        "train_auroc": dl_reorder_result.train_auroc,
+                        "val_auroc": dl_reorder_result.val_auroc,
+                        "test_auroc": dl_reorder_result.test_auroc,
+                        "train_accuracy": dl_reorder_result.train_accuracy,
+                        "val_accuracy": dl_reorder_result.val_accuracy,
+                        "test_accuracy": dl_reorder_result.test_accuracy,
+                        "train_auprc": dl_reorder_result.train_auprc,
+                        "val_auprc": dl_reorder_result.val_auprc,
+                        "test_auprc": dl_reorder_result.test_auprc,
+                        "pretrain_seconds": dl_reorder_result.stage_durations.get("pretrain_seconds"),
+                        "finetune_seconds": dl_reorder_result.stage_durations.get("finetune_seconds"),
+                        "adapt_seconds": dl_reorder_result.stage_durations.get("adapt_seconds"),
+                        "pretrain_epochs": dl_reorder_result.stage_epochs.get("pretrain_epochs"),
+                        "finetune_epochs": dl_reorder_result.stage_epochs.get("finetune_epochs"),
+                        "adapt_epochs": dl_reorder_result.stage_epochs.get("adapt_epochs"),
+                        "pretrain_val_auroc": dl_reorder_result.pretrain_val_auroc,
+                        "pretrain_val_accuracy": dl_reorder_result.pretrain_val_accuracy,
+                        "pretrain_val_auprc": dl_reorder_result.pretrain_val_auprc,
+                        "best_iteration": None,
+                    })
+
+                    if train_dataset.X.size > 0:
+                        dl_reorder_target_cfg = replace(dl_reorder_cfg, pretrain_epochs=0)
+                        dl_reorder_target_pipeline = DLReorderPipeline(dl_reorder_target_cfg)
+                        dl_reorder_target_result = dl_reorder_target_pipeline.run(
+                            seed=seed,
+                            pretrain=None,
+                            pretrain_val=None,
+                            train=train_dataset,
+                            val=val_dataset,
+                            adapt=None,
+                            evaluation=eval_dataset,
+                        )
+                        results.append({
+                            **common_payload,
+                            "model": "dl_reorder",
+                            "mode": "target_only",
+                            "train_auroc": dl_reorder_target_result.train_auroc,
+                            "val_auroc": dl_reorder_target_result.val_auroc,
+                            "test_auroc": dl_reorder_target_result.test_auroc,
+                            "train_accuracy": dl_reorder_target_result.train_accuracy,
+                            "val_accuracy": dl_reorder_target_result.val_accuracy,
+                            "test_accuracy": dl_reorder_target_result.test_accuracy,
+                            "train_auprc": dl_reorder_target_result.train_auprc,
+                            "val_auprc": dl_reorder_target_result.val_auprc,
+                            "test_auprc": dl_reorder_target_result.test_auprc,
+                            "pretrain_seconds": dl_reorder_target_result.stage_durations.get("pretrain_seconds"),
+                            "finetune_seconds": dl_reorder_target_result.stage_durations.get("finetune_seconds"),
+                            "adapt_seconds": dl_reorder_target_result.stage_durations.get("adapt_seconds"),
+                            "pretrain_epochs": dl_reorder_target_result.stage_epochs.get("pretrain_epochs"),
+                            "finetune_epochs": dl_reorder_target_result.stage_epochs.get("finetune_epochs"),
+                            "adapt_epochs": dl_reorder_target_result.stage_epochs.get("adapt_epochs"),
+                            "pretrain_val_auroc": dl_reorder_target_result.pretrain_val_auroc,
+                            "pretrain_val_accuracy": dl_reorder_target_result.pretrain_val_accuracy,
+                            "pretrain_val_auprc": dl_reorder_target_result.pretrain_val_auprc,
+                            "best_iteration": None,
+                        })
+
+                if "dl_masf" in model_types:
+                    dl_masf_cfg = replace(dl_masf_config, input_dim=len(feature_list))
+                    dl_masf_pipeline = DLMASFPipeline(dl_masf_cfg)
+                    dl_masf_result = dl_masf_pipeline.run(
+                        seed=seed,
+                        pretrain=pretrain_train_dataset,
+                        pretrain_val=pretrain_val_dataset,
+                        train=train_dataset,
+                        val=val_dataset,
+                        adapt=None,
+                        evaluation=eval_dataset,
+                    )
+                    results.append({
+                        **common_payload,
+                        "model": "dl_masf",
+                        "mode": "pretrain_finetune",
+                        "train_auroc": dl_masf_result.train_auroc,
+                        "val_auroc": dl_masf_result.val_auroc,
+                        "test_auroc": dl_masf_result.test_auroc,
+                        "train_accuracy": dl_masf_result.train_accuracy,
+                        "val_accuracy": dl_masf_result.val_accuracy,
+                        "test_accuracy": dl_masf_result.test_accuracy,
+                        "train_auprc": dl_masf_result.train_auprc,
+                        "val_auprc": dl_masf_result.val_auprc,
+                        "test_auprc": dl_masf_result.test_auprc,
+                        "pretrain_seconds": dl_masf_result.stage_durations.get("pretrain_seconds"),
+                        "finetune_seconds": dl_masf_result.stage_durations.get("finetune_seconds"),
+                        "adapt_seconds": dl_masf_result.stage_durations.get("adapt_seconds"),
+                        "pretrain_epochs": dl_masf_result.stage_epochs.get("pretrain_epochs"),
+                        "finetune_epochs": dl_masf_result.stage_epochs.get("finetune_epochs"),
+                        "adapt_epochs": dl_masf_result.stage_epochs.get("adapt_epochs"),
+                        "pretrain_val_auroc": dl_masf_result.pretrain_val_auroc,
+                        "pretrain_val_accuracy": dl_masf_result.pretrain_val_accuracy,
+                        "pretrain_val_auprc": dl_masf_result.pretrain_val_auprc,
+                        "best_iteration": None,
+                    })
+
+                    if train_dataset.X.size > 0:
+                        dl_masf_target_cfg = replace(dl_masf_cfg, pretrain_epochs=0)
+                        dl_masf_target_pipeline = DLMASFPipeline(dl_masf_target_cfg)
+                        dl_masf_target_result = dl_masf_target_pipeline.run(
+                            seed=seed,
+                            pretrain=None,
+                            pretrain_val=None,
+                            train=train_dataset,
+                            val=val_dataset,
+                            adapt=None,
+                            evaluation=eval_dataset,
+                        )
+                        results.append({
+                            **common_payload,
+                            "model": "dl_masf",
+                            "mode": "target_only",
+                            "train_auroc": dl_masf_target_result.train_auroc,
+                            "val_auroc": dl_masf_target_result.val_auroc,
+                            "test_auroc": dl_masf_target_result.test_auroc,
+                            "train_accuracy": dl_masf_target_result.train_accuracy,
+                            "val_accuracy": dl_masf_target_result.val_accuracy,
+                            "test_accuracy": dl_masf_target_result.test_accuracy,
+                            "train_auprc": dl_masf_target_result.train_auprc,
+                            "val_auprc": dl_masf_target_result.val_auprc,
+                            "test_auprc": dl_masf_target_result.test_auprc,
+                            "pretrain_seconds": dl_masf_target_result.stage_durations.get("pretrain_seconds"),
+                            "finetune_seconds": dl_masf_target_result.stage_durations.get("finetune_seconds"),
+                            "adapt_seconds": dl_masf_target_result.stage_durations.get("adapt_seconds"),
+                            "pretrain_epochs": dl_masf_target_result.stage_epochs.get("pretrain_epochs"),
+                            "finetune_epochs": dl_masf_target_result.stage_epochs.get("finetune_epochs"),
+                            "adapt_epochs": dl_masf_target_result.stage_epochs.get("adapt_epochs"),
+                            "pretrain_val_auroc": dl_masf_target_result.pretrain_val_auroc,
+                            "pretrain_val_accuracy": dl_masf_target_result.pretrain_val_accuracy,
+                            "pretrain_val_auprc": dl_masf_target_result.pretrain_val_auprc,
+                            "best_iteration": None,
+                        })
+
+                if "dl_dann" in model_types:
+                    dl_dann_cfg = replace(dl_dann_config, input_dim=len(feature_list))
+                    dl_dann_pipeline = DLDANNPipeline(dl_dann_cfg)
+                    dl_dann_result = dl_dann_pipeline.run(
+                        seed=seed,
+                        pretrain=pretrain_train_dataset,
+                        pretrain_val=pretrain_val_dataset,
+                        train=train_dataset,
+                        val=val_dataset,
+                        adapt=None,
+                        evaluation=eval_dataset,
+                    )
+                    results.append({
+                        **common_payload,
+                        "model": "dl_dann",
+                        "mode": "pretrain_finetune",
+                        "train_auroc": dl_dann_result.train_auroc,
+                        "val_auroc": dl_dann_result.val_auroc,
+                        "test_auroc": dl_dann_result.test_auroc,
+                        "train_accuracy": dl_dann_result.train_accuracy,
+                        "val_accuracy": dl_dann_result.val_accuracy,
+                        "test_accuracy": dl_dann_result.test_accuracy,
+                        "train_auprc": dl_dann_result.train_auprc,
+                        "val_auprc": dl_dann_result.val_auprc,
+                        "test_auprc": dl_dann_result.test_auprc,
+                        "pretrain_seconds": dl_dann_result.stage_durations.get("pretrain_seconds"),
+                        "finetune_seconds": dl_dann_result.stage_durations.get("finetune_seconds"),
+                        "adapt_seconds": dl_dann_result.stage_durations.get("adapt_seconds"),
+                        "pretrain_epochs": dl_dann_result.stage_epochs.get("pretrain_epochs"),
+                        "finetune_epochs": dl_dann_result.stage_epochs.get("finetune_epochs"),
+                        "adapt_epochs": dl_dann_result.stage_epochs.get("adapt_epochs"),
+                        "pretrain_val_auroc": dl_dann_result.pretrain_val_auroc,
+                        "pretrain_val_accuracy": dl_dann_result.pretrain_val_accuracy,
+                        "pretrain_val_auprc": dl_dann_result.pretrain_val_auprc,
+                        "best_iteration": None,
+                    })
+
+                    if train_dataset.X.size > 0:
+                        dl_dann_target_cfg = replace(dl_dann_cfg, pretrain_epochs=0)
+                        dl_dann_target_pipeline = DLDANNPipeline(dl_dann_target_cfg)
+                        dl_dann_target_result = dl_dann_target_pipeline.run(
+                            seed=seed,
+                            pretrain=None,
+                            pretrain_val=None,
+                            train=train_dataset,
+                            val=val_dataset,
+                            adapt=None,
+                            evaluation=eval_dataset,
+                        )
+                        results.append({
+                            **common_payload,
+                            "model": "dl_dann",
+                            "mode": "target_only",
+                            "train_auroc": dl_dann_target_result.train_auroc,
+                            "val_auroc": dl_dann_target_result.val_auroc,
+                            "test_auroc": dl_dann_target_result.test_auroc,
+                            "train_accuracy": dl_dann_target_result.train_accuracy,
+                            "val_accuracy": dl_dann_target_result.val_accuracy,
+                            "test_accuracy": dl_dann_target_result.test_accuracy,
+                            "train_auprc": dl_dann_target_result.train_auprc,
+                            "val_auprc": dl_dann_target_result.val_auprc,
+                            "test_auprc": dl_dann_target_result.test_auprc,
+                            "pretrain_seconds": dl_dann_target_result.stage_durations.get("pretrain_seconds"),
+                            "finetune_seconds": dl_dann_target_result.stage_durations.get("finetune_seconds"),
+                            "adapt_seconds": dl_dann_target_result.stage_durations.get("adapt_seconds"),
+                            "pretrain_epochs": dl_dann_target_result.stage_epochs.get("pretrain_epochs"),
+                            "finetune_epochs": dl_dann_target_result.stage_epochs.get("finetune_epochs"),
+                            "adapt_epochs": dl_dann_target_result.stage_epochs.get("adapt_epochs"),
+                            "pretrain_val_auroc": dl_dann_target_result.pretrain_val_auroc,
+                            "pretrain_val_accuracy": dl_dann_target_result.pretrain_val_accuracy,
+                            "pretrain_val_auprc": dl_dann_target_result.pretrain_val_auprc,
+                            "best_iteration": None,
+                        })
+
+                if "dl_irm" in model_types:
+                    dl_irm_cfg = replace(dl_irm_config, input_dim=len(feature_list))
+                    dl_irm_pipeline = DLIRMPipeline(dl_irm_cfg)
+                    dl_irm_result = dl_irm_pipeline.run(
+                        seed=seed,
+                        pretrain=pretrain_train_dataset,
+                        pretrain_val=pretrain_val_dataset,
+                        train=train_dataset,
+                        val=val_dataset,
+                        adapt=None,
+                        evaluation=eval_dataset,
+                    )
+                    results.append({
+                        **common_payload,
+                        "model": "dl_irm",
+                        "mode": "pretrain_finetune",
+                        "train_auroc": dl_irm_result.train_auroc,
+                        "val_auroc": dl_irm_result.val_auroc,
+                        "test_auroc": dl_irm_result.test_auroc,
+                        "train_accuracy": dl_irm_result.train_accuracy,
+                        "val_accuracy": dl_irm_result.val_accuracy,
+                        "test_accuracy": dl_irm_result.test_accuracy,
+                        "train_auprc": dl_irm_result.train_auprc,
+                        "val_auprc": dl_irm_result.val_auprc,
+                        "test_auprc": dl_irm_result.test_auprc,
+                        "pretrain_seconds": dl_irm_result.stage_durations.get("pretrain_seconds"),
+                        "finetune_seconds": dl_irm_result.stage_durations.get("finetune_seconds"),
+                        "adapt_seconds": dl_irm_result.stage_durations.get("adapt_seconds"),
+                        "pretrain_epochs": dl_irm_result.stage_epochs.get("pretrain_epochs"),
+                        "finetune_epochs": dl_irm_result.stage_epochs.get("finetune_epochs"),
+                        "adapt_epochs": dl_irm_result.stage_epochs.get("adapt_epochs"),
+                        "pretrain_val_auroc": dl_irm_result.pretrain_val_auroc,
+                        "pretrain_val_accuracy": dl_irm_result.pretrain_val_accuracy,
+                        "pretrain_val_auprc": dl_irm_result.pretrain_val_auprc,
+                        "best_iteration": None,
+                    })
+
+                    if train_dataset.X.size > 0:
+                        dl_irm_target_cfg = replace(dl_irm_cfg, pretrain_epochs=0)
+                        dl_irm_target_pipeline = DLIRMPipeline(dl_irm_target_cfg)
+                        dl_irm_target_result = dl_irm_target_pipeline.run(
+                            seed=seed,
+                            pretrain=None,
+                            pretrain_val=None,
+                            train=train_dataset,
+                            val=val_dataset,
+                            adapt=None,
+                            evaluation=eval_dataset,
+                        )
+                        results.append({
+                            **common_payload,
+                            "model": "dl_irm",
+                            "mode": "target_only",
+                            "train_auroc": dl_irm_target_result.train_auroc,
+                            "val_auroc": dl_irm_target_result.val_auroc,
+                            "test_auroc": dl_irm_target_result.test_auroc,
+                            "train_accuracy": dl_irm_target_result.train_accuracy,
+                            "val_accuracy": dl_irm_target_result.val_accuracy,
+                            "test_accuracy": dl_irm_target_result.test_accuracy,
+                            "train_auprc": dl_irm_target_result.train_auprc,
+                            "val_auprc": dl_irm_target_result.val_auprc,
+                            "test_auprc": dl_irm_target_result.test_auprc,
+                            "pretrain_seconds": dl_irm_target_result.stage_durations.get("pretrain_seconds"),
+                            "finetune_seconds": dl_irm_target_result.stage_durations.get("finetune_seconds"),
+                            "adapt_seconds": dl_irm_target_result.stage_durations.get("adapt_seconds"),
+                            "pretrain_epochs": dl_irm_target_result.stage_epochs.get("pretrain_epochs"),
+                            "finetune_epochs": dl_irm_target_result.stage_epochs.get("finetune_epochs"),
+                            "adapt_epochs": dl_irm_target_result.stage_epochs.get("adapt_epochs"),
+                            "pretrain_val_auroc": dl_irm_target_result.pretrain_val_auroc,
+                            "pretrain_val_accuracy": dl_irm_target_result.pretrain_val_accuracy,
+                            "pretrain_val_auprc": dl_irm_target_result.pretrain_val_auprc,
+                            "best_iteration": None,
+                        })
+
+                if "dl_csd" in model_types:
+                    dl_csd_cfg = replace(dl_csd_config, input_dim=len(feature_list), domain_count=domain_count)
+                    dl_csd_pipeline = DLCSDPipeline(dl_csd_cfg)
+                    dl_csd_result = dl_csd_pipeline.run(
+                        seed=seed,
+                        pretrain=pretrain_train_dataset,
+                        pretrain_val=pretrain_val_dataset,
+                        train=train_dataset,
+                        val=val_dataset,
+                        adapt=None,
+                        evaluation=eval_dataset,
+                    )
+                    results.append({
+                        **common_payload,
+                        "model": "dl_csd",
+                        "mode": "pretrain_finetune",
+                        "train_auroc": dl_csd_result.train_auroc,
+                        "val_auroc": dl_csd_result.val_auroc,
+                        "test_auroc": dl_csd_result.test_auroc,
+                        "train_accuracy": dl_csd_result.train_accuracy,
+                        "val_accuracy": dl_csd_result.val_accuracy,
+                        "test_accuracy": dl_csd_result.test_accuracy,
+                        "train_auprc": dl_csd_result.train_auprc,
+                        "val_auprc": dl_csd_result.val_auprc,
+                        "test_auprc": dl_csd_result.test_auprc,
+                        "pretrain_seconds": dl_csd_result.stage_durations.get("pretrain_seconds"),
+                        "finetune_seconds": dl_csd_result.stage_durations.get("finetune_seconds"),
+                        "adapt_seconds": dl_csd_result.stage_durations.get("adapt_seconds"),
+                        "pretrain_epochs": dl_csd_result.stage_epochs.get("pretrain_epochs"),
+                        "finetune_epochs": dl_csd_result.stage_epochs.get("finetune_epochs"),
+                        "adapt_epochs": dl_csd_result.stage_epochs.get("adapt_epochs"),
+                        "pretrain_val_auroc": dl_csd_result.pretrain_val_auroc,
+                        "pretrain_val_accuracy": dl_csd_result.pretrain_val_accuracy,
+                        "pretrain_val_auprc": dl_csd_result.pretrain_val_auprc,
+                        "best_iteration": None,
+                    })
+
+                    if train_dataset.X.size > 0:
+                        dl_csd_target_cfg = replace(dl_csd_cfg, pretrain_epochs=0)
+                        dl_csd_target_pipeline = DLCSDPipeline(dl_csd_target_cfg)
+                        dl_csd_target_result = dl_csd_target_pipeline.run(
+                            seed=seed,
+                            pretrain=None,
+                            pretrain_val=None,
+                            train=train_dataset,
+                            val=val_dataset,
+                            adapt=None,
+                            evaluation=eval_dataset,
+                        )
+                        results.append({
+                            **common_payload,
+                            "model": "dl_csd",
+                            "mode": "target_only",
+                            "train_auroc": dl_csd_target_result.train_auroc,
+                            "val_auroc": dl_csd_target_result.val_auroc,
+                            "test_auroc": dl_csd_target_result.test_auroc,
+                            "train_accuracy": dl_csd_target_result.train_accuracy,
+                            "val_accuracy": dl_csd_target_result.val_accuracy,
+                            "test_accuracy": dl_csd_target_result.test_accuracy,
+                            "train_auprc": dl_csd_target_result.train_auprc,
+                            "val_auprc": dl_csd_target_result.val_auprc,
+                            "test_auprc": dl_csd_target_result.test_auprc,
+                            "pretrain_seconds": dl_csd_target_result.stage_durations.get("pretrain_seconds"),
+                            "finetune_seconds": dl_csd_target_result.stage_durations.get("finetune_seconds"),
+                            "adapt_seconds": dl_csd_target_result.stage_durations.get("adapt_seconds"),
+                            "pretrain_epochs": dl_csd_target_result.stage_epochs.get("pretrain_epochs"),
+                            "finetune_epochs": dl_csd_target_result.stage_epochs.get("finetune_epochs"),
+                            "adapt_epochs": dl_csd_target_result.stage_epochs.get("adapt_epochs"),
+                        "pretrain_val_auroc": dl_csd_target_result.pretrain_val_auroc,
+                        "pretrain_val_accuracy": dl_csd_target_result.pretrain_val_accuracy,
+                        "pretrain_val_auprc": dl_csd_target_result.pretrain_val_auprc,
+                        "best_iteration": None,
+                        })
+
+                if "dl_mldg" in model_types:
+                    source_dataset = combined_pretrain
+                    if source_dataset.X.size == 0 or source_dataset.domains is None or source_dataset.domains.size == 0:
+                        continue
+                    val_source = pretrain_val_dataset if pretrain_val_dataset is not None else source_dataset
+                    dl_mldg_cfg = replace(dl_mldg_config, input_dim=len(feature_list))
+                    dl_mldg_pipeline = DLMldgPipeline(dl_mldg_cfg)
+                    dl_mldg_result = dl_mldg_pipeline.run(
+                        seed=seed,
+                        pretrain=source_dataset,
+                        pretrain_val=val_source,
+                        train=source_dataset,
+                        val=val_source,
+                        adapt=None,
+                        evaluation=eval_dataset,
+                    )
+                    results.append({
+                        **common_payload,
+                        "model": "dl_mldg",
+                        "mode": "pretrain_only",
+                        "train_auroc": dl_mldg_result.train_auroc,
+                        "val_auroc": dl_mldg_result.val_auroc,
+                        "test_auroc": dl_mldg_result.test_auroc,
+                        "train_accuracy": dl_mldg_result.train_accuracy,
+                        "val_accuracy": dl_mldg_result.val_accuracy,
+                        "test_accuracy": dl_mldg_result.test_accuracy,
+                        "train_auprc": dl_mldg_result.train_auprc,
+                        "val_auprc": dl_mldg_result.val_auprc,
+                        "test_auprc": dl_mldg_result.test_auprc,
+                        "pretrain_seconds": dl_mldg_result.stage_durations.get("pretrain_seconds"),
+                        "finetune_seconds": dl_mldg_result.stage_durations.get("finetune_seconds"),
+                        "adapt_seconds": dl_mldg_result.stage_durations.get("adapt_seconds"),
+                        "pretrain_epochs": dl_mldg_result.stage_epochs.get("pretrain_epochs"),
+                        "finetune_epochs": dl_mldg_result.stage_epochs.get("finetune_epochs"),
+                        "adapt_epochs": dl_mldg_result.stage_epochs.get("adapt_epochs"),
+                        "pretrain_val_auroc": dl_mldg_result.pretrain_val_auroc,
+                        "pretrain_val_accuracy": dl_mldg_result.pretrain_val_accuracy,
+                        "pretrain_val_auprc": dl_mldg_result.pretrain_val_auprc,
+                        "best_iteration": None,
+                    })
+
+                # if "tabpfn" in model_types and tabpfn_pipeline is not None:
+                #     def _append_tabpfn(result_obj: "TabPFNRunResult", mode: str) -> None:
+                #         results.append({
+                #             **common_payload,
+                #             "model": "tabpfn",
+                #             "mode": mode,
+                #             "train_auroc": result_obj.train_auroc,
+                #             "val_auroc": result_obj.val_auroc,
+                #             "test_auroc": result_obj.test_auroc,
+                #             "train_accuracy": result_obj.train_accuracy,
+                #             "val_accuracy": result_obj.val_accuracy,
+                #             "test_accuracy": result_obj.test_accuracy,
+                #             "train_auprc": result_obj.train_auprc,
+                #             "val_auprc": result_obj.val_auprc,
+                #             "test_auprc": result_obj.test_auprc,
+                #             "pretrain_seconds": None,
+                #             "finetune_seconds": result_obj.stage_durations.get("train_seconds"),
+                #             "adapt_seconds": None,
+                #             "pretrain_epochs": None,
+                #             "finetune_epochs": None,
+                #             "adapt_epochs": None,
+                #             "pretrain_val_auroc": float("nan"),
+                #             "pretrain_val_accuracy": float("nan"),
+                #             "pretrain_val_auprc": float("nan"),
+                #             "best_iteration": None,
+                #         })
+
+                #     if pretrain_train_dataset.X.size > 0:
+                #         try:
+                #             tabpfn_result = tabpfn_pipeline.run(
+                #                 seed=seed,
+                #                 train=train_dataset,
+                #                 val=val_dataset,
+                #                 evaluation=eval_dataset,
+                #                 extra_train=pretrain_train_dataset,
+                #             )
+                #         except ValueError:
+                #             tabpfn_result = None
+                #         if tabpfn_result is not None:
+                #             _append_tabpfn(tabpfn_result, "pretrain_finetune")
+
+                #     if train_dataset.X.size > 0:
+                #         try:
+                #             target_only_result = tabpfn_pipeline.run(
+                #                 seed=seed,
+                #                 train=train_dataset,
+                #                 val=val_dataset,
+                #                 evaluation=eval_dataset,
+                #                 extra_train=None,
+                #             )
+                #         except ValueError:
+                #             target_only_result = None
+                #         if target_only_result is not None:
+                #             _append_tabpfn(target_only_result, "target_only")
+
                 if "cdtrans" in model_types:
                     cdtrans_adapt_dataset = eval_dataset
                     cdtrans_val_dataset = eval_dataset
@@ -1194,6 +2374,26 @@ def run_all_scenarios(
     include_target_in_scaler: bool = True,
     feature_clip_value: Optional[float] = 5.0,
     transformer_overrides: Optional[Dict[str, object]] = None,
+    dl_erm_config: Optional[DLERMConfig] = None,
+    dl_erm_overrides: Optional[Dict[str, object]] = None,
+    dl_dann_config: Optional[DLDANNConfig] = None,
+    dl_dann_overrides: Optional[Dict[str, object]] = None,
+    dl_irm_config: Optional[DLIRMConfig] = None,
+    dl_irm_overrides: Optional[Dict[str, object]] = None,
+    dl_csd_config: Optional[DLCSConfig] = None,
+    dl_csd_overrides: Optional[Dict[str, object]] = None,
+    dl_mldg_config: Optional[DLMldgConfig] = None,
+    dl_mldg_overrides: Optional[Dict[str, object]] = None,
+    dl_clustering_config: Optional[DLClusteringConfig] = None,
+    dl_clustering_overrides: Optional[Dict[str, object]] = None,
+    dl_siamese_config: Optional[DLSiameseConfig] = None,
+    dl_siamese_overrides: Optional[Dict[str, object]] = None,
+    dl_reorder_config: Optional[DLReorderConfig] = None,
+    dl_reorder_overrides: Optional[Dict[str, object]] = None,
+    dl_masf_config: Optional[DLMASFConfig] = None,
+    dl_masf_overrides: Optional[Dict[str, object]] = None,
+    # tabpfn_config: Optional[TabPFNConfig] = None,
+    # tabpfn_overrides: Optional[Dict[str, object]] = None,
     max_target_shift_std: float = 15.0,
     max_feature_correlation: float = 0.0,
     correlation_sample_rows: int = 2000,
@@ -1201,6 +2401,11 @@ def run_all_scenarios(
     class_shift_max_samples: int = 5000,
     l1_feature_keep_ratio: float = 0.0,
     l1_max_samples: int = 5000,
+    optuna_tune: bool = False,
+    optuna_trials: int = 50,
+    optuna_seed: int = 42,
+    tuned_configs: Optional[Dict[str, object]] = None,
+    tuned_configs_out: Optional[Dict[str, object]] = None,
     scenario_specs: Optional[Sequence[ExperimentScenario]] = None,
     output_csv: Optional[Path] = None,
 ) -> pd.DataFrame:
@@ -1222,6 +2427,7 @@ def run_all_scenarios(
             raise ValueError("No dataset combinations available for scenario generation")
 
     resolved_feature_strategy = _resolve_feature_strategy(feature_strategy, fine_tune_ratios)
+    tuned_configs = tuned_configs if tuned_configs is not None else {}
 
     for scenario in scenario_list:
         scenario_results = run_experiment_scenario(
@@ -1248,6 +2454,26 @@ def run_all_scenarios(
             include_target_in_scaler=include_target_in_scaler,
             feature_clip_value=feature_clip_value,
             transformer_overrides=transformer_overrides,
+            dl_erm_config=dl_erm_config,
+            dl_erm_overrides=dl_erm_overrides,
+            dl_dann_config=dl_dann_config,
+            dl_dann_overrides=dl_dann_overrides,
+            dl_irm_config=dl_irm_config,
+            dl_irm_overrides=dl_irm_overrides,
+            dl_csd_config=dl_csd_config,
+            dl_csd_overrides=dl_csd_overrides,
+            dl_mldg_config=dl_mldg_config,
+            dl_mldg_overrides=dl_mldg_overrides,
+            dl_clustering_config=dl_clustering_config,
+            dl_clustering_overrides=dl_clustering_overrides,
+            dl_siamese_config=dl_siamese_config,
+            dl_siamese_overrides=dl_siamese_overrides,
+            dl_reorder_config=dl_reorder_config,
+            dl_reorder_overrides=dl_reorder_overrides,
+            dl_masf_config=dl_masf_config,
+            dl_masf_overrides=dl_masf_overrides,
+            # tabpfn_config=tabpfn_config,
+            # tabpfn_overrides=tabpfn_overrides,
             max_target_shift_std=max_target_shift_std,
             max_feature_correlation=max_feature_correlation,
             correlation_sample_rows=correlation_sample_rows,
@@ -1255,6 +2481,10 @@ def run_all_scenarios(
             class_shift_max_samples=class_shift_max_samples,
             l1_feature_keep_ratio=l1_feature_keep_ratio,
             l1_max_samples=l1_max_samples,
+            optuna_tune=optuna_tune,
+            optuna_trials=optuna_trials,
+            optuna_seed=optuna_seed,
+            tuned_configs=tuned_configs,
         )
         all_results.extend(scenario_results)
 
@@ -1266,4 +2496,9 @@ def run_all_scenarios(
     if output_csv is not None:
         output_csv.parent.mkdir(parents=True, exist_ok=True)
         df.to_csv(output_csv, index=False)
+    if tuned_configs_out is not None:
+        tuned_configs_out.update({
+            name: (asdict(cfg) if is_dataclass(cfg) else cfg)
+            for name, cfg in tuned_configs.items()
+        })
     return df
