@@ -12,6 +12,7 @@ from sklearn.metrics import accuracy_score, average_precision_score, roc_auc_sco
 class ArrayDataset:
     X: np.ndarray
     y: np.ndarray
+    domains: Optional[np.ndarray] = None
 
     def is_valid(self) -> bool:
         return self.X.size > 0 and len(np.unique(self.y)) >= 2
