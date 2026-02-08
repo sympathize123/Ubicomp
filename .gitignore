@@ -27,6 +27,8 @@ selected_users_dataset/
 *.xlsx
 *.pdf
 data/
+
+# Folders
 GLOBEM/
 FEEL/
 domain_adaptation/
