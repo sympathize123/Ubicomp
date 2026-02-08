@@ -27,6 +27,12 @@ selected_users_dataset/
 *.xlsx
 *.pdf
 data/
+GLOBEM/
+FEEL/
+domain_adaptation/
+analysis/
+D-4
+
 
 # Folders
 GLOBEM/
