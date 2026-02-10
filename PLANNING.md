@@ -39,7 +39,35 @@ We are building a comprehensive benchmark suite. Detailed guide available in `CO
 ### 2.3 Documentation
 - [x] `CONTRIBUTING_GUIDE.md`: Detailed instructions for team members to implement remaining algorithms and code sources.
 
-## 3. Benchmark Protocol & Experimental Design
+## 3. Detailed Implementation Specifics (From Implementation Plan)
+*This section details the technical execution steps for the "Within-Dataset" benchmark.*
+
+### 3.1 Protocol & Preprocessing
+- **Datasets**: Using "full feature" versions (`stress_binary_personal-full.pkl`) from `CHI/data/Archived`.
+- **Split Strategy**: Temporal Split (60% Train, 20% Val, 20% Test) **per user**.
+    - Indices are aggregated to form Global Train/Val/Test sets.
+- **Normalization**: Z-score normalization **per user** ($z = \frac{x - \mu}{\sigma}$) before concatenation.
+- **Filtering**: Drop users with $< N$ samples or significant class imbalance.
+
+### 3.2 Data Pipeline (`src/data_loader.py`)
+- **`StressDataset` Class**:
+    - **`filter_users()`**: Logic to remove ineligible users.
+    - **`normalize_features()`**: User-wise normalization logic.
+    - **`get_splits()`**: Temporal splitting logic (Sort by timestamp -> Split -> Aggregate).
+
+### 3.3 Execution Pipeline
+- **Script**: `execute_benchmark.py`
+    - Dynamic model loading via `--model`.
+    - Supports 3 seeds for robust evaluation.
+    - Handles initialization for diverse model types (Torch, Sklearn, etc.).
+- **Wrapper**: `run_benchmark_all.sh`
+    - Automates iteration over the expanded model list and datasets.
+
+### 3.4 Verification Steps
+- [ ] Verify new model classes train for 1 epoch on D-1.
+- [ ] Check accuracy is better than random (>50%).
+
+## 4. Benchmark Protocol & Experimental Design (Rationale)
 *Rationale for Hyperparameter Optimization (HPO) and Model Selection*
 
 To ensure our benchmark meets top-tier conference standards (e.g., NeurIPS Datasets & Benchmarks Track), we adhere to rigorous evaluation protocols.
