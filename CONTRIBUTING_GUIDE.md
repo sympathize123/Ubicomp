@@ -28,14 +28,14 @@ Goal: Access to unlabeled target domain data during training.
     - **Code Source**: Adapted from [SSARCandy/DeepCORAL](https://github.com/SSARCandy/DeepCORAL).
     - **Paper**: Sun et al., 2016.
 
-**Class-wise & Recent Methods (To Implement):**
+**Class-wise & Recent Methods:**
 *Please implement these by referencing the official TLL repository where possible.*
 
-- [ ] **CDAN (Conditional Domain Adversarial Network)** (High Priority)
+- [x] **CDAN (Conditional Domain Adversarial Network)** (High Priority) (Implemented)
     - **Rationale**: Condition the domain discriminator on class predictions. Captures multimodal structures crucial for complex shifts.
     - **Code Source**: [thuml/Transfer-Learning-Library/CDAN](https://github.com/thuml/Transfer-Learning-Library/blob/master/examples/domain_adaptation/image_classification/cdan.py)
     - **Paper**: Long et al., 2018 (NeurIPS).
-- [ ] **MCC (Minimum Class Confusion)**
+- [x] **MCC (Minimum Class Confusion)** (Implemented)
     - **Rationale**: Directly minimizes class confusion on the target domain. A non-adversarial, class-wise alignment method.
     - **Code Source**: [thuml/Transfer-Learning-Library/MCC](https://github.com/thuml/Transfer-Learning-Library/blob/master/examples/domain_adaptation/image_classification/mcc.py)
     - **Paper**: Jin et al., 2020 (ECCV).

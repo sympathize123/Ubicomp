@@ -9,8 +9,9 @@ import torch.nn as nn
 import sys
 from src.data_loader import StressDataset
 from src.models import XGBoostWrapper, LightGBMWrapper, MLP, ResNet, TabNetWrapper, TabPFNWrapper, WidedeepWrapper, PytorchTabularWrapper, DeepCTRWrapper, train_torch_model, evaluate_model
-from src.da_models import DANN, train_dann
-from src.domainbed_algos import ERM as DG_ERM, IRM, VREx, GroupDRO, MixStyle, train_dg_model
+from src.da_models import DANN, CDAN, DeepCORAL, MCC, train_adversarial_da, train_mcc, train_dann
+from src.domainbed_algos import ERM as DG_ERM, IRM, VREx, GroupDRO, MixStyle, MLDG, MASF, train_dg_model
+from src.domainbed_algos import ERM as DG_ERM, IRM, VREx, GroupDRO, MixStyle, MLDG, MASF, train_dg_model
 from sklearn.preprocessing import LabelEncoder
 
 # Constants
@@ -32,7 +33,7 @@ class DANNInferenceWrapper(nn.Module):
 def get_args():
     parser = argparse.ArgumentParser(description="Run Within-Dataset Benchmark")
     parser.add_argument('--dataset', type=str, required=True, choices=['D-1', 'D-2', 'D-3'], help='Dataset to benchmark')
-    parser.add_argument('--model', type=str, required=True, choices=['XGB', 'LGB', 'MLP', 'ResNet', 'DANN', 'TabNet', 'TabPFN', 'SAINT', 'TabTransformer', 'NODE', 'DCN', 'IRM', 'VREx', 'GroupDRO', 'MixStyle', 'ERM_DG'], help='Model to use')
+    parser.add_argument('--model', type=str, required=True, choices=['XGB', 'LGB', 'MLP', 'ResNet', 'DANN', 'CDAN', 'DeepCORAL', 'MCC', 'TabNet', 'TabPFN', 'SAINT', 'TabTransformer', 'NODE', 'DCN', 'IRM', 'VREx', 'GroupDRO', 'MixStyle', 'ERM_DG', 'MLDG', 'MASF'], help='Model to use')
     parser.add_argument('--backbone', type=str, default='MLP', choices=['MLP', 'ResNet', 'Transformer'], help='Backbone for DG/DA models')
     parser.add_argument('--epochs', type=int, default=50, help='Epochs for DL models')
     parser.add_argument('--batch_size', type=int, default=64, help='Batch size for DL models')
@@ -55,7 +56,7 @@ def main():
     X_test, y_test = ds.X[test_idx], ds.y[test_idx]
     
     # Domain Labels (Users) for DANN and DG Models
-    DG_MODELS = ['DANN', 'IRM', 'VREx', 'GroupDRO', 'MixStyle', 'ERM_DG']
+    DG_MODELS = ['DANN', 'CDAN', 'DeepCORAL', 'MCC', 'IRM', 'VREx', 'GroupDRO', 'MixStyle', 'ERM_DG', 'MLDG', 'MASF']
     
     if args.model in DG_MODELS:
         print(f"Preparing Domain Labels for {args.model}...")
@@ -118,9 +119,13 @@ def main():
             model = train_torch_model(net, X_train, y_train, X_val, y_val, 
                                       epochs=args.epochs, batch_size=args.batch_size, lr=args.lr)
         elif args.model == 'DANN':
-            net = DANN(input_dim=input_dim, num_domains=num_domains, hidden_dim=256, dropout=0.3)
-            model = train_dann(net, X_train, y_train, d_train, X_val, y_val, d_val,
-                               epochs=args.epochs, batch_size=args.batch_size, lr=args.lr)
+            # net = DANN(input_dim=input_dim, num_domains=num_domains, hidden_dim=256, dropout=0.3)
+            net = DANN(input_dim=input_dim, num_classes=2, num_domains=num_domains, 
+                hparams={'lr': args.lr, 'backbone': args.backbone, 'dropout': 0.3, 'hidden_dim': 256})
+            # model = train_dann(net, X_train, y_train, d_train, X_val, y_val, d_val,
+            #                    epochs=args.epochs, batch_size=args.batch_size, lr=args.lr)
+            model = train_dann_legacy(net, X_train, y_train, d_train, X_val, y_val, d_val,
+                          epochs=args.epochs, batch_size=args.batch_size)
             # Wrap for evaluation
             model = DANNInferenceWrapper(model)
         
@@ -136,11 +141,15 @@ def main():
         elif args.model == 'ERM_DG':
             # Baseline ERM within the DG framework (same backbone)
             model = DG_ERM(input_dim=input_dim, num_classes=2, hparams={'lr': args.lr, 'backbone': args.backbone})
-            
+        elif args.model == 'MLDG':
+            model = MLDG(input_dim=input_dim, num_classes=2, hparams={'lr': args.lr, 'backbone': args.backbone})
+        elif args.model == 'MASF':
+            model = MASF(input_dim=input_dim, num_classes=2, hparams={'lr': args.lr, 'backbone': args.backbone})
+                   
         # 3. Train (if not already trained inside helper)
         if args.model in ['XGB', 'LGB', 'TabNet', 'TabPFN', 'SAINT', 'TabTransformer', 'NODE', 'DCN']:
             model.fit(X_train, y_train, X_val, y_val)
-        elif args.model in ['IRM', 'VREx', 'GroupDRO', 'MixStyle', 'ERM_DG']:
+        elif args.model in ['IRM', 'VREx', 'GroupDRO', 'MixStyle', 'ERM_DG', 'MLDG', 'MASF']:
             # Use specialized DG training loop
             model = train_dg_model(model, X_train, y_train, d_train, X_val, y_val, d_val,
                                    epochs=args.epochs, batch_size=32, domains_per_batch=8)
