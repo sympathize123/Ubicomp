@@ -92,16 +92,28 @@ We model our protocol after these accepted NeurIPS/ICLR benchmarks:
 - **Goal**: Implement high-priority DA methods (ADDA, JAN, SHOT).
 - **Action**: Team to follow `CONTRIBUTING_GUIDE.md` to add remaining models to `src/da_models.py`.
 
-### Phase 4: Large-Scale Benchmarking
+### Phase 4: Tabular Deep Learning & Foundation Models (Alignment with Implementation Plan)
+*These models are critical baselines for our "Backbone Agnostic" claim.*
+- [ ] **Tabular DL Baselines**:
+    - **TabNet** (`pytorch-tabnet`)
+    - **TabTransformer** (Attention-based)
+    - **NODE** (Neural Oblivious Decision Ensembles)
+    - **SAINT** (Self-Attention and Intersample Attention)
+    - **FT-Transformer** (Feature Tokenizer + Transformer)
+- [ ] **Foundation Models**:
+    - **TabPFN** (Prior-Data Fitted Network): A transformer pre-trained on synthetic datasets, acting as a foundation model for tabular data.
+- **Action**: Integrate these into `src/models.py` wrappers.
+
+### Phase 5: Large-Scale Benchmarking
 - **Goal**: Run full factorial experiments (Grid Search or fixed hyperparams).
 - **Matrix**:
     - Datasets: D-1, D-2, D-3
-    - Models: All DG/DA list
+    - Models: All DG/DA list + Tabular DL + Foundation Models
     - Backbones: MLP, ResNet, Transformer
     - Seeds: 3-5 runs
 - **Action**: Use `run_benchmark_all.sh` (needs update) to execute batch jobs.
 
-### Phase 5: HPO (Hyperparameter Optimization)
+### Phase 6: HPO (Hyperparameter Optimization)
 - **Goal**: Optimize `lr`, `dropout`, and algorithm-specific params (`lambda`, `penalty_weight`).
 - **Action**: Integrate Optuna or Ray Tune if performance is unsatisfactory with default params.
 
