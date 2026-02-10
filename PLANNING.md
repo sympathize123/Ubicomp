@@ -39,7 +39,31 @@ We are building a comprehensive benchmark suite. Detailed guide available in `CO
 ### 2.3 Documentation
 - [x] `CONTRIBUTING_GUIDE.md`: Detailed instructions for team members to implement remaining algorithms and code sources.
 
-## 3. Next Steps (Roadmap)
+## 3. Benchmark Protocol & Experimental Design
+*Rationale for Hyperparameter Optimization (HPO) and Model Selection*
+
+To ensure our benchmark meets top-tier conference standards (e.g., NeurIPS Datasets & Benchmarks Track), we adhere to rigorous evaluation protocols.
+
+### 3.1 Why HPO is Mandatory?
+- **Avoid "Tuning on Test"**: Fixed hyperparameters often favor methods that happened to be tuned on specific datasets in their original papers. HPO ensures fair comparison by searching for optimal settings for *every* model on *every* dataset.
+- **DomainBed Standard**: We follow the protocol defined by **Gulrajani & Lopez-Paz (2021)** in *"In Search of Lost Domain Generalization"*, which demonstrated that many state-of-the-art DG methods are no better than ERM when hyperparameters are fairly tuned.
+- **Tabular Data Sensitivity**: Tree-based models (XGB/LGB) and Deep Tabular models (TabNet/FT-Transformer) have vastly different sensitivities. Random search is preferred over grid search for efficiency and better coverage (Bergstra & Bengio, 2012).
+
+### 3.2 Protocol Details
+- **Split Strategy**: Train / Validation (ID) / Test (OOD).
+    - *Validation (ID)*: Used for HPO and early stopping.
+    - *Test (OOD)*: **Never** used for tuning (No "Oracle" selection).
+- **Search Strategy**:
+    - **Random Search**: 20 trials per model/dataset combination.
+    - **Search Space**: Defined in `src/hparams_registry.py` (to be created, mirroring DomainBed's registry).
+- **Evaluation Metric**: Average performance across 3 independent seeds.
+
+### 3.3 References
+1.  **DomainBed**: Gulrajani, I., & Lopez-Paz, D. (2021). *In Search of Lost Domain Generalization*. ICLR. (Standard for DG protocols).
+2.  **Tabular Benchmarks**: Grinsztajn, L., et al. (2022). *Why do tree-based models still outperform deep learning on typical tabular data?*. NeurIPS. (Rationale for tabular HPO).
+3.  **Wilds**: Koh, P. W., et al. (2021). *WILDS: A Benchmark of in-the-Wild Distribution Shifts*. ICML.
+
+## 4. Next Steps (Roadmap)
 
 ### Phase 3: Complete DA Baselines
 - **Goal**: Implement high-priority DA methods (ADDA, JAN, SHOT).
