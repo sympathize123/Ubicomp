@@ -6,7 +6,7 @@ from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
 import xgboost as xgb
 import lightgbm as lgb
 from pytorch_tabnet.tab_model import TabNetClassifier
-from tabpfn import TabPFNClassifier
+#from tabpfn import TabPFNClassifier
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -72,29 +72,29 @@ class TabNetWrapper(BaseEstimator, ClassifierMixin):
     def predict_proba(self, X):
         return self.model.predict_proba(X)
 
-class TabPFNWrapper(BaseEstimator, ClassifierMixin):
-    def __init__(self, **kwargs):
-        self.model = TabPFNClassifier(device='cuda' if torch.cuda.is_available() else 'cpu', N_ensemble_configurations=3, **kwargs)
+# class TabPFNWrapper(BaseEstimator, ClassifierMixin):
+#     def __init__(self, **kwargs):
+#         self.model = TabPFNClassifier(device='cuda' if torch.cuda.is_available() else 'cpu', N_ensemble_configurations=3, **kwargs)
 
-    def fit(self, X, y, X_val=None, y_val=None):
-        from tabpfn import TabPFNClassifier
-        # TabPFN doesn't use validation set for early stopping, it's a PFN.
-        # It handles small datasets well. Subsampling might be needed for large Train.
-        # TabPFN assumes smaller datasets (e.g. < 10k samples). 
-        # Our Global Train is ~12k samples. It might be slow or hit memory limits.
-        # We will try fitting directly.
-        if X.shape[0] > 10000:
-             # Subsample for TabPFN if too large? 
-             # For benchmark strictness, let's try full. If OOM, we'll subsample.
-             pass
-        self.model.fit(X, y)
-        return self
+#     def fit(self, X, y, X_val=None, y_val=None):
+#         from tabpfn import TabPFNClassifier
+#         # TabPFN doesn't use validation set for early stopping, it's a PFN.
+#         # It handles small datasets well. Subsampling might be needed for large Train.
+#         # TabPFN assumes smaller datasets (e.g. < 10k samples). 
+#         # Our Global Train is ~12k samples. It might be slow or hit memory limits.
+#         # We will try fitting directly.
+#         if X.shape[0] > 10000:
+#              # Subsample for TabPFN if too large? 
+#              # For benchmark strictness, let's try full. If OOM, we'll subsample.
+#              pass
+#         self.model.fit(X, y)
+#         return self
 
-    def predict(self, X):
-        return self.model.predict(X)
+#     def predict(self, X):
+#         return self.model.predict(X)
 
-    def predict_proba(self, X):
-        return self.model.predict_proba(X)
+#     def predict_proba(self, X):
+#         return self.model.predict_proba(X)
 
 # --- Wrappers for Advanced Tabular DL ---
 

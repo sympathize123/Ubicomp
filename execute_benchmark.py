@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 import sys
 from src.data_loader import StressDataset
-from src.models import XGBoostWrapper, LightGBMWrapper, MLP, ResNet, TabNetWrapper, TabPFNWrapper, WidedeepWrapper, PytorchTabularWrapper, DeepCTRWrapper, train_torch_model, evaluate_model
+from src.models import XGBoostWrapper, LightGBMWrapper, MLP, ResNet, TabNetWrapper, WidedeepWrapper, PytorchTabularWrapper, DeepCTRWrapper, train_torch_model, evaluate_model
 from src.da_models import DANN, CDAN, DeepCORAL, MCC, train_adversarial_da, train_mcc, train_dann
 from src.domainbed_algos import ERM as DG_ERM, IRM, VREx, GroupDRO, MixStyle, MLDG, MASF, train_dg_model
 from src.domainbed_algos import ERM as DG_ERM, IRM, VREx, GroupDRO, MixStyle, MLDG, MASF, train_dg_model
@@ -16,9 +16,9 @@ from sklearn.preprocessing import LabelEncoder
 
 # Constants
 DATASETS = {
-    'D-1': '/home/iclab/minseo/CHI/data/Archived/stress_binary_personal-full.pkl',
-    'D-2': '/home/iclab/minseo/CHI/data/Archived/stress_binary_personal-full_D#2.pkl',
-    'D-3': '/home/iclab/minseo/CHI/data/Archived/stress_binary_personal-full_D#3.pkl'
+    'D-1': '/home/iclab/Tomiris/Ubicomp/data/stress_binary_personal-full.pkl',
+    'D-2': '/home/iclab/Tomiris/Ubicomp/data/stress_binary_personal-full_D#2.pkl',
+    'D-3': '/home/iclab/Tomiris/Ubicomp/data/stress_binary_personal-full_D#3.pkl'
 }
 
 class DANNInferenceWrapper(nn.Module):

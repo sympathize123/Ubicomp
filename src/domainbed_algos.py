@@ -236,6 +236,102 @@ class MixStyle(DGModel):
         self.optimizer.step()
         return {'loss': loss.item()}
 
+
+class MLDG(DGModel):
+    """Meta-Learning for Domain Generalization (Li et al., 2018), first-order variant."""
+
+    def __init__(self, input_dim, num_classes=2, hparams=None):
+        super().__init__(input_dim, num_classes, hparams)
+        self.optimizer = torch.optim.Adam(self.network.parameters(), lr=hparams.get('lr', 1e-3))
+        self.beta = hparams.get('mldg_beta', 1.0)
+
+    def update(self, minibatches, unlabeled=None):
+        if len(minibatches) < 2:
+            raise ValueError("MLDG requires at least two domains per update")
+
+        device = minibatches[0][0].device
+        meta_test_idx = torch.randint(len(minibatches), (1,), device=device).item()
+        meta_train = [b for i, b in enumerate(minibatches) if i != meta_test_idx]
+        meta_test = minibatches[meta_test_idx]
+
+        # Meta-train loss
+        train_losses = []
+        for x, y in meta_train:
+            logits = self.network(x)
+            train_losses.append(F.cross_entropy(logits, y))
+        meta_train_loss = torch.stack(train_losses).mean()
+
+        # Meta-test loss
+        x_meta, y_meta = meta_test
+        meta_test_logits = self.network(x_meta)
+        meta_test_loss = F.cross_entropy(meta_test_logits, y_meta)
+
+        total_loss = meta_train_loss + self.beta * meta_test_loss
+
+        self.optimizer.zero_grad()
+        total_loss.backward()
+        self.optimizer.step()
+
+        return {
+            'loss': total_loss.item(),
+            'meta_train_loss': meta_train_loss.item(),
+            'meta_test_loss': meta_test_loss.item(),
+        }
+
+
+class MASF(DGModel):
+    """MMD-based alignment regularizer across domain features."""
+
+    def __init__(self, input_dim, num_classes=2, hparams=None):
+        super().__init__(input_dim, num_classes, hparams)
+        self.optimizer = torch.optim.Adam(self.network.parameters(), lr=hparams.get('lr', 1e-3))
+        self.lambda_mmd = hparams.get('masf_lambda', 1.0)
+        self.sigma = hparams.get('masf_sigma', 1.0)
+
+    def _gaussian_kernel(self, x, y, sigma):
+        x_exp = x.unsqueeze(1)
+        y_exp = y.unsqueeze(0)
+        diff = x_exp - y_exp
+        dist_sq = (diff * diff).sum(dim=2)
+        return torch.exp(-dist_sq / (2 * sigma * sigma))
+
+    def _mmd(self, f1, f2):
+        k11 = self._gaussian_kernel(f1, f1, self.sigma)
+        k22 = self._gaussian_kernel(f2, f2, self.sigma)
+        k12 = self._gaussian_kernel(f1, f2, self.sigma)
+        return k11.mean() + k22.mean() - 2 * k12.mean()
+
+    def update(self, minibatches, unlabeled=None):
+        device = minibatches[0][0].device
+        ce_losses = []
+        features = []
+
+        for x, y in minibatches:
+            logits = self.network(x)
+            ce_losses.append(F.cross_entropy(logits, y))
+            with torch.no_grad():
+                features.append(self.featurizer(x).detach())
+
+        ce_loss = torch.stack(ce_losses).mean()
+
+        mmd_terms = []
+        for i in range(len(features)):
+            for j in range(i + 1, len(features)):
+                mmd_terms.append(self._mmd(features[i], features[j]))
+        mmd_loss = torch.stack(mmd_terms).mean() if mmd_terms else torch.tensor(0.0, device=device)
+
+        total_loss = ce_loss + self.lambda_mmd * mmd_loss
+
+        self.optimizer.zero_grad()
+        total_loss.backward()
+        self.optimizer.step()
+
+        return {
+            'loss': total_loss.item(),
+            'ce_loss': ce_loss.item(),
+            'mmd_loss': mmd_loss.item(),
+        }
+
 # --- Training Helper ---
 
 import numpy as np
