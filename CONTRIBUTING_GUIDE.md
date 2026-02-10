@@ -27,6 +27,27 @@ Goal: Access to unlabeled target domain data during training.
     - **Rationale**: Aligns second-order statistics (covariance) of source and target features. Simple and effective.
     - **Code Source**: Adapted from [SSARCandy/DeepCORAL](https://github.com/SSARCandy/DeepCORAL).
     - **Paper**: Sun et al., 2016.
+    - **Paper**: Sun et al., 2016.
+
+### Tabular Deep Learning & Foundation Models
+Goal: Leverage specialized architectures for tabular data (beyond simple MLP/ResNet).
+*Implemented in `src/models.py` using wrappers.*
+
+- [x] **TabNet** (Implemented)
+    - **Rationale**: Attentive interpretable tabular learning. Uses sequential attention to select features.
+    - **Wraps**: `pytorch_tabnet`
+- [x] **TabTransformer** (Implemented)
+    - **Rationale**: Transformer-based model for tabular data, using self-attention on categorical embeddings.
+    - **Wraps**: `pytorch_widedeep`
+- [x] **SAINT (Self-Attention and Intersample Attention)** (Implemented)
+    - **Rationale**: Attention over both rows (samples) and columns (features). SOTA for many tabular tasks.
+    - **Wraps**: `pytorch_widedeep`
+- [x] **NODE (Neural Oblivious Decision Ensembles)** (Implemented)
+    - **Rationale**: Differentiable oblivious decision trees.
+    - **Wraps**: `pytorch_tabular`
+- [x] **TabPFN (Prior-Data Fitted Network)** (Implemented)
+    - **Rationale**: A foundation model pre-trained on synthetic datasets. Requires no training (inference only) or fine-tuning.
+    - **Wraps**: `tabpfn`
 
 **Class-wise & Recent Methods:**
 *Please implement these by referencing the official TLL repository where possible.*
