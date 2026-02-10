@@ -17,6 +17,12 @@ This document tracks the progress of the Cross-Dataset and Within-Dataset Benchm
 ### 2.2 Algorithm Implementation status
 We are building a comprehensive benchmark suite. Detailed guide available in `CONTRIBUTING_GUIDE.md`.
 
+#### Standard Baselines - *Complete*
+- [x] **XGBoost** (Gradient Boosting)
+- [x] **LightGBM** (Gradient Boosting)
+- [x] **MLP** (Simple Feed-Forward)
+- [x] **ResNet** (ResNet for Tabular Data - RTDL)
+
 #### Domain Generalization (DG) - *Complete*
 - [x] **ERM** (Baseline)
 - [x] **IRM** (Invariant Risk Minimization)
