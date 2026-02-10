@@ -39,20 +39,20 @@ Goal: Access to unlabeled target domain data during training.
     - **Rationale**: Directly minimizes class confusion on the target domain. A non-adversarial, class-wise alignment method.
     - **Code Source**: [thuml/Transfer-Learning-Library/MCC](https://github.com/thuml/Transfer-Learning-Library/blob/master/examples/domain_adaptation/image_classification/mcc.py)
     - **Paper**: Jin et al., 2020 (ECCV).
-- [ ] **ADDA (Adversarial Discriminative Domain Adaptation)**
-    - **Rationale**: Decouples source and target encoders with GAN loss.
-    - **Code Source**: [jvanvugt/pytorch-domain-adaptation](https://github.com/jvanvugt/pytorch-domain-adaptation)
+- [x] **ADDA (Adversarial Discriminative Domain Adaptation)** (Implemented)
+    - **Rationale**: Decouples source and target encoders with GAN loss. (Implemented as Phase 1 Pretraining for Within-Dataset Benchmark).
+    - **Code Source**: Adapted from [jvanvugt/pytorch-domain-adaptation](https://github.com/jvanvugt/pytorch-domain-adaptation)
     - **Paper**: Tzeng et al., 2017 (CVPR).
-- [ ] **DAN (Deep Adaptation Network)** / **JAN (Joint Adaptation Network)**
-    - **Rationale**: MMD-based distribution alignment. JAN aligns joint distributions of features and labels.
+- [x] **JAN (Joint Adaptation Network)** (Implemented)
+    - **Rationale**: MMD-based distribution alignment. JAN aligns joint distributions of features and labels using JMMD.
     - **Code Source**: [thuml/Transfer-Learning-Library/DAN](https://github.com/thuml/Transfer-Learning-Library/blob/master/examples/domain_adaptation/image_classification/dan.py)
-    - **Paper**: Long et al., 2015/2017 (ICML).
-- [ ] **MCD (Maximum Classifier Discrepancy)**
+    - **Paper**: Long et al., 2017 (ICML).
+- [x] **MCD (Maximum Classifier Discrepancy)** (Implemented)
     - **Rationale**: Uses two classifiers to align distributions by minimizing their discrepancy on target data.
     - **Code Source**: [mil-tokyo/MCD_DA](https://github.com/mil-tokyo/MCD_DA)
     - **Paper**: Saito et al., 2018 (CVPR).
-- [ ] **SHOT (Source Hypothesis Transfer)**
-    - **Rationale**: Recent SOTA for Source-Free Domain Adaptation (SFDA). Adapts using information maximization and pseudo-labeling without source data.
+- [x] **SHOT (Source Hypothesis Transfer)** (Implemented)
+    - **Rationale**: Recent SOTA for Source-Free Domain Adaptation (SFDA). Adapts using information maximization and pseudo-labeling.
     - **Code Source**: [tim-learn/SHOT](https://github.com/tim-learn/SHOT)
     - **Paper**: Liang et al., 2020 (ICML).
 - [ ] **CBST (Class-Balanced Self-Training)**
