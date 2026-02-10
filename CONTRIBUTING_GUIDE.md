@@ -8,6 +8,102 @@ This guide explains how to add new **Domain Generalization (DG)** and **Domain A
 
 ---
 
+## Algorithm Checklist & Rationale
+
+We have selected SOTA algorithms covering different mechanisms of Domain Generalization (DG) and Domain Adaptation (DA).
+**Trusted Code Sources**: Please refer to these repositories for implementation details.
+1.  **DomainBed**: [facebookresearch/DomainBed](https://github.com/facebookresearch/DomainBed) (DG Standard)
+2.  **Transfer-Learning-Library (TLL)**: [thuml/Transfer-Learning-Library](https://github.com/thuml/Transfer-Learning-Library) (DA Standard)
+
+### Domain Adaptation (DA)
+Goal: Access to unlabeled target domain data during training.
+
+**Core Baselines:**
+- [x] **DANN (Domain-Adversarial Neural Networks)** (Implemented)
+    - **Rationale**: The classic adversarial approach. Aligns feature distributions by confusing a domain discriminator.
+    - **Code Source**: Adapted from [shonenkov/DANN-PyTorch](https://github.com/shonenkov/DANN-PyTorch) & TLL.
+    - **Paper**: Ganin et al., 2016.
+- [x] **DeepCORAL (Correlation Alignment)** (Implemented)
+    - **Rationale**: Aligns second-order statistics (covariance) of source and target features. Simple and effective.
+    - **Code Source**: Adapted from [SSARCandy/DeepCORAL](https://github.com/SSARCandy/DeepCORAL).
+    - **Paper**: Sun et al., 2016.
+
+**Class-wise & Recent Methods (To Implement):**
+*Please implement these by referencing the official TLL repository where possible.*
+
+- [ ] **CDAN (Conditional Domain Adversarial Network)** (High Priority)
+    - **Rationale**: Condition the domain discriminator on class predictions. Captures multimodal structures crucial for complex shifts.
+    - **Code Source**: [thuml/Transfer-Learning-Library/CDAN](https://github.com/thuml/Transfer-Learning-Library/blob/master/examples/domain_adaptation/image_classification/cdan.py)
+    - **Paper**: Long et al., 2018 (NeurIPS).
+- [ ] **MCC (Minimum Class Confusion)**
+    - **Rationale**: Directly minimizes class confusion on the target domain. A non-adversarial, class-wise alignment method.
+    - **Code Source**: [thuml/Transfer-Learning-Library/MCC](https://github.com/thuml/Transfer-Learning-Library/blob/master/examples/domain_adaptation/image_classification/mcc.py)
+    - **Paper**: Jin et al., 2020 (ECCV).
+- [ ] **ADDA (Adversarial Discriminative Domain Adaptation)**
+    - **Rationale**: Decouples source and target encoders with GAN loss.
+    - **Code Source**: [jvanvugt/pytorch-domain-adaptation](https://github.com/jvanvugt/pytorch-domain-adaptation)
+    - **Paper**: Tzeng et al., 2017 (CVPR).
+- [ ] **DAN (Deep Adaptation Network)** / **JAN (Joint Adaptation Network)**
+    - **Rationale**: MMD-based distribution alignment. JAN aligns joint distributions of features and labels.
+    - **Code Source**: [thuml/Transfer-Learning-Library/DAN](https://github.com/thuml/Transfer-Learning-Library/blob/master/examples/domain_adaptation/image_classification/dan.py)
+    - **Paper**: Long et al., 2015/2017 (ICML).
+- [ ] **MCD (Maximum Classifier Discrepancy)**
+    - **Rationale**: Uses two classifiers to align distributions by minimizing their discrepancy on target data.
+    - **Code Source**: [mil-tokyo/MCD_DA](https://github.com/mil-tokyo/MCD_DA)
+    - **Paper**: Saito et al., 2018 (CVPR).
+- [ ] **SHOT (Source Hypothesis Transfer)**
+    - **Rationale**: Recent SOTA for Source-Free Domain Adaptation (SFDA). Adapts using information maximization and pseudo-labeling without source data.
+    - **Code Source**: [tim-learn/SHOT](https://github.com/tim-learn/SHOT)
+    - **Paper**: Liang et al., 2020 (ICML).
+- [ ] **CBST (Class-Balanced Self-Training)**
+    - **Rationale**: Self-training with class balancing to mitigate label shift.
+    - **Code Source**: [yzou2/CBST](https://github.com/yzou2/CBST)
+    - **Paper**: Zou et al., 2018 (ECCV).
+
+### Domain Generalization (DG)
+Goal: Train on source domains to generalize to unseen target domains.
+
+**Implemented (using DomainBed reference):**
+*All defined in `src/domainbed_algos.py` following [facebookresearch/DomainBed](https://github.com/facebookresearch/DomainBed)*
+
+- [x] **ERM (Empirical Risk Minimization)** (Implemented)
+    - **Rationale**: Standard training baseline. Serves as the lower bound for performance.
+    - **Code Source**: DomainBed `algorithms.py` (ERM class).
+- [x] **IRM (Invariant Risk Minimization)** (Implemented)
+    - **Rationale**: Learning invariant features across environments by penalizing gradient norms.
+    - **Code Source**: DomainBed `algorithms.py` (IRM class).
+- [x] **V-REx (Variance Risk Extrapolation)** (Implemented)
+    - **Rationale**: Reduces variance of risks across training domains. robust alternative to IRM.
+    - **Code Source**: DomainBed `algorithms.py` (VREx class).
+- [x] **GroupDRO (Group Distributionally Robust Optimization)** (Implemented)
+    - **Rationale**: Optimizes for the worst-case domain performance. Essential for user heterogeneity.
+    - **Code Source**: DomainBed `algorithms.py` (GroupDRO class).
+- [x] **MixStyle** (Implemented)
+    - **Rationale**: Data augmentation in feature space (mixing statistics). Simple yet effective.
+    - **Code Source**: DomainBed `algorithms.py` (MixStyle class).
+- [x] **MLDG (Meta-Learning for Domain Generalization)** (Implemented)
+    - **Rationale**: Meta-learning to simulate domain shift.
+    - **Code Source**: DomainBed `algorithms.py` (MLDG class).
+- [x] **MASF (Maximum Mean Discrepancy for DG)** (Implemented)
+    - **Rationale**: MMD-based feature alignment for DG.
+    - **Code Source**: [douqi/MASF](https://github.com/douqi/MASF)
+
+
+**Planned DG Methods:**
+- [ ] **CSD (Common Specific Decomposition)**
+    - **Rationale**: Decomposes features into domain-shared and domain-specific components.
+    - **Source**: Piratla et al., 2020 (ICML).
+- [ ] **SagNet (Style Agnostic Networks)**
+    - **Rationale**: Randomizes style features to focus on content.
+    - **Source**: Nam et al., 2021 (CVPR).
+- [ ] **Fish (Gradient Matching)**
+    - **Rationale**: Aligns gradients across domains.
+    - **Source**: Shi et al., 2021 (ICLR).
+
+
+
+---
+
 ## 1. Domain Generalization (DG) Algorithm Implementation
 
 All new DG algorithms should be added to `src/domainbed_algos.py`.
