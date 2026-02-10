@@ -1,113 +1,64 @@
-# UbiComp Experiment Planning
+# UbiComp Experiment Planning & Status
 
-This plan expands the **Experiment Design → Pretraining** notes from `UbiComp_Doc_Personalization.docx` into actionable work items. The goal is to iteratively implement and validate cross-dataset stress detection experiments inside the `Ubicomp` project.
+This document tracks the progress of the Cross-Dataset and Within-Dataset Benchmarking for Stress Detection.
 
 ## 1. Objectives
-- Predict *valence*, *arousal*, *stress*, and *attention* labels under pronounced cross-user/domain shifts.
-- Leverage existing CrossShift-style models (XGBoost, LightGBM) and extend to tabular generalization baselines (SAINT, TabTransformer, NODE, FT-Transformer, TransBoost, etc.).
-- Evaluate transferability with **LOSO** (leave-one-subject-out) and **stratified group 5-fold** protocols.
-- Compare *pretraining + fine-tuning* vs. *target-only* training, and quantify the impact of dataset combinations (D-1, D-2, D-3).
+- **Benchmark Domain Generalization (DG) & Domain Adaptation (DA)** methods on stress detection datasets (D-1, D-2, D-3).
+- **Backbone Agnostic Evaluation**: Compare algorithms using consistent backbones (`MLP`, `ResNet`, `Transformer`).
+- **Reproducibility**: Ensure all methods use standard splits and evaluation protocols.
 
-## 2. Datasets & Preprocessing
-| Alias | Source pickle (default) |
-| ----- | ----------------------- |
-| D-1 | `~/minseo/Archived/stress_binary_personal-current_D#2.pkl` |
-| D-2 | `~/minseo/Archived/stress_binary_personal-current_D#3.pkl` |
-| D-3 | `~/minseo/Archived/stress_binary_personal-current.pkl` |
+## 2. Current Progress (Updated 2026-02-10)
 
-**Tasks**
-1. [ ] Confirm paths and availability; override via CLI if needed (`--dataset-override`).
-2. [x] 표준화: 모든 데이터셋을 교집합 피처만 사용하도록 정렬 (`domain_adaptation.data_utils.align_feature_intersection`).
-3. [ ] Track metadata (timestamp ranges, user counts, label distribution) for reproducibility.
+### 2.1 Codebase Refactoring
+- [x] **Directory Structure**: Moved core logic to `src/` (`src/models.py`, `src/da_models.py`, `src/domainbed_algos.py`, `src/backbones.py`).
+- [x] **Backbone Standardization**: Implemented shared `MLPFeaturizer`, `ResNetFeaturizer`, `TransformerFeaturizer` in `src/backbones.py`.
+- [x] **Execution Pipeline**: Unified execution via `execute_benchmark.py` supporting `--model`, `--dataset`, `--backbone` arguments.
 
-## 3. Pretraining + Fine-tuning Experiments
-### 3.1 Scenario Matrix
-| Pretrain Sources | Target |
-| ---------------- | ------ |
-| D-1 + D-3 | D-2 |
-| D-1 + D-2 | D-3 |
-| D-2 + D-3 | D-1 |
+### 2.2 Algorithm Implementation status
+We are building a comprehensive benchmark suite. Detailed guide available in `CONTRIBUTING_GUIDE.md`.
 
-For each scenario:
-- Pretrain on concatenated source datasets.
-- Fine-tune on target training split; evaluate on target validation/test.
-- Compare against *target-only* training with identical hyperparameters.
+#### Domain Generalization (DG) - *Complete*
+- [x] **ERM** (Baseline)
+- [x] **IRM** (Invariant Risk Minimization)
+- [x] **V-REx** (Variance Risk Extrapolation)
+- [x] **GroupDRO** (Distributionally Robust Optimization)
+- [x] **MixStyle** (Feature Statistics Mixing)
+- [x] **MLDG** (Meta-Learning DG)
+- [x] **MASF** (MMD-based DG)
 
-### 3.2 Implementation Steps
-1. [ ] Parameterize `domain_adaptation.pipeline.run_experiment_scenario` to enforce LOSO and stratified group 5-fold splits. **추가**: D-1, D-2, D-3 각각을 독립 실행하는 별도 진입점/스크립트를 마련해 `D-1+D-3→D-2`와 같은 복합 시나리오 외에도 dataset 단위 결과를 남긴다.
-2. [x] Extend pipeline outputs to include per-class metrics (AUROC/PRAUC/Accuracy) for all four targets.
-3. [ ] Add configuration for XGBoost pipeline mirroring CrossShift settings (learning rate, max depth, estimators).
-4. [x] Log pretrain/fine-tune sample counts, training times, and best iteration numbers for later analysis.
-5. [ ] Persist experiment summaries to `results/domain_adaptation/` with scenario + seed metadata.
+#### Domain Adaptation (DA) - *In Progress*
+- [x] **DANN** (Domain-Adversarial NN) - *Refactored & Verified*
+- [x] **CDAN** (Conditional DANN) - *Implemented & Verified*
+- [x] **MCC** (Minimum Class Confusion) - *Implemented & Verified*
+- [x] **DeepCORAL** (Correlation Alignment) - *Implemented*
+- [ ] **ADDA** (Adversarial Discriminative DA)
+- [ ] **DAN / JAN** (MMD-based)
+- [ ] **MCD** (Classifier Discrepancy)
+- [ ] **SHOT** (Source-Free DA)
 
+### 2.3 Documentation
+- [x] `CONTRIBUTING_GUIDE.md`: Detailed instructions for team members to implement remaining algorithms and code sources.
 
-`scripts/experiments/pretrain_transfer.py`에 `--split-strategy`, `--group-folds`, `--val-size`, `--test-size` 옵션을 추가하여 CLI에서도 동일한 분할 구성을 제어할 수 있다.
+## 3. Next Steps (Roadmap)
 
-## 4. Evaluation Protocols
-- **LOSO**: treat each user as held-out fold; requires user-level grouping (integrate with `GroupKFold` or custom splitter).
-- **Stratified Group 5-Fold**: enforce both label stratification and user grouping (can adapt `StratifiedGroupKFold` from `sklearn.model_selection` in 1.3+ or implement manual splitter).
-- Metrics: AUROC, AUPRC, accuracy, confusion matrix per fold, plus aggregated mean ± std.
-- Record OTDD distances (via `utility.calculate_user_similarity_ranking`) to correlate transfer performance with domain shifts.
+### Phase 3: Complete DA Baselines
+- **Goal**: Implement high-priority DA methods (ADDA, JAN, SHOT).
+- **Action**: Team to follow `CONTRIBUTING_GUIDE.md` to add remaining models to `src/da_models.py`.
 
-**Tasks**
-1. [x] Implement reusable splitter utilities under `domain_adaptation/data_utils.py` to serve both tree and transformer pipelines.
-2. [x] Update experiment logs to attach splitter type and random seed.
+### Phase 4: Large-Scale Benchmarking
+- **Goal**: Run full factorial experiments (Grid Search or fixed hyperparams).
+- **Matrix**:
+    - Datasets: D-1, D-2, D-3
+    - Models: All DG/DA list
+    - Backbones: MLP, ResNet, Transformer
+    - Seeds: 3-5 runs
+- **Action**: Use `run_benchmark_all.sh` (needs update) to execute batch jobs.
 
-## 5. Domain Adaptation Baselines
-### 5.1 TransBoost (as cited)
-1. [ ] Add TransBoost implementation or vendor package integration under `domain_adaptation/models/transboost.py`.
-2. [ ] Define training interface aligned with existing pipeline (pretrain/adapt/eval hooks).
-3. [ ] Benchmark against LightGBM & transformer baselines on the scenario matrix.
-
-### 5.2 Dataset Combination Ablations
-- Compare for each fine-tune 비율(0%, 20%, …):
-  - Combined (D-1 + D-3) pretraining + D-2 fine-tune/test.
-  - Target-only D-2 training (pretrain 없이 fine-tune 데이터만으로 학습).
-  - Combined datasets without pretraining (direct pooled training).
-- For each, report metrics and delta vs. target-only baseline.
-
-## 6. Tabular Generalization Models
-**Models to include (per doc + packages):**
-- SAINT, TabTransformer, NODE, FT-Transformer, Tabular ResNet (from TabBenchmark).
-- Additional Domain Robustness / Label Shift / Domain Generalization models from GLOBEM packages.
-
-**Tasks**
-1. [ ] Audit external packages (GLOBEM, TabBenchmark, Domain Robustness, Label Shift) and catalog model + dependency requirements.
-2. [ ] Create wrappers under `domain_adaptation/models/` mirroring LightGBM/Transformer interfaces.
-3. [ ] Standardize config schemas (YAML/JSON or dataclasses) for hyperparameters.
-4. [ ] Design experiment runner capable of batching models for each scenario and saving per-model CSV outputs.
-
-## 7. Analysis & Reporting
-- Produce `results/domain_adaptation/dashboard.csv` tracking:
-  - Scenario, model, mode (pretrain_finetune vs. target_only).
-  - Metric aggregates + OTDD correlation coefficients.
-  - Training time and resource footprint (threads, GPU usage if applicable).
-
-## 8. Implementation Phases
-1. **Phase 0 – Infrastructure**
-   - [ ] LOSO + StratifiedGroup splitters (dataset별 독립 실험 및 pretrain/target 분할 로깅 포함).
-   - [x] Enhanced logging & results schema.
-2. **Phase 1 – XGBoost Pretraining**
-   - [x] Integrate XGBoost pipeline (random split end-to-end run logged in `results/pipeline_run_log.csv`).
-     - Latest baseline: 2025-10-12 random 80/20 split (`model=xgb`, 46 anchors, 40 features) – see `distance_figures_xgb/` outputs for plots and CSV summaries.
-   - [ ] Run scenario matrix, validate metrics (LOSO/StratifiedGroupKFold pending – current pipeline assumes per-user splits).
-3. **Phase 2 – Domain Adaptation Extensions**
-   - [ ] Add TransBoost.
-   - [ ] Implement dataset combination experiments.
-4. **Phase 3 – Tabular Generalization Sweep**
-   - [ ] Wire in TabBenchmark models.
-   - [ ] Automate comparison runs.
-5. **Phase 4 – Analysis & Reporting**
-   - [ ] Aggregate results, compute OTDD correlations.
-   - [ ] Generate summary tables/plots for manuscript or model handoff.
-
-## 9. Open Questions / Dependencies
-- Confirm whether label sets (valence/arousal/stress/attention) are mutually exclusive or multi-label; adjust training targets accordingly.
-- Determine GPU availability for transformer/tabular models and TransBoost.
-- Validate that OTDD computation scales with combined datasets (adjust subsampling thresholds if required).
-- Cross-check overlap between GLOBEM and TabBenchmark model lists to avoid duplicate effort.
-- Optional dependency log (updated 2025-10-12): installed `statsmodels`, `ray`, `tqdm_joblib`, `xgboost`, `lightgbm`, `catboost`, `otdd` (microsoft/otdd). OTDD 모듈은 `from otdd.pytorch.distance import DatasetDistance` 임포트 경로를 사용하며, 이 경로 변경 시 전 파이프라인 업데이트 필요.
-- **Policy reminder:** keep “fail fast” discipline across codepaths (no fallback behaviour; surface exceptions and iterate until fixed) so future models inherit the same guarantees.
+### Phase 5: HPO (Hyperparameter Optimization)
+- **Goal**: Optimize `lr`, `dropout`, and algorithm-specific params (`lambda`, `penalty_weight`).
+- **Action**: Integrate Optuna or Ray Tune if performance is unsatisfactory with default params.
 
 ---
-**Next Step:** Extend the pipeline to handle LOSO/StratifiedGroupKFold splits (shared-normalization fix) and populate the XGBoost scenario matrix.
+**Legacy Plan (Archived)**
+*Previous sections regarding XGBoost pretraining and basic pipeline setup are superseded by the current `src/` based architecture.*
+
