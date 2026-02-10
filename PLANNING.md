@@ -58,10 +58,33 @@ To ensure our benchmark meets top-tier conference standards (e.g., NeurIPS Datas
     - **Search Space**: Defined in `src/hparams_registry.py` (to be created, mirroring DomainBed's registry).
 - **Evaluation Metric**: Average performance across 3 independent seeds.
 
-### 3.3 References
-1.  **DomainBed**: Gulrajani, I., & Lopez-Paz, D. (2021). *In Search of Lost Domain Generalization*. ICLR. (Standard for DG protocols).
-2.  **Tabular Benchmarks**: Grinsztajn, L., et al. (2022). *Why do tree-based models still outperform deep learning on typical tabular data?*. NeurIPS. (Rationale for tabular HPO).
-3.  **Wilds**: Koh, P. W., et al. (2021). *WILDS: A Benchmark of in-the-Wild Distribution Shifts*. ICML.
+### 3.3 Benchmark Design Case Studies (Reference for Manuscript)
+We model our protocol after these accepted NeurIPS/ICLR benchmarks:
+
+**1. Tabular Deep Learning Benchmark (NeurIPS 2022)**
+*   **Paper**: Grinsztajn et al., *"Why do tree-based models still outperform deep learning on typical tabular data?"*
+*   **Protocol**:
+    *   Used **Random Search** with up to **400 iterations** per dataset.
+    *   Tuned **Model Size** explicitly: Number of layers (1-6), Width (64-1024), Dropout (0-0.5).
+    *   **Result**: Showed that without this extensive tuning, DL models significantly underperform XGBoost/LightGBM.
+
+**2. Revisiting Deep Learning for Tabular Data (NeurIPS 2021)**
+*   **Paper**: Gorishniy et al. (Yandex Research)
+*   **Protocol**:
+    *   Unified tuning protocol for ResNet, MLP, and Transformer (FT-Transformer).
+    *   Used a fixed **Validation Set** for both early stopping and hyperparameter selection.
+    *   Demonstrated that "Model Size" (depth/width) is a critical hyperparameter, not a fixed architectural choice.
+
+**3. DomainBed (ICLR 2021)**
+*   **Paper**: Gulrajani & Lopez-Paz
+*   **Protocol**:
+    *   Random Search over 20 distributions of hyperparameters.
+    *   Critique: Proved that complex DG algorithms often fail to beat ERM if ERM is well-tuned and DG is not, or vice versa.
+
+### 3.4 References
+1.  **DomainBed**: Gulrajani, I., & Lopez-Paz, D. (2021). *In Search of Lost Domain Generalization*. ICLR.
+2.  **Tabular Benchmarks**: Grinsztajn, L., et al. (2022). *Why do tree-based models still outperform deep learning on typical tabular data?*. NeurIPS.
+3.  **FT-Transformer**: Gorishniy, Y., et al. (2021). *Revisiting Deep Learning Models for Tabular Data*. NeurIPS.
 
 ## 4. Next Steps (Roadmap)
 
