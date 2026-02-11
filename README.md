@@ -44,11 +44,15 @@ We support over 20+ algorithms across three categories. See `CONTRIBUTING_GUIDE.
 - **Meta-Learning**: MLDG
 - **Baseline**: ERM (Empirical Risk Minimization)
 
-### 3. Tabular Deep Learning & Foundation Models
-*Modern architectures for tabular data.*
-- **Tree-based**: XGBoost, LightGBM
-- **Deep Learning**: TabNet, TabTransformer, SAINT, NODE, DeepCTR (DCN-v2)
-- **Foundation**: TabPFN (Prior-Data Fitted Network)
+### 3. Transformers & Tabular Deep Learning
+- **TabNet** (Arik & Pfister, 2020)
+- **SAINT** (Somepalli et al., 2021)
+- **TabTransformer** (Huang et al., 2020)
+- **FT-Transformer** (Gorishniy et al., 2021)
+- **FastFormer** (Wu et al., 2021): Efficient Additive Attention ($O(N)$ complexity). Recommended for high-dimensional feature sets (e.g., >1000 features).
+- **Perceiver** (Jaegle et al., 2021): Latent Attention mechanism. Handles very large input dimensions by projecting to a fixed-size latent space.
+
+*Note: TabPFN is excluded from large-scale benchmarks due to memory/time constraints ($N > 10,000$, $D > 100$).*
 
 ---
 

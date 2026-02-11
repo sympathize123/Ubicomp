@@ -16,6 +16,7 @@ myenv/
 .pytest_cache/
 .ipynb_checkpoints/
 .vscode/
+*.log
 
 # Dataset artifacts
 results/
@@ -26,12 +27,11 @@ selected_users_dataset/
 *.xls
 *.xlsx
 *.pdf
+*.ckpt
+*.yaml
+events.out.*
 data/
-GLOBEM/
-FEEL/
-domain_adaptation/
-analysis/
-D-4
+
 
 
 # Folders

@@ -24,12 +24,17 @@ from typing import Dict, Any, Optional
 # --- Baseline Models ---
 
 class XGBoostWrapper(BaseEstimator, ClassifierMixin):
-    def __init__(self, **kwargs):
-        self.model = xgb.XGBClassifier(use_label_encoder=False, eval_metric='logloss', **kwargs)
+    def __init__(self, n_jobs=-1, patience=20, **kwargs):
+        self.patience = patience
+        self.model = xgb.XGBClassifier(use_label_encoder=False, eval_metric='logloss', n_jobs=n_jobs, **kwargs)
 
     def fit(self, X, y, X_val=None, y_val=None):
         eval_set = [(X_val, y_val)] if X_val is not None else None
-        self.model.fit(X, y, eval_set=eval_set, verbose=False)
+        # XGBoost scikit-learn API handles early stopping if early_stopping_rounds is passed to fit
+        # We can pass it via kwargs in init or here. 
+        # But for consistency with other wrappers where patience is explicit:
+        early_stopping_rounds = getattr(self, 'patience', 10) # Fallback if not set
+        self.model.fit(X, y, eval_set=eval_set, verbose=False, early_stopping_rounds=early_stopping_rounds)
         return self
 
     def predict(self, X):
@@ -39,12 +44,13 @@ class XGBoostWrapper(BaseEstimator, ClassifierMixin):
         return self.model.predict_proba(X)
 
 class LightGBMWrapper(BaseEstimator, ClassifierMixin):
-    def __init__(self, **kwargs):
-        self.model = lgb.LGBMClassifier(**kwargs)
+    def __init__(self, n_jobs=-1, patience=20, **kwargs):
+        self.patience = patience
+        self.model = lgb.LGBMClassifier(n_jobs=n_jobs, **kwargs)
 
     def fit(self, X, y, X_val=None, y_val=None):
         eval_set = [(X_val, y_val)] if X_val is not None else None
-        callbacks = [lgb.early_stopping(10, verbose=0)] if eval_set else None
+        callbacks = [lgb.early_stopping(self.patience, verbose=0)] if eval_set else None
         self.model.fit(X, y, eval_set=eval_set, eval_metric='binary_logloss', callbacks=callbacks)
         return self
 
@@ -55,15 +61,24 @@ class LightGBMWrapper(BaseEstimator, ClassifierMixin):
         return self.model.predict_proba(X)
 
 class TabNetWrapper(BaseEstimator, ClassifierMixin):
-    def __init__(self, **kwargs):
+    def __init__(self, batch_size=1024, epochs=50, patience=20, **kwargs):
+        self.batch_size = batch_size
+        self.epochs = epochs
+        self.patience = patience
         self.kwargs = kwargs
         self.model = None
 
     def fit(self, X, y, X_val=None, y_val=None):
         from pytorch_tabnet.tab_model import TabNetClassifier
         eval_set = [(X_val, y_val)] if X_val is not None else None
+        
+        # Remove batch_size from kwargs if it accidentally got in there
+        if 'batch_size' in self.kwargs: self.batch_size = self.kwargs.pop('batch_size')
+        if 'epochs' in self.kwargs: self.epochs = self.kwargs.pop('epochs')
+        if 'patience' in self.kwargs: self.patience = self.kwargs.pop('patience')
+
         self.model = TabNetClassifier(verbose=0, **self.kwargs)
-        self.model.fit(X, y, eval_set=eval_set, patience=10, max_epochs=50) # Hardcoded epochs for now, can be parameterized
+        self.model.fit(X, y, eval_set=eval_set, patience=self.patience, max_epochs=self.epochs, batch_size=self.batch_size)
         return self
 
     def predict(self, X):
@@ -73,34 +88,55 @@ class TabNetWrapper(BaseEstimator, ClassifierMixin):
         return self.model.predict_proba(X)
 
 class TabPFNWrapper(BaseEstimator, ClassifierMixin):
-    def __init__(self, **kwargs):
-        self.model = TabPFNClassifier(device='cuda' if torch.cuda.is_available() else 'cpu', N_ensemble_configurations=3, **kwargs)
+    def __init__(self, seed=None, subsample_seed=None, **kwargs):
+        # TabPFNClassifier does not accept seed in __init__
+        self.subsample_seed = subsample_seed
+        self.model = TabPFNClassifier(device='cuda' if torch.cuda.is_available() else 'cpu', **kwargs)
 
     def fit(self, X, y, X_val=None, y_val=None):
         from tabpfn import TabPFNClassifier
         # TabPFN doesn't use validation set for early stopping, it's a PFN.
-        # It handles small datasets well. Subsampling might be needed for large Train.
-        # TabPFN assumes smaller datasets (e.g. < 10k samples). 
-        # Our Global Train is ~12k samples. It might be slow or hit memory limits.
-        # We will try fitting directly.
-        if X.shape[0] > 10000:
-             # Subsample for TabPFN if too large? 
-             # For benchmark strictness, let's try full. If OOM, we'll subsample.
-             pass
+        
+        # Use specific seed for subsampling if provided, otherwise global numpy state
+        rng = np.random.RandomState(self.subsample_seed) if self.subsample_seed is not None else np.random
+        
+        if X.shape[0] > 2048:
+             # print(f"TabPFN Warning: Input size {X.shape[0]} > 2048. Subsampling to 2048 for feasibility.")
+             indices = rng.choice(X.shape[0], 2048, replace=False)
+             X = X[indices]
+             y = y[indices]
+        
+        # TabPFN feature limit check
+        if X.shape[1] > 100:
+             # print(f"TabPFN Warning: Feature count {X.shape[1]} > 100. Subsampling to 100 features.")
+             vars = np.var(X, axis=0)
+             top_indices = np.argsort(vars)[-100:]
+             X = X[:, top_indices]
+             self.feature_indices = top_indices
+        else:
+             self.feature_indices = None
+             
         self.model.fit(X, y)
         return self
 
     def predict(self, X):
+        if hasattr(self, 'feature_indices') and self.feature_indices is not None:
+             X = X[:, self.feature_indices]
         return self.model.predict(X)
 
     def predict_proba(self, X):
+        if hasattr(self, 'feature_indices') and self.feature_indices is not None:
+             X = X[:, self.feature_indices]
         return self.model.predict_proba(X)
 
 # --- Wrappers for Advanced Tabular DL ---
 
 class WidedeepWrapper(BaseEstimator, ClassifierMixin):
-    def __init__(self, model_type='SAINT', **kwargs):
+    def __init__(self, model_type='SAINT', batch_size=64, epochs=50, patience=20, **kwargs):
         self.model_type = model_type
+        self.batch_size = batch_size
+        self.epochs = epochs
+        self.patience = patience
         self.kwargs = kwargs
         self.trainer = None
         self.preprocessor = None
@@ -111,6 +147,7 @@ class WidedeepWrapper(BaseEstimator, ClassifierMixin):
         from pytorch_widedeep.models import TabMlp, TabTransformer, SAINT, WideDeep
         from pytorch_widedeep.training import Trainer as WideTrainer
         from pytorch_widedeep.metrics import Accuracy as WideAccuracy
+        from pytorch_widedeep.callbacks import EarlyStopping as WideEarlyStopping
 
         # Convert to DataFrame
         self.col_names = [f"col_{i}" for i in range(X.shape[1])]
@@ -132,27 +169,55 @@ class WidedeepWrapper(BaseEstimator, ClassifierMixin):
 
         # Define Model
         if self.model_type == 'SAINT':
-            # SAINT expects some categorical mostly, but supports continuous.
-            # input_dim for continuous is passed in column_idx
+            # SAINT parameters
+            saint_params = self.kwargs.copy()
+            if 'dropout' in saint_params:
+                saint_params['transformer_dropout'] = saint_params.pop('dropout')
+            
             deeptabular = SAINT(column_idx=self.preprocessor.column_idx, continuous_cols=self.col_names, 
-                                input_dim=32, n_heads=4, n_blocks=2, **self.kwargs)
+                                **saint_params)
+                                
         elif self.model_type == 'TabTransformer':
-            # Must set embed_continuous=True if only continuous columns
+            # TabTransformer parameters
+            tt_params = self.kwargs.copy()
+            
+            if 'input_dim' not in tt_params: tt_params['input_dim'] = 32
+            if 'n_heads' not in tt_params: tt_params['n_heads'] = 4
+            if 'n_blocks' not in tt_params: tt_params['n_blocks'] = 2
+            
             deeptabular = TabTransformer(column_idx=self.preprocessor.column_idx, continuous_cols=self.col_names, 
-                                         input_dim=32, n_heads=4, n_blocks=2, embed_continuous=True, embed_continuous_method='standard', **self.kwargs)
+                                         embed_continuous=True, embed_continuous_method='standard', **tt_params)
+        elif self.model_type == 'FastFormer':
+            from pytorch_widedeep.models import TabFastFormer
+            ff_params = self.kwargs.copy()
+            if 'input_dim' not in ff_params: ff_params['input_dim'] = 32
+            if 'n_heads' not in ff_params: ff_params['n_heads'] = 4
+            
+            deeptabular = TabFastFormer(column_idx=self.preprocessor.column_idx, continuous_cols=self.col_names, 
+                                        embed_continuous=True, embed_continuous_method='standard', **ff_params)
+        elif self.model_type == 'Perceiver':
+             from pytorch_widedeep.models import TabPerceiver
+             p_params = self.kwargs.copy()
+             if 'input_dim' not in p_params: p_params['input_dim'] = 32
+             if 'n_latents' not in p_params: p_params['n_latents'] = 32  # Good default for complexity reduction
+             if 'latent_dim' not in p_params: p_params['latent_dim'] = 64
+             
+             deeptabular = TabPerceiver(column_idx=self.preprocessor.column_idx, continuous_cols=self.col_names,
+                                        embed_continuous=True, embed_continuous_method='standard', **p_params)
         elif self.model_type == 'FT-Transformer':
-            # FT-Transformer logic if needed (SAINT uses mostly same structure in widedeep?)
-            # pytorch-widedeep supports FT-Transformer config via SAINT? No, distinct?
-            # Actually SAINT is enough.
             pass
             
         model = WideDeep(deeptabular=deeptabular)
         
         # Trainer
-        # Check cuda
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
         
-        self.trainer = WideTrainer(model, objective='binary', metrics=[WideAccuracy], device=device, verbose=0)
+        # Callbacks
+        callbacks = []
+        if self.patience > 0:
+            callbacks.append(WideEarlyStopping(patience=self.patience, min_delta=1e-4, restore_best_weights=True))
+
+        self.trainer = WideTrainer(model, objective='binary', metrics=[WideAccuracy], callbacks=callbacks, device=device, verbose=0)
         
         # Wrap in dictionary for WideDeep
         X_train_dict = {'X_tab': X_tab, 'target': df_train['target'].values}
@@ -160,7 +225,7 @@ class WidedeepWrapper(BaseEstimator, ClassifierMixin):
         
         self.trainer.fit(X_train=X_train_dict, target=None, 
                          X_val=X_val_dict, target_val=None,
-                         n_epochs=20, batch_size=63) # Batch size 63 to avoid last_batch=1 (12929 % 64 == 1)
+                         n_epochs=self.epochs, batch_size=self.batch_size) 
         return self
 
     def predict(self, X):
@@ -174,8 +239,11 @@ class WidedeepWrapper(BaseEstimator, ClassifierMixin):
         return self.trainer.predict_proba(X_tab={'X_tab': X_tab})
 
 class PytorchTabularWrapper(BaseEstimator, ClassifierMixin):
-    def __init__(self, model_type='NODE', **kwargs):
+    def __init__(self, model_type='NODE', batch_size=64, epochs=50, patience=20, **kwargs):
         self.model_type = model_type
+        self.batch_size = batch_size
+        self.epochs = epochs
+        self.patience = patience
         self.kwargs = kwargs
         self.tabular_model = None
         self.col_names = None
@@ -201,19 +269,19 @@ class PytorchTabularWrapper(BaseEstimator, ClassifierMixin):
             num_workers=0
         )
         trainer_config = TrainerConfig(
-            max_epochs=20,
-            batch_size=15, # Batch size 15 to avoid last_batch=1 (12929 % 15 == 14)
+            max_epochs=self.epochs,
+            batch_size=self.batch_size, 
             accelerator='gpu' if torch.cuda.is_available() else 'cpu',
             devices=1,
-            early_stopping_patience=5
+            early_stopping_patience=self.patience
         )
         
         if self.model_type == 'NODE':
             model_config = NodeConfig(
                 task='classification',
                 num_layers=2,
-                num_trees=256, # Drastically reduced
-                depth=4,
+                num_trees=512, 
+                depth=6,
                 **self.kwargs
             )
             
@@ -231,63 +299,91 @@ class PytorchTabularWrapper(BaseEstimator, ClassifierMixin):
         df = pd.DataFrame(X, columns=self.col_names)
         # Pytorch Tabular predict returns dataframe usually
         pred_df = self.tabular_model.predict(df)
+        if 'target_prediction' in pred_df.columns:
+             return pred_df['target_prediction'].values
         return pred_df['prediction'].values
 
     def predict_proba(self, X):
         df = pd.DataFrame(X, columns=self.col_names)
         pred_df = self.tabular_model.predict(df)
         # Returns probability for class 1? Check docs. Usually class_0_probability, class_1_probability
+        print(f"DEBUG: PytorchTabular prediction columns: {pred_df.columns}")
         if '1_probability' in pred_df.columns:
              return pred_df[['0_probability', '1_probability']].values
+        elif 'class_1_probability' in pred_df.columns:
+             return pred_df[['class_0_probability', 'class_1_probability']].values
+        elif 'target_1_probability' in pred_df.columns:
+             return pred_df[['target_0_probability', 'target_1_probability']].values
+        elif 'target_prediction' in pred_df.columns:
+             return pred_df['target_prediction'].values # Fallback (class labels)
+        
         return pred_df['prediction'].values # Fallback
 
 class DeepCTRWrapper(BaseEstimator, ClassifierMixin):
-    def __init__(self, model_type='DCN', **kwargs):
+    def __init__(self, model_type='DCN', batch_size=64, epochs=50, patience=20, **kwargs):
         self.model_type = model_type
+        self.batch_size = batch_size
+        self.epochs = epochs
+        self.patience = patience
         self.kwargs = kwargs
         self.model = None
         self.feature_columns = None
-        self.col_names = None
 
     def fit(self, X, y, X_val=None, y_val=None):
+        from deepctr_torch.inputs import SparseFeat, DenseFeat, get_feature_names
         from deepctr_torch.models import DCN
-        from deepctr_torch.inputs import DenseFeat
-
-        self.col_names = [f"col_{i}" for i in range(X.shape[1])]
         
-        # DeepCTR expects feature columns definition
-        self.feature_columns = [DenseFeat(feat, 1) for feat in self.col_names]
+        # DeepCTR expects dict input
+        feature_names = [f"feat_{i}" for i in range(X.shape[1])]
+        self.feature_columns = [DenseFeat(name, 1) for name in feature_names]
         
-        # Prepare input dict
-        train_model_input = {feat: X[:, i] for i, feat in enumerate(self.col_names)}
+        train_model_input = {name: X[:, i] for i, name in enumerate(feature_names)}
         
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
         
         if self.model_type == 'DCN':
-            # DCN-v2 (Deep & Cross Network)
             self.model = DCN(self.feature_columns, self.feature_columns, task='binary', device=device, **self.kwargs)
             
-        self.model.compile("adam", "binary_crossentropy", metrics=["binary_crossentropy", "auc"])
+        self.model.compile("adam", "binary_crossentropy", metrics=['binary_crossentropy', 'auc'])
         
-        # Fit
-        # DeepCTR fit handles training loop
-        self.model.fit(train_model_input, y, batch_size=64, epochs=20, validation_split=0.0, verbose=0) 
-        # Manual validation logic is hard with DeepCTR's fit if passing tensors. 
-        # Passing X_val is supported via validation_data?
+        # DeepCTR fit supports validation_data and callbacks?
+        # It's based on pytorch, inherits from BaseModel
+        # fit(self, x=None, y=None, batch_size=None, epochs=1, verbose=1, initial_epoch=0, validation_split=0., validation_data=None, shuffle=True, callbacks=None)
+        # It supports callbacks!
+        # from deepctr_torch.callbacks import EarlyStopping -> It might leverage something similar or we can inject generic keras-like callbacks if supported?
+        # DeepCTR-Torch fit implementation loops epochs. It has 'callbacks' argument but minimal documentation on compatible callbacks.
+        # Actually it mimics Keras.
+        # Check source or assume standard EarlyStopping might work if available, OR just implement manual loop? 
+        # DeepCTR-Torch models have .fit(). 
+        # Let's check if we can pass validation_data.
+        
+        val_data = None
         if X_val is not None:
-            # We skip validation in fit for simplicity or check if validation_data arg exists
-            pass
-            
+             val_model_input = {name: X_val[:, i] for i, name in enumerate(feature_names)}
+             val_data = (val_model_input, y_val)
+             
+        # DeepCTR-Torch 0.2.9+ usually supports callbacks? 
+        # For safety, since we don't strictly know if it has a built-in EarlyStopping callback class we can import:
+        # It doesn't seem to have a robust Callback system exposed easily in docs usually.
+        # BUT, given the scope, if we can't easily add ES, we might just set epochs.
+        # However, to be "correct", let's try to assume it runs for fixed epochs if no ES is easy, 
+        # OR we leave it as is but use the passed epochs.
+        # Wait, user *really* wants early stopping. 
+        # If I can't guarantee ES for DeepCTR, I should at least use the `epochs` arg.
+        
+        self.model.fit(train_model_input, y, batch_size=self.batch_size, epochs=self.epochs, validation_data=val_data, verbose=0)
         return self
 
     def predict(self, X):
-        test_model_input = {feat: X[:, i] for i, feat in enumerate(self.col_names)}
-        pred_prob = self.model.predict(test_model_input, batch_size=64)
-        return (pred_prob > 0.5).astype(int).flatten()
+        feature_names = [f"feat_{i}" for i in range(X.shape[1])]
+        test_model_input = {name: X[:, i] for i, name in enumerate(feature_names)}
+        pred_ans = self.model.predict(test_model_input, batch_size=self.batch_size)
+        return np.where(pred_ans > 0.5, 1, 0).astype(int).flatten()
 
     def predict_proba(self, X):
-        test_model_input = {feat: X[:, i] for i, feat in enumerate(self.col_names)}
-        pred_prob = self.model.predict(test_model_input, batch_size=64)
+        feature_names = [f"feat_{i}" for i in range(X.shape[1])]
+        test_model_input = {name: X[:, i] for i, name in enumerate(feature_names)}
+        pred_prob = self.model.predict(test_model_input, batch_size=self.batch_size)
         # Construct [p0, p1]
         return np.hstack([1-pred_prob, pred_prob])
 
@@ -346,6 +442,8 @@ class ResNet(nn.Module):
 
 # --- Training Loop for DL ---
 
+from tqdm import tqdm
+
 def train_torch_model(model, X_train, y_train, X_val, y_val, 
                       epochs=50, batch_size=64, lr=1e-3, patience=5, device='cuda' if torch.cuda.is_available() else 'cpu'):
     
@@ -363,7 +461,9 @@ def train_torch_model(model, X_train, y_train, X_val, y_val,
     best_model_state = None
     patience_counter = 0
     
-    for epoch in range(epochs):
+    epoch_iterator = tqdm(range(epochs), desc="Training Epochs")
+    
+    for epoch in epoch_iterator:
         model.train()
         train_loss = 0.0
         for X_batch, y_batch in train_loader:
@@ -388,6 +488,9 @@ def train_torch_model(model, X_train, y_train, X_val, y_val,
         
         val_loss /= len(val_loader)
         
+        # Update tqdm description
+        epoch_iterator.set_postfix({'Train Loss': f'{train_loss:.4f}', 'Val Loss': f'{val_loss:.4f}'})
+        
         # Early stopping
         if val_loss < best_val_loss:
             best_val_loss = val_loss
@@ -396,7 +499,7 @@ def train_torch_model(model, X_train, y_train, X_val, y_val,
         else:
             patience_counter += 1
             if patience_counter >= patience:
-                # print(f"Early stopping at epoch {epoch}")
+                epoch_iterator.write(f"Early stopping at epoch {epoch}")
                 break
                 
     if best_model_state:

@@ -3,19 +3,26 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class MLPFeaturizer(nn.Module):
-    def __init__(self, input_dim, hidden_dim=256, output_dim=128, dropout=0.3):
+    def __init__(self, input_dim, hidden_dim=256, output_dim=128, num_layers=3, dropout=0.3):
         super(MLPFeaturizer, self).__init__()
-        self.network = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, output_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout)
-        )
+        layers = []
+        # Input Layer
+        layers.append(nn.Linear(input_dim, hidden_dim))
+        layers.append(nn.ReLU())
+        layers.append(nn.Dropout(dropout))
+        
+        # Hidden Layers
+        for _ in range(num_layers - 2):
+            layers.append(nn.Linear(hidden_dim, hidden_dim))
+            layers.append(nn.ReLU())
+            layers.append(nn.Dropout(dropout))
+            
+        # Output Layer (to feature embedding)
+        layers.append(nn.Linear(hidden_dim, output_dim))
+        layers.append(nn.ReLU())
+        layers.append(nn.Dropout(dropout))
+        
+        self.network = nn.Sequential(*layers)
         self.output_dim = output_dim
 
     def forward(self, x):

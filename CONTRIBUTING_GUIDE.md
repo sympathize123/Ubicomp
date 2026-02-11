@@ -78,6 +78,15 @@ Goal: Train on source domains to generalize to unseen target domains.
 - [x] **GroupDRO (Group Distributionally Robust Optimization)** (Implemented)
     - **Rationale**: Optimizes for the worst-case domain performance. Essential for user heterogeneity.
     - **Code Source**: DomainBed `algorithms.py` (GroupDRO class).
+- [x] **TabTransformer** (Implemented)
+    - **Rationale**: Transformer encoder for tabular data. Handles categorical embeddings effectively.
+    - **Code Source**: `pytorch-widedeep` / Huang et al., 2020.
+- [x] **FastFormer** (Implemented)
+    - **Rationale**: Efficient Additive Attention ($O(N)$). Crucial for datasets with many features (>100 features).
+    - **Code Source**: `pytorch-widedeep` / Wu et al., 2021.
+- [x] **Perceiver** (Implemented)
+    - **Rationale**: Latent Attention. Decouples compute from input size, enabling handling of very high-dimensional data.
+    - **Code Source**: `pytorch-widedeep` / Jaegle et al., 2021 (DeepMind).
 - [x] **MixStyle** (Implemented)
     - **Rationale**: Data augmentation in feature space (mixing statistics). Simple yet effective.
     - **Code Source**: DomainBed `algorithms.py` (MixStyle class).
@@ -230,3 +239,18 @@ elif args.model == 'MyDAModel':
 3.  [ ] **Backbone**: Ensure strict usage of `hparams['backbone']` to select `MLP`, `ResNet`, etc.
 4.  [ ] **Execution**: Update `execute_benchmark.py` imports, arguments, and training calls.
 5.  [ ] **Verify**: Run `python execute_benchmark.py --dataset D-1 --model MyNewAlgo --epochs 1` to test.
+
+
+---
+
+## Model Limitations & Best Practices
+
+### TabPFN (Tabular Prior-Data Fitted Network)
+**Limitations:**
+- **Dataset Size:** TabPFN is designed for small to medium-sized datasets. It has a hard limit on input size (typically 2048 samples) and feature count (100 features).
+- **Subsampling:** For datasets larger than these limits, the model requires subsampling. This can lead to significant information loss and suboptimal performance on large-scale datasets (like D-3 with >20k samples).
+- **Recommendation:** Avoid using TabPFN for large-scale benchmarks (>5k samples, >100 features) unless investigating few-shot performance or specific subsampling strategies.
+
+### Tabular Deep Learning Models (SAINT, TabTransformer, etc.)
+- Ensure hyperparameters match the specific implementation (e.g., `pytorch-widedeep`).
+- Use `n_jobs` for data loading carefully to avoid CPU bottlenecks.

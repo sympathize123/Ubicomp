@@ -1,0 +1,131 @@
+import numpy as np
+from src.domainbed_algos import DGModel
+from src.da_models import DAModel
+
+def get_hparams(algorithm, dataset):
+    """
+    Return a dictionary of hyperparameters for a given algorithm and dataset.
+    This defines the search space for Randomized Search (Optuna).
+    """
+    
+    # Common Hparams
+    hparams = {}
+    
+    # Grid/Distributions
+    # tailored based on DomainBed and Tabular DL papers
+    
+    # 1. ERM / Backbone Baselines (MLP, ResNet)
+    if algorithm in ['MLP', 'ResNet', 'ERM_DG', 'DANN', 'CDAN', 'DeepCORAL', 'MCC', 'ADDA', 'MCD', 'JAN', 'SHOT']:
+        hparams['lr'] = lambda trial: trial.suggest_float('lr', 1e-5, 1e-2, log=True)
+        hparams['weight_decay'] = lambda trial: trial.suggest_float('weight_decay', 1e-6, 1e-3, log=True)
+        hparams['batch_size'] = lambda trial: trial.suggest_categorical('batch_size', [32, 64, 128])
+        hparams['dropout'] = lambda trial: trial.suggest_float('dropout', 0.0, 0.5)
+        
+        # Architecture Search (Backbone-specific)
+        hparams['hidden_dim'] = lambda trial: trial.suggest_categorical('hidden_dim', [64, 128, 256, 512])
+        # Note: These will only be used if the backbone supports them via DAModel/DGModel logic we just added
+        hparams['num_layers'] = lambda trial: trial.suggest_int('num_layers', 2, 6) # For MLP and Transformer
+        hparams['num_blocks'] = lambda trial: trial.suggest_int('num_blocks', 2, 4) # For ResNet
+        hparams['nhead'] = lambda trial: trial.suggest_categorical('nhead', [2, 4, 8]) # For Transformer
+        
+        # Algorithm specific
+        if algorithm in ['DANN', 'CDAN', 'ADDA']:
+            hparams['discriminator_lr'] = lambda trial: trial.suggest_float('discriminator_lr', 1e-5, 1e-2, log=True)
+            
+        if algorithm == 'DeepCORAL':
+            hparams['mmd_gamma'] = lambda trial: trial.suggest_float('mmd_gamma', 0.1, 10.0, log=True)
+            
+        if algorithm == 'MCC':
+            hparams['mcc_temp'] = lambda trial: trial.suggest_float('mcc_temp', 1.0, 5.0)
+            
+        if algorithm == 'JAN':
+            hparams['jmmd_lambda'] = lambda trial: trial.suggest_float('jmmd_lambda', 0.1, 10.0)
+
+        # New: CBST
+        if algorithm == 'CBST':
+            # Self-training portion/iterations are fixed in logic usually, but we could tune.
+            pass
+
+    # 2. DG Specific
+    elif algorithm in ['IRM', 'VREx', 'GroupDRO', 'MixStyle', 'MLDG', 'MASF', 'Fish', 'CSD', 'SagNet']:
+        hparams['lr'] = lambda trial: trial.suggest_float('lr', 1e-5, 1e-2, log=True)
+        hparams['weight_decay'] = lambda trial: trial.suggest_float('weight_decay', 1e-6, 1e-3, log=True)
+        hparams['batch_size'] = lambda trial: trial.suggest_categorical('batch_size', [32, 64]) # Smaller batch for DG usually
+        
+        if algorithm == 'IRM':
+            hparams['irm_lambda'] = lambda trial: trial.suggest_float('irm_lambda', 1e-1, 1e4, log=True)
+            hparams['irm_penalty_anneal_iters'] = lambda trial: trial.suggest_int('irm_penalty_anneal_iters', 0, 50)
+            
+        if algorithm == 'VREx':
+            hparams['vrex_lambda'] = lambda trial: trial.suggest_float('vrex_lambda', 1e-1, 1e4, log=True)
+            hparams['vrex_penalty_anneal_iters'] = lambda trial: trial.suggest_int('vrex_penalty_anneal_iters', 0, 50)
+            
+        if algorithm == 'GroupDRO':
+            hparams['groupdro_eta'] = lambda trial: trial.suggest_float('groupdro_eta', 1e-3, 1.0, log=True)
+            
+        if algorithm == 'MixStyle':
+            hparams['mixstyle_alpha'] = lambda trial: trial.suggest_float('mixstyle_alpha', 0.1, 0.5)
+
+        if algorithm == 'Fish':
+            hparams['fish_meta_lr'] = lambda trial: trial.suggest_float('fish_meta_lr', 0.1, 1.0)
+            
+        if algorithm == 'CSD':
+            hparams['csd_lambda'] = lambda trial: trial.suggest_float('csd_lambda', 0.1, 5.0)
+
+        if algorithm == 'SagNet':
+            hparams['sagnet_style_stage'] = lambda trial: trial.suggest_float('sagnet_style_stage', 0.1, 0.9)
+
+    # 3. Tabular Deep Learning
+    elif algorithm == 'TabNet':
+        hparams['n_d'] = lambda trial: trial.suggest_int('n_d', 8, 64)
+        hparams['n_a'] = lambda trial: trial.suggest_int('n_a', 8, 64)
+        hparams['n_steps'] = lambda trial: trial.suggest_int('n_steps', 3, 10)
+        hparams['gamma'] = lambda trial: trial.suggest_float('gamma', 1.0, 2.0)
+        hparams['lambda_sparse'] = lambda trial: trial.suggest_float('lambda_sparse', 1e-6, 1e-3, log=True)
+        hparams['lr'] = lambda trial: trial.suggest_float('lr', 1e-4, 1e-2, log=True)
+        hparams['batch_size'] = lambda trial: trial.suggest_categorical('batch_size', [64, 128, 256, 512, 1024])
+
+    elif algorithm == 'TabTransformer':
+        hparams['input_dim'] = lambda trial: trial.suggest_categorical('input_dim', [16, 32, 64])
+        hparams['n_heads'] = lambda trial: trial.suggest_categorical('n_heads', [2, 4, 8])
+        hparams['n_blocks'] = lambda trial: trial.suggest_int('n_blocks', 1, 4)
+        hparams['dropout'] = lambda trial: trial.suggest_float('dropout', 0.0, 0.3)
+        hparams['lr'] = lambda trial: trial.suggest_float('lr', 1e-4, 1e-3, log=True)
+        
+    elif algorithm == 'SAINT':
+        hparams['input_dim'] = lambda trial: trial.suggest_categorical('input_dim', [16, 32, 64])
+        hparams['n_heads'] = lambda trial: trial.suggest_categorical('n_heads', [2, 4, 8])
+        hparams['n_blocks'] = lambda trial: trial.suggest_int('n_blocks', 1, 4)
+        hparams['dropout'] = lambda trial: trial.suggest_float('dropout', 0.0, 0.3)
+        hparams['lr'] = lambda trial: trial.suggest_float('lr', 1e-4, 1e-3, log=True)
+
+    elif algorithm == 'NODE':
+        hparams['num_layers'] = lambda trial: trial.suggest_int('num_layers', 2, 8)
+        hparams['num_trees'] = lambda trial: trial.suggest_categorical('num_trees', [256, 512, 1024])
+        hparams['depth'] = lambda trial: trial.suggest_int('depth', 4, 8)
+        hparams['lr'] = lambda trial: trial.suggest_float('lr', 1e-4, 1e-3, log=True)
+        
+    elif algorithm == 'DCN':
+        hparams['dnn_hidden_units'] = lambda trial: trial.suggest_categorical('dnn_hidden_units', [(128, 128), (256, 128), (256, 256)])
+        hparams['dropout'] = lambda trial: trial.suggest_float('dropout', 0.0, 0.5)
+        
+    elif algorithm == 'TabPFN':
+        # TabPFN has no structural hyperparameters to tune, but for large datasets, 
+        # the subsampling is critical. We treat the random seed for subsampling as a hyperparameter.
+        hparams['subsample_seed'] = lambda trial: trial.suggest_int('subsample_seed', 0, 10000)
+
+    # 4. Tree-based (XGB/LGB)
+    elif algorithm == 'XGB':
+        hparams['learning_rate'] = lambda trial: trial.suggest_float('learning_rate', 1e-3, 1.0, log=True)
+        hparams['max_depth'] = lambda trial: trial.suggest_int('max_depth', 3, 10)
+        hparams['n_estimators'] = lambda trial: trial.suggest_int('n_estimators', 50, 500)
+        hparams['subsample'] = lambda trial: trial.suggest_float('subsample', 0.5, 1.0)
+        hparams['colsample_bytree'] = lambda trial: trial.suggest_float('colsample_bytree', 0.5, 1.0)
+        
+    elif algorithm == 'LGB':
+        hparams['learning_rate'] = lambda trial: trial.suggest_float('learning_rate', 1e-3, 1.0, log=True)
+        hparams['num_leaves'] = lambda trial: trial.suggest_int('num_leaves', 8, 128)
+        hparams['n_estimators'] = lambda trial: trial.suggest_int('n_estimators', 50, 500)
+        hparams['min_child_samples'] = lambda trial: trial.suggest_int('min_child_samples', 5, 100)
+        
+    return hparams
