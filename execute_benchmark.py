@@ -16,9 +16,9 @@ from sklearn.preprocessing import LabelEncoder
 
 # Constants
 DATASETS = {
-    'D-1': '/home/iclab/Tomiris/Ubicomp/data/stress_binary_personal-full.pkl',
-    'D-2': '/home/iclab/Tomiris/Ubicomp/data/stress_binary_personal-full_D#2.pkl',
-    'D-3': '/home/iclab/Tomiris/Ubicomp/data/stress_binary_personal-full_D#3.pkl'
+    'D-1': '/home/iclab/tomiris/Ubicomp/data/stress_binary_personal-full.pkl',
+    'D-2': '/home/iclab/tomiris/Ubicomp/data/stress_binary_personal-full_D#2.pkl',
+    'D-3': '/home/iclab/tomiris/Ubicomp/data/stress_binary_personal-full_D#3.pkl'
 }
 
 class DANNInferenceWrapper(nn.Module):

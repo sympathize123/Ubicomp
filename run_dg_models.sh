@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-cd /home/iclab/Tomiris/Ubicomp
+cd /home/iclab/tomiris/Ubicomp
 
 mkdir -p results
 out_results=results/dg_benchmark_results.csv

@@ -389,7 +389,7 @@ def train_dg_model(model, X_train, y_train, d_train, X_val, y_val, d_val,
                     batch = next(loader)
                 except StopIteration:
                     # Restart loader
-                    domain_loaders[d_idx] = iter(DataLoader(domain_datasets[d_idx], batch_size=batch_size, shuffle=True))
+                    domain_loaders[d_idx] = iter(DataLoader(domain_datasets[d_idx], batch_size=batch_size, shuffle=True, drop_last=True))
                     batch = next(domain_loaders[d_idx])
                 
                 x, y = batch
