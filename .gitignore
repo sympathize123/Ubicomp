@@ -41,7 +41,6 @@ domain_adaptation/
 analysis/
 D-4
 
-
 # OS junk
 .DS_Store
 Thumbs.db

@@ -12,14 +12,11 @@ from src.data_loader import StressDataset
 from src.models import XGBoostWrapper, LightGBMWrapper, MLP, ResNet, TabNetWrapper, TabPFNWrapper, WidedeepWrapper, PytorchTabularWrapper, DeepCTRWrapper, train_torch_model, evaluate_model
 from src.da_models import DANN, CDAN, DeepCORAL, MCC, ADDA, MCD, JAN, SHOT, CBST, train_adversarial_da, train_mcd, train_dann, train_adda, train_jan, train_shot, train_cbst, train_deepcoral, train_mcc
 from src.domainbed_algos import ERM as DG_ERM, IRM, VREx, GroupDRO, MixStyle, MLDG, MASF, Fish, CSD, SagNet, train_dg_model
+from src.hparams_registry import get_hparams
 from sklearn.preprocessing import LabelEncoder
 
-# Constants
-DATASETS = {
-    'D-1': '/home/iclab/minseo/CHI/data/Archived/stress_binary_personal-full_D#2.pkl',
-    'D-2': '/home/iclab/minseo/CHI/data/Archived/stress_binary_personal-full_D#3.pkl',
-    'D-3': '/home/iclab/minseo/CHI/data/Archived/stress_binary_personal-full.pkl'
-}
+# We will define the base directory and templates dynamically based on args.label
+BASE_DATA_DIR = '/home/iclab/minseo/Ubicomp/data'
 
 # ADDED: Timing results file
 TIMING_OUTPUT = 'results/timing_results_da_hpo.csv'
@@ -55,6 +52,7 @@ class MCDInferenceWrapper(nn.Module):
 def get_args():
     parser = argparse.ArgumentParser(description="Run Within-Dataset Benchmark")
     parser.add_argument('--dataset', type=str, required=True, choices=['D-1', 'D-2', 'D-3'], help='Dataset to benchmark')
+    parser.add_argument('--label', type=str, default='stress_binary', help='Target label to predict (e.g., stress_binary, arousal, valence, disturbance, happy, angry)')
     parser.add_argument('--model', type=str, required=True, choices=['XGB', 'LGB', 'MLP', 'ResNet', 'DANN', 'CDAN', 'DeepCORAL', 'MCC', 'ADDA', 'MCD', 'JAN', 'SHOT', 'CBST', 'TabNet', 'TabPFN', 'SAINT', 'TabTransformer', 'FastFormer', 'Perceiver', 'NODE', 'DCN', 'IRM', 'VREx', 'GroupDRO', 'MixStyle', 'ERM_DG', 'MLDG', 'MASF', 'Fish', 'CSD', 'SagNet'], help='Model to use')
     parser.add_argument('--backbone', type=str, default='MLP', choices=['MLP', 'ResNet', 'Transformer'], help='Backbone for DG/DA models')
     parser.add_argument('--epochs', type=int, default=50, help='Epochs for DL models')
@@ -63,10 +61,15 @@ def get_args():
     parser.add_argument('--output', type=str, default='results/benchmark_results_da_hpo.csv', help='Output results file')
     parser.add_argument('--hpo_trials', type=int, default=0, help='Number of HPO trials (0 for default params)')
     parser.add_argument('--patience', type=int, default=20, help='Early stopping patience')
+    parser.add_argument('--efficient_attention', action='store_true', help='Use efficient attention (FastFormer backend) for Transformer models')
+    parser.add_argument('--uda', action='store_true', help='Enable Unsupervised Domain Adaptation (Source -> Target)')
     
     return parser.parse_args()
 
-def train_model(args, X_train, y_train, d_train, X_val, y_val, d_val, input_dim, num_classes, num_domains, hparams, seed, patience=20):
+def train_model(args, X_train, y_train, d_train, X_val, y_val, d_val, 
+                input_dim, num_classes, num_domains, hparams, seed=42, patience=20, X_target=None):
+
+    print(f"  [DEBUG] train_model params: Backbone={args.backbone}, Model={args.model}, LR={hparams.get('lr')}")
     # Set seed
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -105,11 +108,22 @@ def train_model(args, X_train, y_train, d_train, X_val, y_val, d_val, input_dim,
     elif args.model == 'SAINT':
         model = WidedeepWrapper(model_type='SAINT', input_dim=hparams.get('input_dim', 32), n_heads=hparams.get('n_heads', 4), 
                                 n_blocks=hparams.get('n_blocks', 2), dropout=hparams.get('dropout', 0.1), mlp_dropout=hparams.get('dropout', 0.1),
-                                epochs=epochs, patience=patience, batch_size=batch_size, **hparams)
+                                epochs=epochs, patience=patience, batch_size=batch_size, 
+                                efficient_attention=args.efficient_attention, **hparams)
     elif args.model == 'TabTransformer':
-        model = WidedeepWrapper(model_type='TabTransformer', input_dim=hparams.get('input_dim', 32), n_heads=hparams.get('n_heads', 4), 
-                                n_blocks=hparams.get('n_blocks', 2), dropout=hparams.get('dropout', 0.1),
-                                epochs=epochs, patience=patience, batch_size=batch_size, **hparams)
+        # Default to efficient_attention=True (Linear Attention) to prevent OOM
+        use_efficient = True if not args.efficient_attention else args.efficient_attention
+        
+        # Pop keys that are explicitly passed to avoid "multiple values" error during HPO
+        _input_dim = hparams.pop('input_dim', 32)
+        _n_heads = hparams.pop('n_heads', 4)
+        _n_blocks = hparams.pop('n_blocks', 2)
+        _dropout = hparams.pop('dropout', 0.1)
+        
+        model = WidedeepWrapper(model_type='TabTransformer', input_dim=_input_dim, n_heads=_n_heads, 
+                                n_blocks=_n_blocks, dropout=_dropout,
+                                epochs=epochs, patience=patience, batch_size=batch_size, 
+                                efficient_attention=use_efficient, **hparams)
     elif args.model == 'FastFormer':
         # FastFormer for efficient attention
         model = WidedeepWrapper(model_type='FastFormer', input_dim=hparams.get('input_dim', 32), n_heads=hparams.get('n_heads', 4), 
@@ -120,11 +134,22 @@ def train_model(args, X_train, y_train, d_train, X_val, y_val, d_val, input_dim,
                                 n_latents=hparams.get('n_latents', 32), latent_dim=hparams.get('latent_dim', 64),
                                 epochs=epochs, patience=patience, batch_size=batch_size, **hparams)
     elif args.model == 'NODE':
-        model = PytorchTabularWrapper(model_type='NODE', num_layers=hparams.get('num_layers', 2), num_trees=hparams.get('num_trees', 512), 
-                                      depth=hparams.get('depth', 6), batch_size=batch_size, epochs=epochs, patience=patience, **hparams)
+        # Default to batch_size=24 to prevent BatchNorm error
+        if batch_size == 64 and 'batch_size' not in hparams:
+             batch_size = 24
+             
+        # Pop keys that are explicitly passed to avoid "multiple values" error during HPO
+        _num_layers = hparams.pop('num_layers', 2)
+        _num_trees = hparams.pop('num_trees', 512)
+        _depth = hparams.pop('depth', 6)
+        
+        model = PytorchTabularWrapper(model_type='NODE', num_layers=_num_layers, num_trees=_num_trees, 
+                                      depth=_depth, batch_size=batch_size, epochs=epochs, patience=patience, **hparams)
     elif args.model == 'DCN':
-        model = DeepCTRWrapper(model_type='DCN', dnn_hidden_units=hparams.get('dnn_hidden_units', (256, 128)), 
-                               dnn_dropout=hparams.get('dropout', 0.1), batch_size=batch_size, epochs=epochs, patience=patience, **hparams)
+        _dnn_hidden_units = hparams.pop('dnn_hidden_units', (256, 128))
+        _dropout = hparams.pop('dropout', 0.1)
+        model = DeepCTRWrapper(model_type='DCN', dnn_hidden_units=_dnn_hidden_units, 
+                               dnn_dropout=_dropout, batch_size=batch_size, epochs=epochs, patience=patience, **hparams)
     elif args.model == 'MLP':
         net = MLP(input_dim=input_dim, hidden_dim=256)
         model = train_torch_model(net, X_train, y_train, X_val, y_val, 
@@ -218,62 +243,125 @@ def main():
     args = get_args()
     
     # 1. Load Data
-    print(f"Loading {args.dataset}...")
-    dataset_path = DATASETS[args.dataset]
+    print(f"Loading {args.dataset} (Label: {args.label})...")
+    
+    # Construct paths dynamically
+    if args.dataset == 'D-1':
+        dataset_path = os.path.join(BASE_DATA_DIR, f"{args.label}_personal-full_D#2.pkl")
+    elif args.dataset == 'D-2':
+        dataset_path = os.path.join(BASE_DATA_DIR, f"{args.label}_personal-full_D#3.pkl")
+    elif args.dataset == 'D-3':
+        dataset_path = os.path.join(BASE_DATA_DIR, f"{args.label}_personal-full.pkl")
+    else:
+        raise ValueError("Unknown dataset")
+        
+    if not os.path.exists(dataset_path):
+        # Fallback to absolute archived path if it's the original stress_binary and local copy doesn't exist
+        fallback_path = f"/home/iclab/minseo/CHI/data/Archived/{os.path.basename(dataset_path)}"
+        if os.path.exists(fallback_path):
+            dataset_path = fallback_path
+
     ds = StressDataset(args.dataset, dataset_path)
     
     train_idx, val_idx, test_idx = ds.get_temporal_splits()
+    
+    # Normalize features using only training data statistics to prevent data leakage
+    ds.normalize_features(train_idx, val_idx, test_idx)
     
     X_train, y_train = ds.X[train_idx], ds.y[train_idx]
     X_val, y_val = ds.X[val_idx], ds.y[val_idx]
     X_test, y_test = ds.X[test_idx], ds.y[test_idx]
     
-    # Domain Labels (Users) for DANN and DG Models
+    # Domain Labels
     DG_MODELS = ['DANN', 'CDAN', 'DeepCORAL', 'MCC', 'IRM', 'VREx', 'GroupDRO', 'MixStyle', 'ERM_DG', 'MLDG', 'MASF', 'ADDA', 'MCD', 'JAN', 'SHOT', 'CBST', 'Fish', 'CSD', 'SagNet']
     
-    if args.model in DG_MODELS:
-        print(f"Preparing Domain Labels for {args.model}...")
-        le = LabelEncoder()
-        all_users_encoded = le.fit_transform(ds.users)
-        d_train = all_users_encoded[train_idx]
-        d_val = all_users_encoded[val_idx]
-        
-        num_domains = len(le.classes_)
-        print(f"Number of Domains (Users): {num_domains}")
-    else:
-        d_train, d_val, num_domains = None, None, 0
+    d_train, d_val, num_domains = None, None, 0
+    X_target = None # For UDA
 
-    print(f"Data Splits: Train {X_train.shape}, Val {X_val.shape}, Test {X_test.shape}")
+    if args.model in DG_MODELS:
+        if args.uda:
+            print(f"Preparing UDA Mode for {args.model} (Source=Train, Target=Test)...")
+            # UDA Mode: Domain 0 = Source (Train), Domain 1 = Target (Test)
+            num_domains = 2
+            
+            # d_train is all 0s (Source)
+            d_train = np.zeros(len(X_train), dtype=int)
+            d_val = np.zeros(len(X_val), dtype=int) # Val is also Source
+            
+            # X_target is the Unlabeled Test Set (Domain 1)
+            X_target = X_test
+            print(f"UDA Enabled: X_target shape {X_target.shape}")
+            
+        else:
+            print(f"Preparing DG Mode for {args.model} (Multi-Source Users)...")
+            le = LabelEncoder()
+            all_users_encoded = le.fit_transform(ds.users)
+            d_train = all_users_encoded[train_idx]
+            d_val = all_users_encoded[val_idx]
+            
+            num_domains = len(le.classes_)
+            print(f"Number of Domains (Users): {num_domains}")
+
+    print(f"Data Splits: Train {X_train.shape}, Val {X_val.shape}")
     input_dim = X_train.shape[1]
     num_classes = 2
-
-    # --- HPO Only ---
-    # Run HPO or Default
+    # 4. Hyperparameter Optimization
+    # 4. Hyperparameter Optimization
     if args.hpo_trials > 0:
+        # Only print backbone if it's a DG/DA model that uses it
+        dg_da_models = ['DANN', 'CDAN', 'DeepCORAL', 'MCC', 'ADDA', 'MCD', 'JAN', 'SHOT', 'CBST', 
+                        'IRM', 'VREx', 'GroupDRO', 'MixStyle', 'MLDG', 'MASF', 'Fish', 'CSD', 'SagNet', 'ERM_DG']
+        
+        if args.model in dg_da_models:
+             print(f"Starting HPO with {args.hpo_trials} trials for {args.model} (Backbone: {args.backbone})...")
+        else:
+             print(f"Starting HPO with {args.hpo_trials} trials for {args.model}...")
         import optuna
         from src.hparams_registry import get_hparams
         
-        print(f"\n--- Starting HPO for {args.model} on {args.dataset} ({args.hpo_trials} trials) ---")
-        
         def objective(trial):
-            hparams_dist = get_hparams(args.model, args.dataset)
-            trial_hparams = {k: v(trial) for k, v in hparams_dist.items()}
+            # Get search space
+            hparams = get_hparams(args.model, args.dataset, backbone=args.backbone) # Pass backbone!
+            
+            # Suggest params
+            trial_params = {}
+            for k, v in hparams.items():
+                if callable(v):
+                    trial_params[k] = v(trial)
+                else:
+                    trial_params[k] = v
+            
+            # Train with these params
+            # We need to capture validation metric. 
+            # To avoid overhead, we might do a shorter run or partial data? 
+            # For now, full run on this split.
             
             try:
                 model = train_model(args, X_train, y_train, d_train, X_val, y_val, d_val, 
-                                    input_dim, num_classes, num_domains, trial_hparams, seed=42, patience=args.patience)
+                                    input_dim, num_classes, num_domains, trial_params, seed=42, patience=args.patience, X_target=X_target)
                 
-                metrics_val = evaluate_model(model, X_val, y_val)
-                return metrics_val['AUROC']
+                # Evaluate on Val
+                val_metrics = evaluate_model(model, X_val, y_val)
+                return val_metrics['AUROC'] # Maximize AUROC
             except Exception as e:
                 print(f"HPO Trial failed: {e}")
                 return 0.0
 
         study = optuna.create_study(direction='maximize')
         study.optimize(objective, n_trials=args.hpo_trials)
-        print("Best params:", study.best_params)
+        
+        print("Best HPO params:", study.best_params)
         best_hparams = study.best_params
-
+    else:
+        # Default params
+        # We still need to call get_hparams but it returns callables. 
+        # We need a 'default' set or just manually set empty so train_model uses defaults.
+        # Actually, hparams_registry returns callables for random search.
+        # If not HPO, we pass empty dict and let train_model use its internal defaults 
+        # OR we could pick 'middle' values. 
+        # Current logic: train_model has defaults if hparams is empty.
+        best_hparams = {}
+    
     seeds = [42]
     
     for seed in seeds:
@@ -293,20 +381,26 @@ def main():
         print(f"Training completed in {total_time:.2f} seconds ({time_per_epoch:.2f} seconds/epoch)")
         
         # 4. Evaluate
-        print("Evaluating on Validation and Test sets...")
+        print("Evaluating on Train, Validation and Test sets...")
         
+        train_metrics = evaluate_model(model, X_train, y_train)
         val_metrics = evaluate_model(model, X_val, y_val)
         test_metrics = evaluate_model(model, X_test, y_test)
         
         print(f"Results for {args.dataset} - {args.model} - Seed {seed}:")
-        print(f"  Val  AUROC: {val_metrics['AUROC']:.4f}, Acc: {val_metrics['Accuracy']:.4f}")
-        print(f"  Test AUROC: {test_metrics['AUROC']:.4f}, Acc: {test_metrics['Accuracy']:.4f}")
+        print(f"  Train AUROC: {train_metrics['AUROC']:.4f}, Acc: {train_metrics['Accuracy']:.4f}")
+        print(f"  Val   AUROC: {val_metrics['AUROC']:.4f}, Acc: {val_metrics['Accuracy']:.4f}")
+        print(f"  Test  AUROC: {test_metrics['AUROC']:.4f}, Acc: {test_metrics['Accuracy']:.4f}")
         
         # 5. Save Results
         results = {
             'Dataset': args.dataset,
+            'Label': args.label,
             'Model': args.model,
+            'Backbone': args.backbone, # Added Backbone
             'Seed': seed,
+            'Train_Accuracy': train_metrics['Accuracy'],
+            'Train_AUROC': train_metrics['AUROC'],
             'Val_Accuracy': val_metrics['Accuracy'],
             'Val_AUROC': val_metrics['AUROC'],
             'Test_Accuracy': test_metrics['Accuracy'],

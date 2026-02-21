@@ -87,8 +87,52 @@ class StressDataset:
         else:
             raise ValueError(f"Unexpected data format in {self.file_path}")
 
-        self.filter_users()
-        self.normalize_features()
+        # We removed self.normalize_features() from here.
+        # Normalization must happen AFTER temporal splitting to avoid data leakage.
+
+    def filter_one_month(self):
+        """Filters data to keep only the first month per user."""
+        print("Filtering usage data to first 1 month per user...")
+        unique_users = np.unique(self.users)
+        valid_indices = []
+
+        for user in unique_users:
+            user_mask = (self.users == user)
+            user_global_indices = np.where(user_mask)[0]
+            
+            if len(user_global_indices) == 0:
+                continue
+                
+            user_timestamps = self.timestamps[user_global_indices]
+            
+            # Ensure timestamps are pandas objects for DateOffset
+            # They verified as pandas Timestamps in test, but safe conversion:
+            # user_timestamps = pd.to_datetime(user_timestamps)
+            
+            start_date = user_timestamps.min()
+            cutoff_date = start_date + pd.DateOffset(months=1)
+            
+            # Filter
+            # Need to relate back to global indices
+            # timestmaps corresponds one-to-one
+            
+            # Vectorized check on this user's slice
+            keep_mask = (user_timestamps <= cutoff_date)
+            
+            # Map back to global indices
+            valid_indices.extend(user_global_indices[keep_mask])
+            
+        valid_indices = np.array(valid_indices)
+        valid_indices.sort() # Ensure sorted order (though extend normally preserves order if iterated sorted)
+        
+        original_count = len(self.X)
+        self.X = self.X[valid_indices]
+        self.y = self.y[valid_indices]
+        self.users = self.users[valid_indices]
+        self.timestamps = self.timestamps[valid_indices]
+        
+        print(f"Filtered data to 1 month. Samples: {original_count} -> {len(self.X)} (Removed {original_count - len(self.X)})")
+
 
     def filter_users(self):
         """Filters out users with insufficient data."""
@@ -122,32 +166,36 @@ class StressDataset:
         self.timestamps = self.timestamps[valid_indices]
         print(f"Taking {len(valid_indices)} samples after filtering.")
 
-    def normalize_features(self):
-        """Performs Z-score normalization per user."""
-        print("Normalizing features per user...")
+    def normalize_features(self, train_idx, val_idx, test_idx):
+        """
+        Performs Z-score normalization per user.
+        CRITICAL: To avoid data leakage, mean and std are calculated strictly on each user's TRAIN split.
+        Those stats are then applied to normalize that user's Train, Val, and Test splits.
+        """
+        print("Normalizing features per user (using Train-only statistics)...")
         unique_users = np.unique(self.users)
         
         for user in unique_users:
             user_mask = (self.users == user)
-            # Ensure user_mask is boolean array matching X length
+            
+            # Find which indices belong to this user AND are in the train set
+            # We use set intersection for speed, then convert to array
+            user_indices = np.where(user_mask)[0]
+            user_train_indices = np.intersect1d(user_indices, train_idx)
+            
+            if len(user_train_indices) == 0:
+                # Fallback if a user has zero training data (rare)
+                mean = np.zeros(self.X.shape[1])
+                std = np.ones(self.X.shape[1])
+            else:
+                user_X_train = self.X[user_train_indices]
+                mean = np.mean(user_X_train, axis=0)
+                std = np.std(user_X_train, axis=0)
+                std[std < 1e-6] = 1.0 # Avoid division by zero
             
             user_X = self.X[user_mask]
-            
-            mean = np.mean(user_X, axis=0)
-            std = np.std(user_X, axis=0)
-            
-            # Avoid division by zero and near-zero std
-            std[std < 1e-6] = 1.0
-            
             normalized = (user_X - mean) / std
             self.X[user_mask] = normalized.astype(np.float32)
-            
-            # Debug for first user
-            if user == unique_users[0]:
-                print(f"User {user}:")
-                print(f"  Original Mean (slice): {np.mean(user_X, axis=0)[:5]}")
-                print(f"  New Mean (slice): {np.mean(normalized, axis=0)[:5]}")
-                print(f"  Stored Mean (in X): {np.mean(self.X[user_mask], axis=0)[:5]}")
 
     def get_temporal_splits(self, train_ratio: float = 0.6, val_ratio: float = 0.2):
         """

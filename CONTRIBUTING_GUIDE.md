@@ -78,15 +78,6 @@ Goal: Train on source domains to generalize to unseen target domains.
 - [x] **GroupDRO (Group Distributionally Robust Optimization)** (Implemented)
     - **Rationale**: Optimizes for the worst-case domain performance. Essential for user heterogeneity.
     - **Code Source**: DomainBed `algorithms.py` (GroupDRO class).
-- [x] **TabTransformer** (Implemented)
-    - **Rationale**: Transformer encoder for tabular data. Handles categorical embeddings effectively.
-    - **Code Source**: `pytorch-widedeep` / Huang et al., 2020.
-- [x] **FastFormer** (Implemented)
-    - **Rationale**: Efficient Additive Attention ($O(N)$). Crucial for datasets with many features (>100 features).
-    - **Code Source**: `pytorch-widedeep` / Wu et al., 2021.
-- [x] **Perceiver** (Implemented)
-    - **Rationale**: Latent Attention. Decouples compute from input size, enabling handling of very high-dimensional data.
-    - **Code Source**: `pytorch-widedeep` / Jaegle et al., 2021 (DeepMind).
 - [x] **MixStyle** (Implemented)
     - **Rationale**: Data augmentation in feature space (mixing statistics). Simple yet effective.
     - **Code Source**: DomainBed `algorithms.py` (MixStyle class).
@@ -110,6 +101,26 @@ Goal: Train on source domains to generalize to unseen target domains.
     - **Source**: Shi et al., 2021 (ICLR).
 
 
+
+### Tabular Deep Learning & Transformers
+Goal: Modern architectures specifically designed for tabular data, including high-dimensional feature sets.
+
+**Implemented:**
+- [x] **TabTransformer** (Implemented)
+    - **Rationale**: Transformer encoder for tabular data. Handles categorical embeddings effectively.
+    - **Code Source**: `pytorch-widedeep` / Huang et al., 2020.
+- [x] **FastFormer** (Implemented)
+    - **Rationale**: Efficient Additive Attention ($O(N)$). Crucial for datasets with many features (>100 features).
+    - **Code Source**: `pytorch-widedeep` / Wu et al., 2021.
+- [x] **Perceiver** (Implemented)
+    - **Rationale**: Latent Attention. Decouples compute from input size, enabling handling of very high-dimensional data.
+    - **Code Source**: `pytorch-widedeep` / Jaegle et al., 2021 (DeepMind).
+- [x] **TabNet** (Implemented)
+    - **Rationale**: Attentive interpretable tabular learning.
+    - **Code Source**: `pytorch-tabnet` / Arik & Pfister, 2020.
+- [x] **NODE (Neural Oblivious Decision Ensembles)** (Implemented)
+    - **Rationale**: Deep learning architecture that mimics decision trees.
+    - **Code Source**: `pytorch_tabular` / Popov et al., 2019.
 
 ---
 

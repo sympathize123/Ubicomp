@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.autograd as autograd
 import numpy as np
 import torch.nn.functional as F
+from sklearn.metrics import roc_auc_score
 from src.backbones import MLPFeaturizer, ResNetFeaturizer, TransformerFeaturizer
 
 class DAModel(nn.Module):
@@ -303,17 +304,19 @@ class DeepCORAL(DAModel):
 # --- Training Logic ---
 
 def train_adversarial_da(model, X_train, y_train, d_train, X_val, y_val, d_val,
-                           epochs=50, batch_size=64, lr=1e-3, patience=5, device='cuda' if torch.cuda.is_available() else 'cpu'):
+                           epochs=50, batch_size=64, lr=1e-3, patience=5, device='cuda' if torch.cuda.is_available() else 'cpu', X_target=None):
     """
     Generic adversarial training loop for DANN and CDAN.
+    Supports both:
+    1. DG Mode (Multi-Source Users): X_target=None. Discriminator aligns User Domains (d_train).
+    2. UDA Mode (Source vs Target): X_target provided. Discriminator aligns Source (d=0) vs Target (d=1).
     """
     model = model.to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     class_criterion = nn.CrossEntropyLoss()
     domain_criterion = nn.CrossEntropyLoss()
     
-    # ... (rest of the logic similar to DANN, but using generic model call)
-    # Datasets
+    # Dataset & Loader Setup
     train_dataset = torch.utils.data.TensorDataset(
         torch.tensor(X_train, dtype=torch.float32), 
         torch.tensor(y_train, dtype=torch.long),
@@ -325,17 +328,36 @@ def train_adversarial_da(model, X_train, y_train, d_train, X_val, y_val, d_val,
         torch.tensor(d_val, dtype=torch.long)
     )
     
-    # Drop last to avoid batchnorm 1 sample issue
     train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
     val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
     
-    best_val_loss = float('inf')
+    target_loader = None
+    if X_target is not None:
+        # UDA Mode: Create Target Loader (Unlabeled)
+        # We dummy y and d for consistency, d=1 for Target
+        y_target_dummy = torch.zeros(len(X_target), dtype=torch.long)
+        d_target = torch.ones(len(X_target), dtype=torch.long) # Domain 1 = Target
+        
+        target_dataset = torch.utils.data.TensorDataset(
+            torch.tensor(X_target, dtype=torch.float32),
+            y_target_dummy,
+            d_target
+        )
+        target_loader = torch.utils.data.DataLoader(target_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
+        # Infinite iterator for target
+        def infinite_iterator(loader):
+            while True:
+                for batch in loader:
+                    yield batch
+        target_iter = infinite_iterator(target_loader)
+
+    best_val_score = -float('inf')
     best_model_state = None
     patience_counter = 0
     import copy
-
     from tqdm import tqdm
-    epoch_iterator = tqdm(range(epochs), desc="Adversarial DA Training")
+
+    epoch_iterator = tqdm(range(epochs), desc="Adversarial DA Training" if X_target is None else "UDA Training")
 
     for epoch in epoch_iterator:
         model.train()
@@ -344,18 +366,51 @@ def train_adversarial_da(model, X_train, y_train, d_train, X_val, y_val, d_val,
         p = epoch / epochs
         alpha = 2.0 / (1.0 + np.exp(-10 * p)) - 1.0
         
-        for X_batch, y_batch, d_batch in train_loader:
-            X_batch, y_batch, d_batch = X_batch.to(device), y_batch.to(device), d_batch.to(device)
+        for batch_s in train_loader:
+            X_s, y_s, d_s = batch_s
+            X_s, y_s, d_s = X_s.to(device), y_s.to(device), d_s.to(device)
+            
+            X_t, d_t = None, None
+            if target_loader:
+                # Sample Target Batch
+                try:
+                    X_t, _, d_t = next(target_iter)
+                except StopIteration:
+                    target_iter = infinite_iterator(target_loader)
+                    X_t, _, d_t = next(target_iter)
+                
+                X_t, d_t = X_t.to(device), d_t.to(device)
             
             optimizer.zero_grad()
             
-            # Forward pass: adversarial models return (class_out, domain_out)
-            class_out, domain_out = model(X_batch, alpha=alpha)
-            
-            err_s_label = class_criterion(class_out, y_batch)
-            err_s_domain = domain_criterion(domain_out, d_batch)
-            
-            loss = err_s_label + err_s_domain
+            # Forward pass
+            if target_loader:
+                # Combined Batch: Source + Target
+                # This ensures Discriminator sees both domains in one step for stability
+                # Or we can do separate passes. Let's do separate passes to keep logic clean?
+                # DANN forward handles single batch.
+                # Standard UDA DANN implementation:
+                # 1. Feature Extractor on Source -> Class Pred + Domain Pred (0)
+                # 2. Feature Extractor on Target -> Domain Pred (1)
+                
+                # --- Source Pass ---
+                class_out_s, domain_out_s = model(X_s, alpha=alpha)
+                err_s_label = class_criterion(class_out_s, y_s)
+                err_s_domain = domain_criterion(domain_out_s, d_s) # d_s should be 0s
+                
+                # --- Target Pass ---
+                _, domain_out_t = model(X_t, alpha=alpha)
+                err_t_domain = domain_criterion(domain_out_t, d_t) # d_t should be 1s
+                
+                loss = err_s_label + err_s_domain + err_t_domain
+                
+            else:
+                # DG Mode: Single Batch (Mixed Users)
+                class_out, domain_out = model(X_s, alpha=alpha)
+                err_s_label = class_criterion(class_out, y_s)
+                err_s_domain = domain_criterion(domain_out, d_s)
+                loss = err_s_label + err_s_domain
+
             loss.backward()
             optimizer.step()
             
@@ -363,34 +418,40 @@ def train_adversarial_da(model, X_train, y_train, d_train, X_val, y_val, d_val,
             
         train_loss /= len(train_loader)
         
-        # Validation
+        # Validation (Always Source-Labeled Val)
         model.eval()
         val_loss = 0.0
+        val_probs = []
+        val_targets = []
+        
         with torch.no_grad():
             for X_batch, y_batch, _ in val_loader:
                 X_batch, y_batch = X_batch.to(device), y_batch.to(device)
-                # Validation forward doesn't need alpha usually, just prediction
-                # But our forward expects alpha. 
-                # If we call model.predict(x) defined in standard base, we get logits
                 class_out = model.predict(X_batch)
                 loss = class_criterion(class_out, y_batch)
                 val_loss += loss.item()
+                
+                probs = torch.softmax(class_out, dim=1)[:, 1]
+                val_probs.extend(probs.cpu().numpy())
+                val_targets.extend(y_batch.cpu().numpy())
         
         val_loss /= len(val_loader)
+        try:
+            val_auroc = roc_auc_score(val_targets, val_probs)
+        except:
+            val_auroc = 0.5
         
-        # print(f"Epoch {epoch}: Train Loss {train_loss:.4f}, Val Loss {val_loss:.4f}")
-        
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
+        if val_auroc > best_val_score:
+            best_val_score = val_auroc
             best_model_state = copy.deepcopy(model.state_dict())
             patience_counter = 0
         else:
             patience_counter += 1
             if patience_counter >= patience:
-                epoch_iterator.write(f"Early stopping at epoch {epoch}")
+                epoch_iterator.write(f"Early stopping at epoch {epoch} (Best AUROC: {best_val_score:.4f})")
                 break
         
-        epoch_iterator.set_postfix({'Loss': f'{train_loss:.4f}', 'Val Loss': f'{val_loss:.4f}'})
+        epoch_iterator.set_postfix({'Loss': f'{train_loss:.4f}', 'Val Loss': f'{val_loss:.4f}', 'Val AUC': f'{val_auroc:.4f}'})
                 
     if best_model_state:
         model.load_state_dict(best_model_state)
@@ -436,7 +497,7 @@ def train_mcc(model, X_train, y_train, d_train, X_val, y_val, d_val,
     val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
     
     import copy
-    best_val_loss = float('inf')
+    best_val_score = -float('inf')
     best_model_state = None
     patience_counter = 0
     
@@ -457,15 +518,8 @@ def train_mcc(model, X_train, y_train, d_train, X_val, y_val, d_val,
             
             # MCC Loss
             probs = F.softmax(logits / model.temperature, dim=1) # (B, C)
-            # Covariance matrix weighting?
-            # Simplified MCC: Minimize entropy / confusion
-            # Official implementation:
-            # cov = probs.T @ probs / BatchSize
-            # loss_mcc = (cov.sum() - cov.diag().sum())  (minimize off-diagonal)
-            
             cov = torch.mm(probs.t(), probs) / X_batch.size(0)
             mcc_loss = (torch.sum(cov) - torch.trace(cov)) 
-            # OR standard formulated: MCC minimizes confusion between classes
             
             loss = cls_loss + 1.0 * mcc_loss # weight 1.0
             
@@ -478,24 +532,35 @@ def train_mcc(model, X_train, y_train, d_train, X_val, y_val, d_val,
         # Validation
         model.eval()
         val_loss = 0.0
+        val_probs = []
+        val_targets = []
         with torch.no_grad():
             for X_batch, y_batch in val_loader:
                 X_batch, y_batch = X_batch.to(device), y_batch.to(device)
                 logits = model.predict(X_batch)
                 val_loss += class_criterion(logits, y_batch).item()
+                
+                probs = torch.softmax(logits, dim=1)[:, 1]
+                val_probs.extend(probs.cpu().numpy())
+                val_targets.extend(y_batch.cpu().numpy())
+                
         val_loss /= len(val_loader)
+        try:
+            val_auroc = roc_auc_score(val_targets, val_probs)
+        except:
+            val_auroc = 0.5
         
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
+        if val_auroc > best_val_score:
+            best_val_score = val_auroc
             best_model_state = copy.deepcopy(model.state_dict())
             patience_counter = 0
         else:
             patience_counter += 1
             if patience_counter >= patience:
-                epoch_iterator.write(f"Early stopping at epoch {epoch}")
+                epoch_iterator.write(f"Early stopping at epoch {epoch} (Best AUROC: {best_val_score:.4f})")
                 break
         
-        epoch_iterator.set_postfix({'Loss': f'{train_loss:.4f}', 'Val Loss': f'{val_loss:.4f}'})
+        epoch_iterator.set_postfix({'Loss': f'{train_loss:.4f}', 'Val Loss': f'{val_loss:.4f}', 'Val AUC': f'{val_auroc:.4f}'})
 
     if best_model_state:
         model.load_state_dict(best_model_state)
@@ -620,7 +685,7 @@ def train_mcd(model, X_train, y_train, d_train, X_val, y_val, d_val,
     train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
     val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
     
-    best_val_loss = float('inf')
+    best_val_score = -float('inf')
     best_model_state = None
     patience_counter = 0
     
@@ -653,6 +718,8 @@ def train_mcd(model, X_train, y_train, d_train, X_val, y_val, d_val,
         # Validation
         model.eval()
         val_loss = 0.0
+        val_probs = []
+        val_targets = []
         with torch.no_grad():
             for X_batch, y_batch in val_loader:
                 X_batch, y_batch = X_batch.to(device), y_batch.to(device)
@@ -660,19 +727,29 @@ def train_mcd(model, X_train, y_train, d_train, X_val, y_val, d_val,
                 l1 = criterion(o1, y_batch)
                 l2 = criterion(o2, y_batch)
                 val_loss += (l1 + l2).item()
+                
+                # Use ensemble for prediction
+                logits = (o1 + o2) / 2.0
+                probs = torch.softmax(logits, dim=1)[:, 1]
+                val_probs.extend(probs.cpu().numpy())
+                val_targets.extend(y_batch.cpu().numpy())
         
         val_loss /= len(val_loader)
+        try:
+            val_auroc = roc_auc_score(val_targets, val_probs)
+        except:
+            val_auroc = 0.5
         
-        epoch_iterator.set_postfix({'Loss': f'{train_loss:.4f}', 'Val Loss': f'{val_loss:.4f}'})
+        epoch_iterator.set_postfix({'Loss': f'{train_loss:.4f}', 'Val Loss': f'{val_loss:.4f}', 'Val AUC': f'{val_auroc:.4f}'})
         
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
+        if val_auroc > best_val_score:
+            best_val_score = val_auroc
             best_model_state = copy.deepcopy(model.state_dict())
             patience_counter = 0
         else:
             patience_counter += 1
             if patience_counter >= patience:
-                epoch_iterator.write(f"Early stopping at epoch {epoch}")
+                epoch_iterator.write(f"Early stopping at epoch {epoch} (Best AUROC: {best_val_score:.4f})")
                 break
 
     if best_model_state:
@@ -758,7 +835,7 @@ def train_jan(model, X_train, y_train, d_train, X_val, y_val, d_val,
     train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
     val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
     
-    best_val_loss = float('inf')
+    best_val_score = -float('inf')
     best_model_state = None
     patience_counter = 0
 
@@ -809,24 +886,35 @@ def train_jan(model, X_train, y_train, d_train, X_val, y_val, d_val,
         # Validation
         model.eval()
         val_loss = 0.0
+        val_probs = []
+        val_targets = []
         with torch.no_grad():
             for X_batch, y_batch in val_loader:
                 X_batch, y_batch = X_batch.to(device), y_batch.to(device)
                 logit = model.predict(X_batch)
                 val_loss += criterion(logit, y_batch).item()
+                
+                probs = torch.softmax(logit, dim=1)[:, 1]
+                val_probs.extend(probs.cpu().numpy())
+                val_targets.extend(y_batch.cpu().numpy())
+
         val_loss /= len(val_loader)
+        try:
+            val_auroc = roc_auc_score(val_targets, val_probs)
+        except:
+            val_auroc = 0.5
         
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
+        if val_auroc > best_val_score:
+            best_val_score = val_auroc
             best_model_state = copy.deepcopy(model.state_dict())
             patience_counter = 0
         else:
             patience_counter += 1
             if patience_counter >= patience:
-                epoch_iterator.write(f"Early stopping at epoch {epoch}")
+                epoch_iterator.write(f"Early stopping at epoch {epoch} (Best AUROC: {best_val_score:.4f})")
                 break
         
-        epoch_iterator.set_postfix({'Loss': f'{train_loss:.4f}', 'Val Loss': f'{val_loss:.4f}'})
+        epoch_iterator.set_postfix({'Loss': f'{train_loss:.4f}', 'Val Loss': f'{val_loss:.4f}', 'Val AUC': f'{val_auroc:.4f}'})
                 
     if best_model_state:
         model.load_state_dict(best_model_state)

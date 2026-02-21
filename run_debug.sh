@@ -31,7 +31,7 @@ for dataset in "${datasets[@]}"; do
         echo "------------------------------------------------"
         echo "Running Baseline: Dataset=$dataset, Model=$model"
         echo "------------------------------------------------"
-        python3 execute_benchmark.py --dataset "$dataset" --model "$model" --hpo_trials 20
+        python3 execute_benchmark.py --dataset "$dataset" --model "$model" --hpo_trials 1 --epochs 1 --patience 1
     done
 
     # 2. Run Tabular DL
@@ -39,7 +39,7 @@ for dataset in "${datasets[@]}"; do
         echo "------------------------------------------------"
         echo "Running Tabular DL: Dataset=$dataset, Model=$model"
         echo "------------------------------------------------"
-        python3 execute_benchmark.py --dataset "$dataset" --model "$model" --hpo_trials 20
+        python3 execute_benchmark.py --dataset "$dataset" --model "$model" --hpo_trials 1 --epochs 1 --patience 1
     done
 
     # 3. Run DG/DA with Backbones
@@ -48,7 +48,7 @@ for dataset in "${datasets[@]}"; do
             echo "------------------------------------------------"
             echo "Running DG/DA: Dataset=$dataset, Model=$model, Backbone=$backbone"
             echo "------------------------------------------------"
-            python3 execute_benchmark.py --dataset "$dataset" --model "$model" --backbone "$backbone" --hpo_trials 20
+            python3 execute_benchmark.py --dataset "$dataset" --model "$model" --backbone "$backbone" --hpo_trials 1 --epochs 1 --patience 1
         done
     done
 
