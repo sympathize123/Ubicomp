@@ -32,6 +32,17 @@ selected_users_dataset/
 events.out.*
 data/
 
+# DA verification outputs
+DA_Verification/CGDM/DA_Verification/
+DA_Verification/CGDM/cgdm_only/
+DA_Verification/CGDM/**/metrics.json
+DA_Verification/CGDM/**/metrics.txt
+DA_Verification/CGDM/**/tsne_*.jpg
+DA_Verification/CGDM/**/pca_*.jpg
+DA_Verification/CGDM/**/tsne_*.png
+DA_Verification/CGDM/**/pca_*.png
+DA_Verification/CGDM/**/*.pt
+DA_Verification/CGDM/**/*.pth
 
 
 # Folders
