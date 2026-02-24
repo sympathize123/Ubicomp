@@ -16,8 +16,11 @@ dg_da_models=(
     # DG
     "IRM" "VREx" "GroupDRO" "MixStyle" "MLDG" "MASF" "Fish" "CSD" "SagNet"
     # DA
-    "DANN" "CDAN" "DeepCORAL" "MCC" "ADDA" "MCD" "JAN" "SHOT" "CBST"
+    "DANN" "CDAN" "DAN" "DeepCORAL" "MCC" "ADDA" "MCD" "JAN" "SHOT" "CBST"
 )
+
+# DA models (require --uda)
+da_models=("DANN" "CDAN" "DAN" "DeepCORAL" "MCC" "ADDA" "MCD" "JAN" "SHOT" "CBST")
 
 # Backbones for DG/DA
 backbones=("MLP" "ResNet" "Transformer")
@@ -48,7 +51,14 @@ for dataset in "${datasets[@]}"; do
             echo "------------------------------------------------"
             echo "Running DG/DA: Dataset=$dataset, Model=$model, Backbone=$backbone"
             echo "------------------------------------------------"
-            python3 execute_benchmark.py --dataset "$dataset" --model "$model" --backbone "$backbone" --hpo_trials 1 --epochs 1 --patience 1
+            use_uda=""
+            for da_model in "${da_models[@]}"; do
+                if [ "$model" == "$da_model" ]; then
+                    use_uda="--uda"
+                    break
+                fi
+            done
+            python3 execute_benchmark.py --dataset "$dataset" --model "$model" --backbone "$backbone" --hpo_trials 1 --epochs 1 --patience 1 $use_uda
         done
     done
 

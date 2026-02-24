@@ -5,6 +5,7 @@ datasets=("D-1" "D-2" "D-3")
 da_models=(
     "DANN" 
     "CDAN" 
+    "DAN"
     "DeepCORAL" 
     "MCC" 
     "ADDA" 
@@ -12,6 +13,7 @@ da_models=(
     "JAN" 
     "SHOT" 
     "CBST"
+    "CGDM"
 )
 # Backbones for DA models
 backbones=("MLP" "ResNet" "Transformer")
@@ -33,7 +35,7 @@ for dataset in "${datasets[@]}"; do
             echo "Running: Dataset=$dataset, Model=$model, Backbone=$backbone"
             echo "HPO Trials: $HPO_TRIALS"
             echo "------------------------------------------------"
-            python3 execute_benchmark.py --dataset "$dataset" --model "$model" --backbone "$backbone" --epochs 50  --hpo_trials $HPO_TRIALS
+            python3 execute_benchmark.py --dataset "$dataset" --model "$model" --backbone "$backbone" --epochs 50  --hpo_trials $HPO_TRIALS --uda
             echo ""
         done
     done

@@ -15,7 +15,7 @@ def get_hparams(algorithm, dataset, backbone='MLP'):
     # tailored based on DomainBed and Tabular DL papers
     
     # 1. ERM / Backbone Baselines (MLP, ResNet)
-    if algorithm in ['MLP', 'ResNet', 'ERM_DG', 'DANN', 'CDAN', 'DeepCORAL', 'MCC', 'ADDA', 'MCD', 'JAN', 'SHOT', 'CBST']:
+    if algorithm in ['MLP', 'ResNet', 'ERM_DG', 'DANN', 'CDAN', 'DAN', 'DeepCORAL', 'MCC', 'ADDA', 'MCD', 'JAN', 'SHOT', 'CBST', 'CGDM']:
         hparams['lr'] = lambda trial: trial.suggest_float('lr', 1e-5, 1e-2, log=True)
         hparams['weight_decay'] = lambda trial: trial.suggest_float('weight_decay', 1e-6, 1e-3, log=True)
         hparams['batch_size'] = lambda trial: trial.suggest_categorical('batch_size', [32, 64, 128])
@@ -43,6 +43,9 @@ def get_hparams(algorithm, dataset, backbone='MLP'):
             
         if algorithm == 'DeepCORAL':
             hparams['mmd_gamma'] = lambda trial: trial.suggest_float('mmd_gamma', 0.1, 10.0, log=True)
+
+        if algorithm == 'DAN':
+            hparams['dan_trade_off'] = lambda trial: trial.suggest_float('dan_trade_off', 0.1, 10.0, log=True)
             
         if algorithm == 'MCC':
             hparams['mcc_temp'] = lambda trial: trial.suggest_float('mcc_temp', 1.0, 5.0)
@@ -74,15 +77,30 @@ def get_hparams(algorithm, dataset, backbone='MLP'):
             
         if algorithm == 'MixStyle':
             hparams['mixstyle_alpha'] = lambda trial: trial.suggest_float('mixstyle_alpha', 0.1, 0.5)
+            hparams['mixstyle_p'] = lambda trial: trial.suggest_float('mixstyle_p', 0.1, 0.9)
+            hparams['mixstyle_mix'] = lambda trial: trial.suggest_categorical('mixstyle_mix', ['random', 'crossdomain'])
+
+        if algorithm == 'MLDG':
+            hparams['mldg_beta'] = lambda trial: trial.suggest_float('mldg_beta', 0.1, 2.0)
+            hparams['n_meta_test'] = lambda trial: trial.suggest_int('n_meta_test', 1, 2)
+
+        if algorithm == 'MASF':
+            hparams['masf_inner_lr'] = lambda trial: trial.suggest_float('masf_inner_lr', 1e-5, 1e-2, log=True)
+            hparams['masf_metric_lr'] = lambda trial: trial.suggest_float('masf_metric_lr', 1e-5, 1e-2, log=True)
+            hparams['masf_metric_weight'] = lambda trial: trial.suggest_float('masf_metric_weight', 1e-4, 1e-2, log=True)
+            hparams['masf_margin'] = lambda trial: trial.suggest_float('masf_margin', 0.2, 2.0)
+            hparams['masf_temperature'] = lambda trial: trial.suggest_float('masf_temperature', 1.0, 5.0)
+            hparams['masf_metric_dim'] = lambda trial: trial.suggest_categorical('masf_metric_dim', [64, 128, 256])
 
         if algorithm == 'Fish':
-            hparams['fish_meta_lr'] = lambda trial: trial.suggest_float('fish_meta_lr', 0.1, 1.0)
+            hparams['meta_lr'] = lambda trial: trial.suggest_float('meta_lr', 0.1, 1.0)
             
         if algorithm == 'CSD':
             hparams['csd_lambda'] = lambda trial: trial.suggest_float('csd_lambda', 0.1, 5.0)
+            hparams['csd_k'] = lambda trial: trial.suggest_categorical('csd_k', [2, 3])
 
         if algorithm == 'SagNet':
-            hparams['sagnet_style_stage'] = lambda trial: trial.suggest_float('sagnet_style_stage', 0.1, 0.9)
+            hparams['sag_w_adv'] = lambda trial: trial.suggest_float('sag_w_adv', 0.1, 2.0)
 
     # 3. Tabular Deep Learning
     elif algorithm == 'TabNet':

@@ -1,34 +1,95 @@
+import copy
+import operator
+from collections import OrderedDict
+from itertools import cycle
+from numbers import Number
+
+import numpy as np
 import torch
+import torch.autograd as autograd
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.autograd as autograd
+from torch.utils.data import DataLoader, TensorDataset
+
 from src.backbones import MLPFeaturizer, ResNetFeaturizer, TransformerFeaturizer
+
+
+class FeatureClassifier(nn.Module):
+    def __init__(self, featurizer, classifier):
+        super().__init__()
+        self.featurizer = featurizer
+        self.classifier = classifier
+
+    def forward(self, x):
+        feats = self.featurizer(x)
+        return self.classifier(feats)
+
+    def forward_features(self, x):
+        return self.featurizer(x)
+
+
+def _build_featurizer(input_dim, hparams):
+    backbone_name = hparams.get('backbone', 'MLP')
+    dropout = hparams.get('dropout', 0.3)
+    hidden_dim = hparams.get('hidden_dim', 256)
+
+    if backbone_name == 'MLP':
+        return MLPFeaturizer(
+            input_dim,
+            hidden_dim=hidden_dim,
+            output_dim=128,
+            num_layers=hparams.get('num_layers', 3),
+            dropout=dropout
+        )
+    if backbone_name == 'ResNet':
+        return ResNetFeaturizer(
+            input_dim,
+            hidden_dim=hidden_dim,
+            output_dim=128,
+            num_blocks=hparams.get('num_blocks', 2),
+            dropout=dropout
+        )
+    if backbone_name == 'Transformer':
+        return TransformerFeaturizer(
+            input_dim,
+            hidden_dim=128,
+            output_dim=128,
+            num_layers=hparams.get('num_layers', 2),
+            nhead=hparams.get('nhead', 4),
+            dropout=dropout
+        )
+
+    raise ValueError(f"Unknown backbone: {backbone_name}")
+
+
+def _build_classifier(in_dim, num_classes, hparams):
+    nonlinear = hparams.get('nonlinear_classifier', False)
+    dropout = hparams.get('classifier_dropout', 0.0)
+    hidden_dim = hparams.get('classifier_hidden_dim', in_dim)
+    if not nonlinear:
+        return nn.Linear(in_dim, num_classes)
+    return nn.Sequential(
+        nn.Linear(in_dim, hidden_dim),
+        nn.ReLU(),
+        nn.Dropout(dropout),
+        nn.Linear(hidden_dim, num_classes)
+    )
+
 
 class DGModel(nn.Module):
     """
     Base class for Domain Generalization models.
     """
     def __init__(self, input_dim, num_classes=2, hparams=None):
-        super(DGModel, self).__init__()
+        super().__init__()
         self.input_dim = input_dim
         self.num_classes = num_classes
         self.hparams = hparams if hparams else {}
-        
-        backbone_name = self.hparams.get('backbone', 'MLP')
-        dropout = self.hparams.get('dropout', 0.3)
-        hidden_dim = self.hparams.get('hidden_dim', 256) 
-        
-        if backbone_name == 'MLP':
-            self.featurizer = MLPFeaturizer(input_dim, hidden_dim=hidden_dim, output_dim=128, num_layers=self.hparams.get('num_layers', 3), dropout=dropout)
-        elif backbone_name == 'ResNet':
-            self.featurizer = ResNetFeaturizer(input_dim, hidden_dim=hidden_dim, output_dim=128, num_blocks=self.hparams.get('num_blocks', 2), dropout=dropout)
-        elif backbone_name == 'Transformer':
-            self.featurizer = TransformerFeaturizer(input_dim, hidden_dim=128, output_dim=128, num_layers=self.hparams.get('num_layers', 2), nhead=self.hparams.get('nhead', 4), dropout=dropout)
-        else:
-            raise ValueError(f"Unknown backbone: {backbone_name}")
-            
-        self.classifier = nn.Linear(self.featurizer.output_dim, num_classes)
-        self.network = nn.Sequential(self.featurizer, self.classifier)
+        self.num_domains = self.hparams.get('num_domains')
+
+        self.featurizer = _build_featurizer(input_dim, self.hparams)
+        self.classifier = _build_classifier(self.featurizer.output_dim, num_classes, self.hparams)
+        self.network = FeatureClassifier(self.featurizer, self.classifier)
 
     def predict(self, x):
         return self.network(x)
@@ -36,23 +97,26 @@ class DGModel(nn.Module):
     def forward(self, x):
         return self.predict(x)
 
-
-    def update(self, minibatches, unlabeled=None):
+    def update(self, minibatches, unlabeled=None, **kwargs):
         """
         Input: minibatches is a list of (x, y) pairs, one per domain.
         """
         raise NotImplementedError
 
+
 class ERM(DGModel):
     """
     Empirical Risk Minimization (Standard Training)
-    Serves as a baseline.
     """
     def __init__(self, input_dim, num_classes=2, hparams=None):
-        super(ERM, self).__init__(input_dim, num_classes, hparams)
-        self.optimizer = torch.optim.Adam(self.network.parameters(), lr=hparams.get('lr', 1e-3))
+        super().__init__(input_dim, num_classes, hparams)
+        self.optimizer = torch.optim.Adam(
+            self.network.parameters(),
+            lr=self.hparams.get('lr', 1e-3),
+            weight_decay=self.hparams.get('weight_decay', 0.0)
+        )
 
-    def update(self, minibatches, unlabeled=None):
+    def update(self, minibatches, unlabeled=None, **kwargs):
         all_x = torch.cat([x for x, y in minibatches])
         all_y = torch.cat([y for x, y in minibatches])
         loss = F.cross_entropy(self.predict(all_x), all_y)
@@ -62,617 +126,902 @@ class ERM(DGModel):
         self.optimizer.step()
         return {'loss': loss.item()}
 
-class IRM(DGModel):
+
+class IRM(ERM):
     """
     Invariant Risk Minimization (Arjovsky et al., 2019)
     """
     def __init__(self, input_dim, num_classes=2, hparams=None):
-        super(IRM, self).__init__(input_dim, num_classes, hparams)
-        self.optimizer = torch.optim.Adam(self.network.parameters(), lr=hparams.get('lr', 1e-3))
-        self.penalty_weight = hparams.get('irm_lambda', 100.0)
-        self.penalty_anneal_iters = hparams.get('irm_penalty_anneal_iters', 500)
-        self.steps = 0
+        super().__init__(input_dim, num_classes, hparams)
+        self.register_buffer('update_count', torch.tensor([0]))
 
-    def irm_penalty(self, logits, y):
+    @staticmethod
+    def _irm_penalty(logits, y):
         device = logits.device
         scale = torch.tensor(1.).to(device).requires_grad_()
-        loss = F.cross_entropy(logits * scale, y)
-        grad = autograd.grad(loss, [scale], create_graph=True)[0]
-        return torch.sum(grad**2)
+        loss_1 = F.cross_entropy(logits[::2] * scale, y[::2])
+        loss_2 = F.cross_entropy(logits[1::2] * scale, y[1::2])
+        grad_1 = autograd.grad(loss_1, [scale], create_graph=True)[0]
+        grad_2 = autograd.grad(loss_2, [scale], create_graph=True)[0]
+        return torch.sum(grad_1 * grad_2)
 
-    def update(self, minibatches, unlabeled=None):
-        self.steps += 1
-        penalty_weight = (self.penalty_weight if self.steps >= self.penalty_anneal_iters else 1.0)
-        
+    def update(self, minibatches, unlabeled=None, **kwargs):
+        penalty_weight = (
+            self.hparams.get('irm_lambda', 1.0)
+            if self.update_count >= self.hparams.get('irm_penalty_anneal_iters', 0)
+            else 1.0
+        )
         nll = 0.
         penalty = 0.
 
+        all_x = torch.cat([x for x, y in minibatches])
+        all_logits = self.network(all_x)
+        all_logits_idx = 0
+
         for x, y in minibatches:
-            logits = self.network(x)
+            logits = all_logits[all_logits_idx:all_logits_idx + x.shape[0]]
+            all_logits_idx += x.shape[0]
             nll += F.cross_entropy(logits, y)
-            penalty += self.irm_penalty(logits, y)
+            penalty += self._irm_penalty(logits, y)
 
         nll /= len(minibatches)
         penalty /= len(minibatches)
-        loss = nll + (penalty_weight * penalty)
+        loss = nll + penalty_weight * penalty
+
+        if self.update_count == self.hparams.get('irm_penalty_anneal_iters', 0):
+            self.optimizer = torch.optim.Adam(
+                self.network.parameters(),
+                lr=self.hparams.get('lr', 1e-3),
+                weight_decay=self.hparams.get('weight_decay', 0.0)
+            )
 
         self.optimizer.zero_grad()
         loss.backward()
         self.optimizer.step()
-        
+
+        self.update_count += 1
         return {'loss': loss.item(), 'nll': nll.item(), 'penalty': penalty.item()}
 
-class VREx(DGModel):
+
+class VREx(ERM):
     """
     V-REx (Krueger et al., 2021)
-    Risk Extrapolation: Minimizes mean risk + variance of risk across domains.
     """
     def __init__(self, input_dim, num_classes=2, hparams=None):
-        super(VREx, self).__init__(input_dim, num_classes, hparams)
-        self.optimizer = torch.optim.Adam(self.network.parameters(), lr=hparams.get('lr', 1e-3))
-        self.lambda_val = hparams.get('vrex_lambda', 10.0)
-        self.anneal_iters = hparams.get('vrex_penalty_anneal_iters', 500)
-        self.steps = 0
+        super().__init__(input_dim, num_classes, hparams)
+        self.register_buffer('update_count', torch.tensor([0]))
 
-    def update(self, minibatches, unlabeled=None):
-        self.steps += 1
-        loss_weight = (self.lambda_val if self.steps >= self.anneal_iters else 1.0)
-        
-        losses = torch.zeros(len(minibatches)).to(minibatches[0][0].device)
-        
-        for i, (x, y) in enumerate(minibatches):
-            logits = self.network(x)
-            losses[i] = F.cross_entropy(logits, y)
+    def update(self, minibatches, unlabeled=None, **kwargs):
+        penalty_weight = (
+            self.hparams.get('vrex_lambda', 1.0)
+            if self.update_count >= self.hparams.get('vrex_penalty_anneal_iters', 0)
+            else 1.0
+        )
 
-        mean_loss = losses.mean()
-        var_loss = losses.var()
-        total_loss = mean_loss + loss_weight * var_loss
-
-        self.optimizer.zero_grad()
-        total_loss.backward()
-        self.optimizer.step()
-
-        return {'loss': total_loss.item(), 'mean_loss': mean_loss.item(), 'var_loss': var_loss.item()}
-
-class GroupDRO(DGModel):
-    """
-    Group DRO (Sagawa et al., 2020)
-    Optimizes for the worst-case domain.
-    """
-    def __init__(self, input_dim, num_classes=2, hparams=None):
-        super(GroupDRO, self).__init__(input_dim, num_classes, hparams)
-        self.optimizer = torch.optim.Adam(self.network.parameters(), lr=hparams.get('lr', 1e-3))
-        # Initialize q with size of num_domains if known, else dynamic. 
-        # But q needs to be persistent. We'll rely on the update method to resize or hparams to pass num_domains.
-        n_domains = hparams.get('num_domains', 10) # Default 10 if not passed
-        self.register_buffer("q", torch.ones(n_domains)) 
-        self.group_step_size = hparams.get('groupdro_eta', 0.01)
-
-    def update(self, minibatches, unlabeled=None, domain_indices=None):
-        device = minibatches[0][0].device
-        
-        # If domain_indices passed (subset of domains), we need to index q carefully.
-        # But GroupDRO expects q to track ALL domains.
-        # If we subsample domains, we only update q for those domains?
-        # Simpler approach: GroupDRO usually assumes access to all groups.
-        # For 100 users, maybe we should just iterate all? 
-        # If standard GroupDRO implementation, it updates q for the batch.
-        
-        # We will assume minibatches corresponds to domain_indices
-        if domain_indices is None:
-             # Assume minibatches are all domains in order 0..N-1
-             domain_indices = range(len(minibatches))
-             
-        if len(self.q) < max(domain_indices) + 1:
-             # Resize q if we see a larger domain index (simple dynamic resize)
-             new_q = torch.ones(max(domain_indices) + 1).to(device)
-             new_q[:len(self.q)] = self.q
-             self.q = new_q
-             
-        losses = torch.zeros(len(minibatches)).to(device)
+        all_x = torch.cat([x for x, y in minibatches])
+        all_logits = self.network(all_x)
+        all_logits_idx = 0
+        losses = torch.zeros(len(minibatches), device=all_x.device)
 
         for i, (x, y) in enumerate(minibatches):
-            logits = self.network(x)
+            logits = all_logits[all_logits_idx:all_logits_idx + x.shape[0]]
+            all_logits_idx += x.shape[0]
             losses[i] = F.cross_entropy(logits, y)
-            # Update q for this specific domain
-            global_idx = domain_indices[i]
-            self.q[global_idx] *= torch.exp(self.group_step_size * losses[i].data)
 
-        # Normalize q roughly? 
-        # Standard GroupDRO normalizes q such that sum(q) = 1.
-        # If we only updated a subset, re-normalizing the whole q is tricky if we don't touch others.
-        # For now, let's normalize the *active* subset or just normalize globally.
-        self.q /= self.q.sum()
+        mean = losses.mean()
+        penalty = ((losses - mean) ** 2).mean()
+        loss = mean + penalty_weight * penalty
 
-        # Weighted loss
-        # We use the q values for the CURRENT sampled domains to weight the losses
-        # q_subset = self.q[domain_indices]
-        # q_subset /= q_subset.sum() # Local normalization for the batch?
-        # No, simpler: dot product with relevant q's, then maybe scale?
-        # Let's stick to standard implementation: loss = sum(q_i * loss_i) for all i.
-        # But we only computed loss_i for the subset.
-        # We'll use the current q values for the subset.
-        
-        batch_q = self.q[list(domain_indices)]
-        batch_q = batch_q / batch_q.sum() # Normalize over the batch for stability
-        
-        loss = torch.dot(losses, batch_q)
+        if self.update_count == self.hparams.get('vrex_penalty_anneal_iters', 0):
+            self.optimizer = torch.optim.Adam(
+                self.network.parameters(),
+                lr=self.hparams.get('lr', 1e-3),
+                weight_decay=self.hparams.get('weight_decay', 0.0)
+            )
 
         self.optimizer.zero_grad()
         loss.backward()
         self.optimizer.step()
 
+        self.update_count += 1
+        return {'loss': loss.item(), 'nll': mean.item(), 'penalty': penalty.item()}
+
+
+class GroupDRO(ERM):
+    """
+    Group DRO (Sagawa et al., 2020)
+    """
+    def __init__(self, input_dim, num_classes=2, hparams=None):
+        super().__init__(input_dim, num_classes, hparams)
+        self.register_buffer("q", torch.Tensor())
+
+    def update(self, minibatches, unlabeled=None, **kwargs):
+        device = minibatches[0][0].device
+
+        if not len(self.q):
+            self.q = torch.ones(len(minibatches)).to(device)
+
+        losses = torch.zeros(len(minibatches)).to(device)
+
+        for m in range(len(minibatches)):
+            x, y = minibatches[m]
+            losses[m] = F.cross_entropy(self.predict(x), y)
+            self.q[m] *= (self.hparams.get("groupdro_eta", 0.01) * losses[m].data).exp()
+
+        self.q /= self.q.sum()
+        loss = torch.dot(losses, self.q)
+
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
         return {'loss': loss.item()}
+
+
+class MixStyleLayer(nn.Module):
+    """
+    MixStyle layer (Zhou et al., 2021). Adapted to support 2D features.
+    """
+    def __init__(self, p=0.5, alpha=0.1, eps=1e-6, mix="random"):
+        super().__init__()
+        self.p = p
+        self.beta = torch.distributions.Beta(alpha, alpha)
+        self.eps = eps
+        self.alpha = alpha
+        self.mix = mix
+        self._activated = True
+
+    def set_activation_status(self, status=True):
+        self._activated = status
+
+    def update_mix_method(self, mix="random"):
+        self.mix = mix
+
+    def forward(self, x):
+        if not self.training or not self._activated:
+            return x
+        if torch.rand(1).item() > self.p:
+            return x
+
+        B = x.size(0)
+
+        if x.dim() == 2:
+            mu = x.mean(dim=1, keepdim=True)
+            var = x.var(dim=1, keepdim=True, unbiased=False)
+            sig = (var + self.eps).sqrt()
+            mu, sig = mu.detach(), sig.detach()
+            x_normed = (x - mu) / sig
+
+            lmda = self.beta.sample((B, 1)).to(x.device)
+        else:
+            mu = x.mean(dim=[2, 3], keepdim=True)
+            var = x.var(dim=[2, 3], keepdim=True)
+            sig = (var + self.eps).sqrt()
+            mu, sig = mu.detach(), sig.detach()
+            x_normed = (x - mu) / sig
+
+            lmda = self.beta.sample((B, 1, 1, 1)).to(x.device)
+
+        if self.mix == "random":
+            perm = torch.randperm(B)
+        elif self.mix == "crossdomain":
+            perm = torch.arange(B - 1, -1, -1)
+            perm_b, perm_a = perm.chunk(2)
+            perm_b = perm_b[torch.randperm(perm_b.shape[0])]
+            perm_a = perm_a[torch.randperm(perm_a.shape[0])]
+            perm = torch.cat([perm_b, perm_a], 0)
+        else:
+            raise NotImplementedError
+
+        mu2, sig2 = mu[perm], sig[perm]
+        mu_mix = mu * lmda + mu2 * (1 - lmda)
+        sig_mix = sig * lmda + sig2 * (1 - lmda)
+
+        return x_normed * sig_mix + mu_mix
+
 
 class MixStyle(DGModel):
     """
-    MixStyle (Zhou et al., 2021)
-    Mixes feature statistics between domains in the featurizer.
-    Simplified application to MLP features (mixing mean/std of hidden layers).
+    MixStyle (Zhou et al., 2021). Training is ERM with MixStyle active.
     """
     def __init__(self, input_dim, num_classes=2, hparams=None):
-        super(MixStyle, self).__init__(input_dim, num_classes, hparams)
-        # Custom featurizer with MixStyle blocks could be implemented.
-        # For simplicity, we apply MixStyle in forward pass if possible or Modify architecture.
-        # This is strictly a placeholder as standard MixStyle is for CNNs.
-        # For tabular, we can mix statistics of embeddings or hidden layers.
-        self.optimizer = torch.optim.Adam(self.network.parameters(), lr=hparams.get('lr', 1e-3))
-        self.alpha = hparams.get('mixstyle_alpha', 0.1)
+        super().__init__(input_dim, num_classes, hparams)
+        self.mixstyle = MixStyleLayer(
+            p=self.hparams.get('mixstyle_p', 0.5),
+            alpha=self.hparams.get('mixstyle_alpha', 0.1),
+            eps=self.hparams.get('mixstyle_eps', 1e-6),
+            mix=self.hparams.get('mixstyle_mix', 'random')
+        )
+        self.optimizer = torch.optim.Adam(
+            self.network.parameters(),
+            lr=self.hparams.get('lr', 1e-3),
+            weight_decay=self.hparams.get('weight_decay', 0.0)
+        )
 
-    def forward_mix(self, x, p=0.5, alpha=0.1):
-        # Apply plain forward with conditional mixing
-        # ... logic ...
-        return self.network(x)
+    def forward(self, x):
+        feats = self.featurizer(x)
+        feats = self.mixstyle(feats)
+        return self.classifier(feats)
 
-    def update(self, minibatches, unlabeled=None, domain_indices=None):
-        # Just ERM for now unless we re-implement Featurizer to support MixStyle injection
-        # Pass generic minibatches flattening
+    def predict(self, x):
+        return self.forward(x)
+
+    def update(self, minibatches, unlabeled=None, **kwargs):
         all_x = torch.cat([x for x, y in minibatches])
         all_y = torch.cat([y for x, y in minibatches])
         loss = F.cross_entropy(self.predict(all_x), all_y)
-        
+
         self.optimizer.zero_grad()
         loss.backward()
         self.optimizer.step()
         return {'loss': loss.item()}
 
 
-# MLDG (Meta-Learning Domain Generalization)
-class MLDG(DGModel):
+class MLDG(ERM):
     """
     Meta-Learning for Domain Generalization (Li et al., 2018)
-    Simulates domain shift by splitting domains into meta-train/meta-test
     """
     def __init__(self, input_dim, num_classes=2, hparams=None):
-        super(MLDG, self).__init__(input_dim, num_classes, hparams)
-        self.optimizer = torch.optim.Adam(self.network.parameters(), lr=hparams.get('lr', 1e-3))
-        self.beta = hparams.get('mldg_beta', 1.0)
-        self.n_meta_test = hparams.get('mldg_n_meta_test', 1)
-    def update(self, minibatches, unlabeled=None):
-        # Split domains into meta-train and meta-test
-        n_domains = len(minibatches)
-        n_meta_train = n_domains - self.n_meta_test
-        
-        if n_meta_train <= 0:
-            # Not enough domains, fall back to ERM
-            all_x = torch.cat([x for x, y in minibatches])
-            all_y = torch.cat([y for x, y in minibatches])
-            loss = F.cross_entropy(self.predict(all_x), all_y)
-            self.optimizer.zero_grad()
-            loss.backward()
-            self.optimizer.step()
-            return {'loss': loss.item()}
-        
-        # Random split
-        indices = torch.randperm(n_domains).tolist()
-        meta_train_indices = indices[:n_meta_train]
-        meta_test_indices = indices[n_meta_train:]
-        
-        # Meta-train loss
-        meta_train_loss = 0.0
-        for i in meta_train_indices:
-            x, y = minibatches[i]
-            logits = self.predict(x)
-            meta_train_loss += F.cross_entropy(logits, y)
-        meta_train_loss /= n_meta_train
-        
-        # Meta-test loss (computed with updated params via higher or approximated)
-        # Simplified: compute meta-test loss directly
-        meta_test_loss = 0.0
-        for i in meta_test_indices:
-            x, y = minibatches[i]
-            logits = self.predict(x)
-            meta_test_loss += F.cross_entropy(logits, y)
-        meta_test_loss /= len(meta_test_indices)
-        
-        # Combined loss
-        loss = meta_train_loss + self.beta * meta_test_loss
-        
-        self.optimizer.zero_grad()
-        loss.backward()
-        self.optimizer.step()
-        
-        return {
-            'loss': loss.item(),
-            'meta_train_loss': meta_train_loss.item(),
-            'meta_test_loss': meta_test_loss.item()
-        }
+        super().__init__(input_dim, num_classes, hparams)
+        self.num_meta_test = self.hparams.get('n_meta_test', 1)
 
-# MASF (MMD for Domain Generalization)
-class MASF(DGModel):
-    """
-    Maximum Mean Discrepancy for Feature Alignment
-    Minimizes MMD between domain feature distributions
-    """
-    def __init__(self, input_dim, num_classes=2, hparams=None):
-        super(MASF, self).__init__(input_dim, num_classes, hparams)
-        self.optimizer = torch.optim.Adam(self.network.parameters(), lr=hparams.get('lr', 1e-3))
-        self.lambda_mmd = hparams.get('masf_lambda', 0.5)
-        self.kernel_type = hparams.get('masf_kernel', 'rbf')
-    def gaussian_kernel(self, x, y, sigma=1.0):
-        """RBF kernel for MMD computation"""
-        x_size = x.size(0)
-        y_size = y.size(0)
-        dim = x.size(1)
-        
-        x = x.unsqueeze(1)  # (x_size, 1, dim)
-        y = y.unsqueeze(0)  # (1, y_size, dim)
-        
-        tiled_x = x.expand(x_size, y_size, dim)
-        tiled_y = y.expand(x_size, y_size, dim)
-        
-        kernel_input = (tiled_x - tiled_y).pow(2).sum(2)
-        return torch.exp(-kernel_input / (2 * sigma ** 2))
-    def compute_mmd(self, x, y):
-        """Compute MMD between two sets of features"""
-        x_kernel = self.gaussian_kernel(x, x)
-        y_kernel = self.gaussian_kernel(y, y)
-        xy_kernel = self.gaussian_kernel(x, y)
-        
-        mmd = x_kernel.mean() + y_kernel.mean() - 2 * xy_kernel.mean()
-        return mmd
-    def update(self, minibatches, unlabeled=None):
-        # Classification loss (ERM)
-        all_x = []
-        all_y = []
-        domain_features = []
-        
-        for x, y in minibatches:
-            # Get features from featurizer
-            features = self.featurizer(x)
-            domain_features.append(features)
-            all_x.append(x)
-            all_y.append(y)
-        
-        all_x_cat = torch.cat(all_x)
-        all_y_cat = torch.cat(all_y)
-        
-        # Classification loss
-        logits = self.classifier(torch.cat(domain_features))
-        cls_loss = F.cross_entropy(logits, all_y_cat)
-        
-        # MMD loss between all pairs of domains
-        mmd_loss = 0.0
-        n_domains = len(minibatches)
-        n_pairs = 0
-        
-        for i in range(n_domains):
-            for j in range(i + 1, n_domains):
-                mmd_loss += self.compute_mmd(domain_features[i], domain_features[j])
-                n_pairs += 1
-        
-        if n_pairs > 0:
-            mmd_loss /= n_pairs
-        
-        # Total loss
-        loss = cls_loss + self.lambda_mmd * mmd_loss
-        
-        self.optimizer.zero_grad()
-        loss.backward()
-        self.optimizer.step()
-        
-        return {
-            'loss': loss.item(),
-            'cls_loss': cls_loss.item(),
-            'mmd_loss': mmd_loss.item() if n_pairs > 0 else 0.0
-        }
+    def update(self, minibatches, unlabeled=None, **kwargs):
+        num_mb = len(minibatches)
+        objective = 0
 
-# Fish (Gradient Matching)
-class Fish(DGModel):
+        self.optimizer.zero_grad()
+        for p in self.network.parameters():
+            if p.grad is None:
+                p.grad = torch.zeros_like(p)
+
+        for (xi, yi), (xj, yj) in split_meta_train_test(minibatches, self.num_meta_test):
+            inner_net = copy.deepcopy(self.network)
+            inner_opt = torch.optim.Adam(
+                inner_net.parameters(),
+                lr=self.hparams.get("lr", 1e-3),
+                weight_decay=self.hparams.get('weight_decay', 0.0)
+            )
+
+            inner_obj = F.cross_entropy(inner_net(xi), yi)
+
+            inner_opt.zero_grad()
+            inner_obj.backward()
+            inner_opt.step()
+
+            for p_tgt, p_src in zip(self.network.parameters(), inner_net.parameters()):
+                if p_src.grad is not None:
+                    p_tgt.grad.data.add_(p_src.grad.data / num_mb)
+
+            objective += inner_obj.item()
+
+            loss_inner_j = F.cross_entropy(inner_net(xj), yj)
+            grad_inner_j = autograd.grad(loss_inner_j, inner_net.parameters(), allow_unused=True)
+
+            objective += (self.hparams.get('mldg_beta', 1.0) * loss_inner_j).item()
+
+            for p, g_j in zip(self.network.parameters(), grad_inner_j):
+                if g_j is not None:
+                    p.grad.data.add_(self.hparams.get('mldg_beta', 1.0) * g_j.data / num_mb)
+
+        objective /= len(minibatches)
+
+        self.optimizer.step()
+        return {'loss': objective}
+
+
+class ParamDict(OrderedDict):
+    """ParamDict from DomainBed."""
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+    def _prototype(self, other, op):
+        if isinstance(other, Number):
+            return ParamDict({k: op(v, other) for k, v in self.items()})
+        if isinstance(other, dict):
+            return ParamDict({k: op(self[k], other[k]) for k in self})
+        raise NotImplementedError
+
+    def __add__(self, other):
+        return self._prototype(other, operator.add)
+
+    def __rmul__(self, other):
+        return self._prototype(other, operator.mul)
+
+    __mul__ = __rmul__
+
+    def __neg__(self):
+        return ParamDict({k: -v for k, v in self.items()})
+
+    def __rsub__(self, other):
+        return self.__add__(other.__neg__())
+
+    __sub__ = __rsub__
+
+    def __truediv__(self, other):
+        return self._prototype(other, operator.truediv)
+
+
+class WholeFish(nn.Module):
+    def __init__(self, input_dim, num_classes, hparams, weights=None):
+        super().__init__()
+        featurizer = _build_featurizer(input_dim, hparams)
+        classifier = _build_classifier(featurizer.output_dim, num_classes, hparams)
+        self.net = FeatureClassifier(featurizer, classifier)
+        if weights is not None:
+            self.load_state_dict(copy.deepcopy(weights))
+
+    def reset_weights(self, weights):
+        self.load_state_dict(copy.deepcopy(weights))
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class Fish(nn.Module):
     """
     Fish: Gradient Matching for Domain Generalization (Shi et al., 2021)
     """
     def __init__(self, input_dim, num_classes=2, hparams=None):
-        super(Fish, self).__init__(input_dim, num_classes, hparams)
-        self.optimizer = torch.optim.Adam(self.network.parameters(), lr=hparams.get('lr', 1e-3))
-        self.meta_lr = hparams.get('fish_meta_lr', 0.5) 
+        super().__init__()
+        self.hparams = hparams if hparams else {}
+        self.input_dim = input_dim
+        self.num_classes = num_classes
 
-    def update(self, minibatches, unlabeled=None):
-        all_x = torch.cat([x for x, y in minibatches])
-        all_y = torch.cat([y for x, y in minibatches])
-        
-        # Inner loop: Simulate updates on each domain
-        param_grads = [torch.zeros_like(p) for p in self.network.parameters()]
-        
+        self.network = WholeFish(input_dim, num_classes, self.hparams)
+        self.optimizer = torch.optim.Adam(
+            self.network.parameters(),
+            lr=self.hparams.get("lr", 1e-3),
+            weight_decay=self.hparams.get('weight_decay', 0.0)
+        )
+        self.optimizer_inner_state = None
+
+    def create_clone(self, device):
+        self.network_inner = WholeFish(
+            self.input_dim,
+            self.num_classes,
+            self.hparams,
+            weights=self.network.state_dict()
+        ).to(device)
+        self.optimizer_inner = torch.optim.Adam(
+            self.network_inner.parameters(),
+            lr=self.hparams.get("lr", 1e-3),
+            weight_decay=self.hparams.get('weight_decay', 0.0)
+        )
+        if self.optimizer_inner_state is not None:
+            self.optimizer_inner.load_state_dict(self.optimizer_inner_state)
+
+    def fish(self, meta_weights, inner_weights, lr_meta):
+        meta_weights = ParamDict(meta_weights)
+        inner_weights = ParamDict(inner_weights)
+        meta_weights += lr_meta * (inner_weights - meta_weights)
+        return meta_weights
+
+    def update(self, minibatches, unlabeled=None, **kwargs):
+        self.create_clone(minibatches[0][0].device)
+
+        loss = None
         for x, y in minibatches:
-            logits = self.network(x)
-            loss = F.cross_entropy(logits, y)
-            grads = autograd.grad(loss, self.network.parameters())
-            
-            for i, g in enumerate(grads):
-                param_grads[i] += g
-                
-        # Update with sum of gradients (standard ERM so far)
-        # Fish actually does: params_new = params - lr * grad
-        # Then maximize dot product of gradients from different domains?
-        # Simplified Fish implementation:
-        # 1. Compute gradients for each domain
-        # 2. Update weights to minimize variance of gradients? 
-        # Actually Fish implementation in DomainBed is complex.
-        # "Invariant Gradient Variances for Out-of-Distribution Generalization"
-        # We will implement the "Mean Gradient" matching + ERM as a proxy or use exact alg.
-        # Exact Fish:
-        # meta_step:
-        #   theta_old = theta
-        #   for domain in domains:
-        #       theta = theta - lr * grad(domain)
-        #   theta = theta_old + meta_lr * (theta - theta_old)
-        
-        theta_old = [p.clone() for p in self.network.parameters()]
-        
-        # Inner updates (Inter-domain updates)
-        for x, y in minibatches:
-            logits = self.network(x)
-            loss = F.cross_entropy(logits, y)
-            
-            self.optimizer.zero_grad()
+            loss = F.cross_entropy(self.network_inner(x), y)
+            self.optimizer_inner.zero_grad()
             loss.backward()
-            self.optimizer.step()
-            
-        # Meta Update
-        for i, p in enumerate(self.network.parameters()):
-            p.data = theta_old[i] + self.meta_lr * (p.data - theta_old[i])
-            
-        # Compute final loss for tracking
-        loss = F.cross_entropy(self.predict(all_x), all_y)
-        return {'loss': loss.item()}
+            self.optimizer_inner.step()
 
-# SagNet (Style Agnostic Networks)
-class SagNet(DGModel):
+        self.optimizer_inner_state = self.optimizer_inner.state_dict()
+        meta_weights = self.fish(
+            meta_weights=self.network.state_dict(),
+            inner_weights=self.network_inner.state_dict(),
+            lr_meta=self.hparams.get("meta_lr", self.hparams.get("fish_meta_lr", 0.5))
+        )
+        self.network.reset_weights(meta_weights)
+
+        return {'loss': loss.item() if loss is not None else 0.0}
+
+    def predict(self, x):
+        return self.network(x)
+
+
+class SagNet(nn.Module):
     """
     SagNet: Style Agnostic Networks (Nam et al., 2021)
-    Randomizes style features (mean/std) to enforce content bias.
     """
     def __init__(self, input_dim, num_classes=2, hparams=None):
-        super(SagNet, self).__init__(input_dim, num_classes, hparams)
-        self.optimizer = torch.optim.Adam(self.network.parameters(), lr=hparams.get('lr', 1e-3))
-        self.style_stage = hparams.get('sagnet_style_stage', 0.5) # Prob to randomize
-        
-    def randomize_style(self, x, eps=1e-5):
-        # x: (B, C) or (B, C, H, W) -> For MLP feats: (B, C)
-        # Simple style randomization for vector features:
-        # mean, var = x.mean(dim=1), x.var(dim=1)
-        # We want to mix statistics of different samples in the batch
-        B, C = x.size()
-        if C < 2: return x 
-        
-        mu = x.mean(dim=1, keepdim=True)
-        var = x.var(dim=1, keepdim=True)
-        sig = (var + eps).sqrt()
-        
-        # Normalize
-        x_norm = (x - mu) / sig
-        
-        # Permute stats
-        perm = torch.randperm(B)
-        mu_perm = mu[perm]
-        sig_perm = sig[perm]
-        
-        # Remodulate
-        return x_norm * sig_perm + mu_perm
+        super().__init__()
+        self.hparams = hparams if hparams else {}
+        self.num_classes = num_classes
 
-    def update(self, minibatches, unlabeled=None):
+        self.network_f = _build_featurizer(input_dim, self.hparams)
+        self.network_c = _build_classifier(self.network_f.output_dim, num_classes, self.hparams)
+        self.network_s = _build_classifier(self.network_f.output_dim, num_classes, self.hparams)
+
+        def opt(p):
+            return torch.optim.Adam(
+                p,
+                lr=self.hparams.get("lr", 1e-3),
+                weight_decay=self.hparams.get('weight_decay', 0.0)
+            )
+
+        self.optimizer_f = opt(self.network_f.parameters())
+        self.optimizer_c = opt(self.network_c.parameters())
+        self.optimizer_s = opt(self.network_s.parameters())
+        self.weight_adv = self.hparams.get("sag_w_adv", 1.0)
+
+    def forward_c(self, x):
+        return self.network_c(self.randomize(self.network_f(x), "style"))
+
+    def forward_s(self, x):
+        return self.network_s(self.randomize(self.network_f(x), "content"))
+
+    def randomize(self, x, what="style", eps=1e-5):
+        sizes = x.size()
+        alpha = torch.rand(sizes[0], 1, device=x.device)
+
+        if len(sizes) == 4:
+            x = x.view(sizes[0], sizes[1], -1)
+            alpha = alpha.unsqueeze(-1)
+
+        mean = x.mean(-1, keepdim=True)
+        var = x.var(-1, keepdim=True)
+        x = (x - mean) / (var + eps).sqrt()
+
+        idx_swap = torch.randperm(sizes[0])
+        if what == "style":
+            mean = alpha * mean + (1 - alpha) * mean[idx_swap]
+            var = alpha * var + (1 - alpha) * var[idx_swap]
+        else:
+            x = x[idx_swap].detach()
+
+        x = x * (var + eps).sqrt() + mean
+        return x.view(*sizes)
+
+    def update(self, minibatches, unlabeled=None, **kwargs):
         all_x = torch.cat([x for x, y in minibatches])
         all_y = torch.cat([y for x, y in minibatches])
-        
-        # 1. Content Loss (randomized style)
-        features = self.featurizer(all_x)
-        if torch.rand(1).item() < self.style_stage:
-            features = self.randomize_style(features)
-        logits = self.classifier(features)
-        
-        loss_content = F.cross_entropy(logits, all_y)
-        
-        # 2. Style Loss (randomized content - optional in full SagNet, here simplified)
-        # Full SagNet has a style classifier. We'll stick to content randomization for robustness.
-        
-        self.optimizer.zero_grad()
-        loss_content.backward()
-        self.optimizer.step()
-        
-        return {'loss': loss_content.item()}
 
-# CSD (Common Specific Decomposition)
-class CSD(DGModel):
+        self.optimizer_f.zero_grad()
+        self.optimizer_c.zero_grad()
+        loss_c = F.cross_entropy(self.forward_c(all_x), all_y)
+        loss_c.backward()
+        self.optimizer_f.step()
+        self.optimizer_c.step()
+
+        self.optimizer_s.zero_grad()
+        loss_s = F.cross_entropy(self.forward_s(all_x), all_y)
+        loss_s.backward()
+        self.optimizer_s.step()
+
+        self.optimizer_f.zero_grad()
+        loss_adv = -F.log_softmax(self.forward_s(all_x), dim=1).mean(1).mean()
+        loss_adv = loss_adv * self.weight_adv
+        loss_adv.backward()
+        self.optimizer_f.step()
+
+        return {'loss_c': loss_c.item(), 'loss_s': loss_s.item(), 'loss_adv': loss_adv.item()}
+
+    def predict(self, x):
+        return self.network_c(self.network_f(x))
+
+
+class CSDHead(nn.Module):
+    def __init__(self, feature_dim, num_classes, num_domains, k=2):
+        super().__init__()
+        self.num_classes = num_classes
+        self.num_domains = num_domains
+        self.k = k
+
+        self.sms = nn.Parameter(torch.normal(0, 1e-1, size=[k, feature_dim, num_classes]))
+        self.sm_biases = nn.Parameter(torch.normal(0, 1e-1, size=[k, num_classes]))
+        self.embs = nn.Parameter(torch.normal(mean=0., std=1e-4, size=[num_domains, k - 1]))
+        self.cs_wt = nn.Parameter(torch.normal(mean=.1, std=1e-4, size=[]))
+
+    def forward(self, features, domain_onehot):
+        w_c, b_c = self.sms[0, :, :], self.sm_biases[0, :]
+        logits_common = torch.matmul(features, w_c) + b_c
+
+        c_wts = torch.matmul(domain_onehot, self.embs)
+        batch_size = domain_onehot.shape[0]
+        c_wts = torch.cat((torch.ones((batch_size, 1), device=features.device) * self.cs_wt, c_wts), 1)
+        c_wts = torch.tanh(c_wts)
+
+        w_d = torch.einsum("bk,kdc->bdc", c_wts, self.sms)
+        b_d = torch.einsum("bk,kc->bc", c_wts, self.sm_biases)
+        logits_specialized = torch.einsum("bdc,bd->bc", w_d, features) + b_d
+
+        return logits_specialized, logits_common
+
+
+class CSD(nn.Module):
     """
-    CSD: Common Specific Decomposition (Piratla et al., 2020)
-    Uses a standard backbone but adds a "Specific" component via orthogonality loss.
-    Simplified: Enforces feature orthogonality between different domains?
-    Actually CSD expects architecture inputs. 
-    We will implement a simplified version:
-    - Featurizer F(x)
-    - C-Classifier (Common)
-    - S-Classifier (Specific) - one per domain? 
-    Given we have N domains, K-specific classifiers is expensive if N is large.
-    We will skip CSD if N is dynamic.
-    Alternative: "Conditioned CSD" -> Specific classifier conditioned on domain idx.
+    Common-Specific Decomposition (Piratla et al., 2020)
     """
     def __init__(self, input_dim, num_classes=2, hparams=None):
-        super(CSD, self).__init__(input_dim, num_classes, hparams)
-        self.optimizer = torch.optim.Adam(self.network.parameters(), lr=hparams.get('lr', 1e-3))
-        self.csd_lambda = hparams.get('csd_lambda', 1.0)
-        
-    def update(self, minibatches, unlabeled=None):
-        # Standard ERM for now as placeholder for CSD - strictly simpler backbone
-        # CSD requires modifying the backbone to fork into (Common, Specific) parts
-        # which violates the single-stream "DGModel" inheritance without major surgery.
-        # We will implement a simplified penalty: Cross-covariance minimization?
-        # Let's map CSD to an Orthogonality penalty on features across domains.
-        
-        all_x = []
+        super().__init__()
+        self.hparams = hparams if hparams else {}
+        self.num_classes = num_classes
+        self.num_domains = self.hparams.get('num_domains')
+
+        self.featurizer = _build_featurizer(input_dim, self.hparams)
+        num_domains = self.num_domains if self.num_domains is not None else 1
+        self.csd_head = CSDHead(self.featurizer.output_dim, num_classes, num_domains, k=self.hparams.get('csd_k', 2))
+
+        self.optimizer = torch.optim.Adam(
+            list(self.featurizer.parameters()) + list(self.csd_head.parameters()),
+            lr=self.hparams.get('lr', 1e-3),
+            weight_decay=self.hparams.get('weight_decay', 0.0)
+        )
+
+    def update(self, minibatches, unlabeled=None, domain_indices=None, **kwargs):
+        if domain_indices is None:
+            domain_indices = list(range(len(minibatches)))
+
+        num_domains = self.num_domains if self.num_domains is not None else (max(domain_indices) + 1)
+        if self.csd_head.num_domains != num_domains:
+            self.csd_head = CSDHead(self.featurizer.output_dim, self.num_classes, num_domains, k=self.hparams.get('csd_k', 2)).to(minibatches[0][0].device)
+            self.optimizer = torch.optim.Adam(
+                list(self.featurizer.parameters()) + list(self.csd_head.parameters()),
+                lr=self.hparams.get('lr', 1e-3),
+                weight_decay=self.hparams.get('weight_decay', 0.0)
+            )
+        self.csd_head.num_domains = num_domains
+
         all_features = []
-        for x, y in minibatches:
-            f = self.featurizer(x)
-            all_features.append(f - f.mean(0))
-            all_x.append(x)
-            
-        all_y = torch.cat([y for x, y in minibatches])
-        all_x_cat = torch.cat(all_x)
-        
-        # Classification
-        logits = self.classifier(self.featurizer(all_x_cat))
-        loss_cls = F.cross_entropy(logits, all_y)
-        
-        # CSD-like Orthogonality:
-        # Penalize if feature means/covariances align too much?
-        # CSD minimizes common and specific feature overlap.
-        # Here we just implement ERM for valid-run compliance if CSD is too complex.
-        # Update: We will treat CSD as ERM + optional CMD (Central Moment Discrepancy) for now
-        # to ensure it runs.
-        
-        loss = loss_cls # + self.csd_lambda * orthogonality
-        
+        all_y = []
+        all_domain = []
+
+        for (x, y), d_idx in zip(minibatches, domain_indices):
+            feats = self.featurizer(x)
+            all_features.append(feats)
+            all_y.append(y)
+            all_domain.append(torch.full((x.size(0),), int(d_idx), device=x.device, dtype=torch.long))
+
+        features = torch.cat(all_features)
+        y = torch.cat(all_y)
+        domain_ids = torch.cat(all_domain)
+        domain_onehot = F.one_hot(domain_ids, num_classes=num_domains).float()
+
+        logits_specialized, logits_common = self.csd_head(features, domain_onehot)
+
+        specific_loss = F.cross_entropy(logits_specialized, y)
+        class_loss = F.cross_entropy(logits_common, y)
+
+        sms = self.csd_head.sms
+        k = sms.shape[0]
+        diag = torch.eye(k, device=sms.device).unsqueeze(0).repeat(self.num_classes, 1, 1)
+        cps = torch.stack([torch.matmul(sms[:, :, c], sms[:, :, c].t()) for c in range(self.num_classes)], dim=0)
+        orth_loss = torch.mean((cps - diag) ** 2)
+
+        loss = class_loss + specific_loss + self.hparams.get('csd_lambda', 1.0) * orth_loss
+
         self.optimizer.zero_grad()
         loss.backward()
         self.optimizer.step()
-        return {'loss': loss.item()}
+
+        return {
+            'loss': loss.item(),
+            'class_loss': class_loss.item(),
+            'specific_loss': specific_loss.item(),
+            'orth_loss': orth_loss.item()
+        }
+
+    def predict(self, x):
+        feats = self.featurizer(x)
+        w_c, b_c = self.csd_head.sms[0, :, :], self.csd_head.sm_biases[0, :]
+        return torch.matmul(feats, w_c) + b_c
+
+
+class MASF(nn.Module):
+    """
+    MASF (Dou et al., 2019). PyTorch port of the official TensorFlow logic.
+    """
+    def __init__(self, input_dim, num_classes=2, hparams=None):
+        super().__init__()
+        self.hparams = hparams if hparams else {}
+        self.num_classes = num_classes
+        self.num_domains = self.hparams.get('num_domains')
+
+        self.featurizer = _build_featurizer(input_dim, self.hparams)
+        self.classifier = _build_classifier(self.featurizer.output_dim, num_classes, self.hparams)
+        self.network = FeatureClassifier(self.featurizer, self.classifier)
+
+        metric_dim = self.hparams.get('masf_metric_dim', 128)
+        self.metric_net = nn.Sequential(
+            nn.Linear(self.featurizer.output_dim, metric_dim),
+            nn.ReLU(),
+            nn.Linear(metric_dim, metric_dim)
+        )
+
+        self.optimizer = torch.optim.Adam(
+            self.network.parameters(),
+            lr=self.hparams.get('lr', 1e-3),
+            weight_decay=self.hparams.get('weight_decay', 0.0)
+        )
+        self.metric_optimizer = torch.optim.Adam(
+            self.metric_net.parameters(),
+            lr=self.hparams.get('masf_metric_lr', self.hparams.get('lr', 1e-3)),
+            weight_decay=self.hparams.get('weight_decay', 0.0)
+        )
+
+    def _kd_loss(self, logits1, y1, logits2, y2, bool_indicator, temperature=2.0):
+        kd_loss = 0.0
+        eps = 1e-16
+        for cls in range(self.num_classes):
+            if bool_indicator[cls] < 0.5:
+                continue
+            mask1 = (y1 == cls)
+            mask2 = (y2 == cls)
+            if mask1.sum() == 0 or mask2.sum() == 0:
+                continue
+            act1 = logits1[mask1].mean(0)
+            act2 = logits2[mask2].mean(0)
+            prob1 = F.softmax(act1 / temperature, dim=0).clamp_min(1e-8)
+            prob2 = F.softmax(act2 / temperature, dim=0).clamp_min(1e-8)
+            kl_div = 0.5 * (
+                torch.sum(prob1 * torch.log(prob1 / (prob2 + eps))) +
+                torch.sum(prob2 * torch.log(prob2 / (prob1 + eps)))
+            )
+            kd_loss += kl_div
+        return kd_loss / self.num_classes
+
+    def _triplet_semihard_loss(self, embeddings, labels, margin):
+        if embeddings.size(0) < 2:
+            return torch.tensor(0.0, device=embeddings.device)
+
+        dist = torch.cdist(embeddings, embeddings, p=2)
+        labels = labels.view(-1)
+        loss_vals = []
+        for i in range(embeddings.size(0)):
+            anchor_label = labels[i]
+            pos_mask = labels == anchor_label
+            neg_mask = labels != anchor_label
+
+            pos_mask[i] = False
+            if pos_mask.sum() == 0 or neg_mask.sum() == 0:
+                continue
+
+            pos_dist = dist[i][pos_mask]
+            neg_dist = dist[i][neg_mask]
+            pos_dist_val = pos_dist.min()
+
+            semihard_neg = neg_dist[neg_dist > pos_dist_val]
+            if semihard_neg.numel() > 0:
+                neg_dist_val = semihard_neg.min()
+            else:
+                neg_dist_val = neg_dist.min()
+
+            loss_vals.append(F.relu(pos_dist_val - neg_dist_val + margin))
+
+        if not loss_vals:
+            return torch.tensor(0.0, device=embeddings.device)
+
+        return torch.stack(loss_vals).mean()
+
+    def update(self, minibatches, unlabeled=None, **kwargs):
+        if len(minibatches) < 3:
+            all_x = torch.cat([x for x, y in minibatches])
+            all_y = torch.cat([y for x, y in minibatches])
+            loss = F.cross_entropy(self.network(all_x), all_y)
+            self.optimizer.zero_grad()
+            loss.backward()
+            self.optimizer.step()
+            return {'loss': loss.item()}
+
+        perm = torch.randperm(len(minibatches)).tolist()
+        meta_train_idx = perm[:2]
+        meta_test_idx = perm[2:3]
+
+        xa, ya = minibatches[meta_train_idx[0]]
+        xa1, ya1 = minibatches[meta_train_idx[1]]
+        xb, yb = minibatches[meta_test_idx[0]]
+
+        # Step 1: source loss update
+        source_loss = 0.5 * (
+            F.cross_entropy(self.network(xa), ya) + F.cross_entropy(self.network(xa1), ya1)
+        )
+        self.optimizer.zero_grad()
+        source_loss.backward()
+        self.optimizer.step()
+
+        # Inner update
+        inner_net = copy.deepcopy(self.network)
+        inner_opt = torch.optim.Adam(
+            inner_net.parameters(),
+            lr=self.hparams.get('masf_inner_lr', self.hparams.get('lr', 1e-3)),
+            weight_decay=self.hparams.get('weight_decay', 0.0)
+        )
+        inner_loss = 0.5 * (
+            F.cross_entropy(inner_net(xa), ya) + F.cross_entropy(inner_net(xa1), ya1)
+        )
+        inner_opt.zero_grad()
+        inner_loss.backward()
+        inner_opt.step()
+
+        logits_a = inner_net(xa)
+        logits_a1 = inner_net(xa1)
+        logits_b = inner_net(xb)
+
+        classes_b = torch.unique(yb).tolist()
+        classes_a = torch.unique(ya).tolist()
+        classes_a1 = torch.unique(ya1).tolist()
+        bool_indicator_b_a = torch.zeros(self.num_classes, device=xa.device)
+        bool_indicator_b_a1 = torch.zeros(self.num_classes, device=xa.device)
+        for cls in range(self.num_classes):
+            if (cls in classes_b) and (cls in classes_a):
+                bool_indicator_b_a[cls] = 1.0
+            if (cls in classes_b) and (cls in classes_a1):
+                bool_indicator_b_a1[cls] = 1.0
+
+        kd_temp = self.hparams.get('masf_temperature', 2.0)
+        global_loss = 0.5 * (
+            self._kd_loss(logits_b, yb, logits_a, ya, bool_indicator_b_a, temperature=kd_temp) +
+            self._kd_loss(logits_b, yb, logits_a1, ya1, bool_indicator_b_a1, temperature=kd_temp)
+        )
+
+        part = min(xa.size(0), xa1.size(0), xb.size(0))
+        input_group = torch.cat([xa[:part], xa1[:part], xb[:part]], dim=0)
+        label_group = torch.cat([ya[:part], ya1[:part], yb[:part]], dim=0)
+
+        embeddings = self.metric_net(inner_net.forward_features(input_group))
+        metric_loss = self._triplet_semihard_loss(
+            embeddings,
+            label_group,
+            margin=self.hparams.get('masf_margin', 1.0)
+        )
+
+        meta_loss = global_loss + self.hparams.get('masf_metric_weight', 0.005) * metric_loss
+
+        # Meta update using gradients from inner_net
+        meta_grads = autograd.grad(meta_loss, inner_net.parameters(), allow_unused=True)
+        self.optimizer.zero_grad()
+        for p, g in zip(self.network.parameters(), meta_grads):
+            if g is not None:
+                p.grad = g.detach()
+        self.optimizer.step()
+
+        # Metric network update (recompute to avoid graph reuse)
+        self.metric_optimizer.zero_grad()
+        with torch.no_grad():
+            group_feats = inner_net.forward_features(input_group)
+        metric_embeddings = self.metric_net(group_feats.detach())
+        metric_loss_metric = self._triplet_semihard_loss(
+            metric_embeddings,
+            label_group,
+            margin=self.hparams.get('masf_margin', 1.0)
+        )
+        metric_loss_metric.backward()
+        self.metric_optimizer.step()
+
+        return {
+            'loss': (source_loss + meta_loss).item(),
+            'source_loss': source_loss.item(),
+            'global_loss': global_loss.item(),
+            'metric_loss': metric_loss.item()
+        }
+
+    def predict(self, x):
+        return self.network(x)
+
 
 # --- Training Helper ---
 
-import numpy as np
-from torch.utils.data import TensorDataset, DataLoader
+def split_meta_train_test(minibatches, num_meta_test=1):
+    n_domains = len(minibatches)
+    perm = torch.randperm(n_domains).tolist()
+    pairs = []
+    meta_train = perm[:(n_domains - num_meta_test)]
+    meta_test = perm[-num_meta_test:]
 
-def train_dg_model(model, X_train, y_train, d_train, X_val, y_val, d_val, 
+    for i, j in zip(meta_train, cycle(meta_test)):
+        xi, yi = minibatches[i][0], minibatches[i][1]
+        xj, yj = minibatches[j][0], minibatches[j][1]
+
+        min_n = min(len(xi), len(xj))
+        pairs.append(((xi[:min_n], yi[:min_n]), (xj[:min_n], yj[:min_n])))
+
+    return pairs
+
+
+def random_pairs_of_minibatches(minibatches):
+    perm = torch.randperm(len(minibatches)).tolist()
+    pairs = []
+
+    for i in range(len(minibatches)):
+        j = i + 1 if i < (len(minibatches) - 1) else 0
+
+        xi, yi = minibatches[perm[i]][0], minibatches[perm[i]][1]
+        xj, yj = minibatches[perm[j]][0], minibatches[perm[j]][1]
+
+        min_n = min(len(xi), len(xj))
+
+        pairs.append(((xi[:min_n], yi[:min_n]), (xj[:min_n], yj[:min_n])))
+
+    return pairs
+
+
+def train_dg_model(model, X_train, y_train, d_train, X_val, y_val, d_val,
                    epochs=20, batch_size=32, domains_per_batch=8, patience=20, device='cuda'):
     """
     Training loop for Domain Generalization models.
     """
+    device = torch.device(device if torch.cuda.is_available() else 'cpu')
     model.to(device)
     model.train()
-    
+
     unique_domains = np.unique(d_train)
     num_domains = len(unique_domains)
+
+    if hasattr(model, 'num_domains'):
+        model.num_domains = num_domains
+    if hasattr(model, 'hparams'):
+        model.hparams['num_domains'] = num_domains
+
     print(f"DG Training: {num_domains} domains, sampling {domains_per_batch} per batch.")
-    
-    # Prepare DataLoaders per domain
+
     domain_loaders = []
+    domain_datasets = []
     for domain in unique_domains:
         mask = (d_train == domain)
         X_d = torch.tensor(X_train[mask], dtype=torch.float32)
         y_d = torch.tensor(y_train[mask], dtype=torch.long)
-        
-        # Check if enough samples for at least 1 batch? 
-        # If not, we might reuse samples or drop?
-        # We'll just define loader, if it runs out we restart iterator (done manually below)
         dataset = TensorDataset(X_d, y_d)
-        # Drop last to avoid batch size 1 causing BatchNorm errors
-        loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=True) 
+        domain_datasets.append(dataset)
+        loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=True)
         domain_loaders.append(iter(loader))
-    
-    # Validation Set (Global)
+
     X_val_t = torch.tensor(X_val, dtype=torch.float32).to(device)
     y_val_t = torch.tensor(y_val, dtype=torch.long).to(device)
-    
-    domain_datasets = [TensorDataset(torch.tensor(X_train[d_train==d], dtype=torch.float32), 
-                                     torch.tensor(y_train[d_train==d], dtype=torch.long)) for d in unique_domains]
-    
-    steps_per_epoch = max(10, int(len(X_train) / (batch_size * domains_per_batch))) # approx
-    
-    steps_per_epoch = max(10, int(len(X_train) / (batch_size * domains_per_batch))) # approx
-    
-    from tqdm import tqdm
-    epoch_iterator = tqdm(range(epochs), desc="DG Training")
-    
-    for epoch in epoch_iterator:
-        model.train()
-        epoch_loss = 0.0
-        
-        for step in range(steps_per_epoch):
-            # 1. Sample domains
-            start_domain_idx = np.random.choice(num_domains, domains_per_batch, replace=(num_domains < domains_per_batch))
-            
-            minibatches = []
-            
-            for d_idx in start_domain_idx:
-                # Basic loader handling (simplified for brevity in diff, assume logic holds)
-                # ... check bounds ... 
-                # Re-implementing logic here safely to avoid context issues? 
-                # No, replace_file_content replaces the whole block.
-                # I need to be careful to include the inner loop logic or just the outer loop change.
-                # The prompt says replace valid python code.
-                pass 
-                
-            # Wait, I shouldn't replace the whole inner loop if I can avoid it.
-            # But the loop structure is changing.
-            # Let's perform a strategic replace of the outer loop line and the print statement.
-            pass
-            
-   # Actually, I will rewrite the whole function body from the loop start to end to be safe.
-   # It's about 40 lines.
-   
-    import copy
+
+    steps_per_epoch = max(10, int(len(X_train) / (batch_size * domains_per_batch)))
+
+    import copy as _copy
     best_val_loss = float('inf')
     best_model_state = None
     patience_counter = 0
 
     from tqdm import tqdm
     epoch_iterator = tqdm(range(epochs), desc="DG Training")
-    
+
     for epoch in epoch_iterator:
         model.train()
         epoch_loss = 0.0
-        
-        for step in range(steps_per_epoch):
-            # 1. Sample domains
-            start_domain_idx = np.random.choice(num_domains, domains_per_batch, replace=(num_domains < domains_per_batch))
-            
+
+        for _ in range(steps_per_epoch):
+            start_domain_idx = np.random.choice(
+                num_domains,
+                domains_per_batch,
+                replace=(num_domains < domains_per_batch)
+            )
+
             minibatches = []
-            
             for d_idx in start_domain_idx:
                 loader = domain_loaders[d_idx]
                 try:
                     batch = next(loader)
                 except StopIteration:
-                    # Restart loader
-                    domain_datasets_ref = domain_datasets 
-                    domain_loaders[d_idx] = iter(DataLoader(domain_datasets_ref[d_idx], batch_size=batch_size, shuffle=True))
+                    domain_loaders[d_idx] = iter(
+                        DataLoader(domain_datasets[d_idx], batch_size=batch_size, shuffle=True, drop_last=True)
+                    )
                     batch = next(domain_loaders[d_idx])
-                
+
                 x, y = batch
                 minibatches.append((x.to(device), y.to(device)))
-            
-            # 2. Update Model
-            if isinstance(model, GroupDRO):
-                 metrics = model.update(minibatches, domain_indices=start_domain_idx)
-            else:
-                 metrics = model.update(minibatches)
-                 
-            epoch_loss += metrics['loss']
-            
-        # Validation
+
+            metrics = model.update(minibatches, domain_indices=list(start_domain_idx))
+            epoch_loss += metrics.get('loss', 0.0)
+
         model.eval()
         with torch.no_grad():
-             logits = model.predict(X_val_t)
-             val_loss = F.cross_entropy(logits, y_val_t).item()
-             preds = logits.argmax(dim=1)
-             val_acc = (preds == y_val_t).float().mean().item()
-             
-        epoch_iterator.set_postfix({'Loss': f'{epoch_loss/steps_per_epoch:.4f}', 'Val Loss': f'{val_loss:.4f}', 'Val Acc': f'{val_acc:.4f}'})
-        
-        # Early Stopping
+            logits = model.predict(X_val_t)
+            val_loss = F.cross_entropy(logits, y_val_t).item()
+            preds = logits.argmax(dim=1)
+            val_acc = (preds == y_val_t).float().mean().item()
+
+        epoch_iterator.set_postfix({
+            'Loss': f'{epoch_loss/steps_per_epoch:.4f}',
+            'Val Loss': f'{val_loss:.4f}',
+            'Val Acc': f'{val_acc:.4f}'
+        })
+
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            best_model_state = copy.deepcopy(model.state_dict())
+            best_model_state = _copy.deepcopy(model.state_dict())
             patience_counter = 0
         else:
             patience_counter += 1
@@ -682,5 +1031,5 @@ def train_dg_model(model, X_train, y_train, d_train, X_val, y_val, d_val,
 
     if best_model_state:
         model.load_state_dict(best_model_state)
-        
+
     return model

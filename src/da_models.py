@@ -1,10 +1,26 @@
 import torch
 import torch.nn as nn
 import torch.autograd as autograd
+from torch.autograd import grad
 import numpy as np
 import torch.nn.functional as F
 from sklearn.metrics import roc_auc_score
 from src.backbones import MLPFeaturizer, ResNetFeaturizer, TransformerFeaturizer
+from scipy.spatial.distance import cdist
+from src.da_tllib_losses import (
+    WarmStartGradientReverseLayer,
+    DomainDiscriminator,
+    DomainAdversarialLoss,
+    ConditionalDomainAdversarialLoss,
+    GaussianKernel,
+    MultipleKernelMaximumMeanDiscrepancy,
+    JointMultipleKernelMaximumMeanDiscrepancy,
+    CorrelationAlignmentLoss,
+    MinimumClassConfusionLoss,
+    classifier_discrepancy,
+    mcd_entropy,
+    entropy as tllib_entropy,
+)
 
 class DAModel(nn.Module):
     """
@@ -54,67 +70,20 @@ class GradientReversalLayer(autograd.Function):
         return output, None
 
 class DANN(DAModel):
-    def __init__(self, input_dim, num_classes=2, num_domains=2, hparams=None):
+    """
+    DANN backbone. Domain discriminator and adversarial loss are handled in training.
+    """
+    def __init__(self, input_dim, num_classes=2, num_domains=None, hparams=None):
         super(DANN, self).__init__(input_dim, num_classes, hparams)
-        
-        hidden_dim = 128 # Output of featurizer
-        dropout = self.hparams.get('dropout', 0.3)
-        
-        # Domain Classifier
-        self.domain_classifier = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.BatchNorm1d(hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, num_domains)
-        )
-        
-    def forward(self, x, alpha=1.0):
-        features = self.feature_extractor(x)
-        class_output = self.classifier(features)
-        
-        reverse_features = GradientReversalLayer.apply(features, alpha)
-        domain_output = self.domain_classifier(reverse_features)
-        
-        return class_output, domain_output
+        self.num_domains = num_domains
 
 class CDAN(DAModel):
     """
-    Conditional Domain Adversarial Network (Long et al., 2018)
-    Conditions domain discriminator on feature * softmax(logits).
+    CDAN backbone. Conditional adversarial loss handled in training.
     """
-    def __init__(self, input_dim, num_classes=2, num_domains=2, hparams=None):
+    def __init__(self, input_dim, num_classes=2, num_domains=None, hparams=None):
         super(CDAN, self).__init__(input_dim, num_classes, hparams)
-        
-        hidden_dim = 128 # Output of featurizer
-        dropout = self.hparams.get('dropout', 0.3)
-        
-        # Discriminator input dim = feature_dim * num_classes (Multilinear conditioning)
-        disc_input_dim = hidden_dim * num_classes
-        
-        self.domain_classifier = nn.Sequential(
-            nn.Linear(disc_input_dim, hidden_dim),
-            nn.BatchNorm1d(hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, num_domains)
-        )
-        
-    def forward(self, x, alpha=1.0):
-        features = self.feature_extractor(x)
-        class_output = self.classifier(features)
-        softmax_output = F.softmax(class_output, dim=1)
-        
-        # Multilinear map: Outer product of feature and softmax
-        # (Batch, Feat) x (Batch, Class) -> (Batch, Feat * Class)
-        # Efficient way: element-wise if standard map, but here we do full outer product flattened
-        op_out = torch.bmm(features.unsqueeze(2), softmax_output.unsqueeze(1)) # (B, F, 1) x (B, 1, C) -> (B, F, C)
-        op_out = op_out.view(features.size(0), -1) # Flatten to (B, F*C)
-        
-        reverse_features = GradientReversalLayer.apply(op_out, alpha)
-        domain_output = self.domain_classifier(reverse_features)
-        
-        return class_output, domain_output
+        self.num_domains = num_domains
 
 class MCC(DAModel):
     """
@@ -123,23 +92,7 @@ class MCC(DAModel):
     """
     def __init__(self, input_dim, num_classes=2, hparams=None):
         super(MCC, self).__init__(input_dim, num_classes, hparams)
-        self.temperature = hparams.get('mcc_temp', 2.0)
-
-    def mcc_loss(self, logits):
-        """
-        Computes Minimum Class Confusion loss on target logits
-        """
-        predictions = F.softmax(logits / self.temperature, dim=1)
-        # Class confusion matrix
-        # (Batch, Class) -> (Class, Class) via batch correlation?
-        # MCC defines confusion as: sum_b (pred_b) check paper formulation
-        # MCC = - mean( trace( C ) ) where C is correlation matrix weighted
-        # Actually standard implementation uses:
-        # 1. Entropy minimization (standard)
-        # 2. Class correlation minimization
-        
-        # Approximate:
-        return 0.0 # Placeholder, logic in training loop usually or here
+        self.temperature = self.hparams.get('mcc_temp', 2.0)
     
     def forward(self, x):
         return self.predict(x)
@@ -164,134 +117,552 @@ def coral_loss(source, target):
     return loss
 
 def train_deepcoral(model, X_train, y_train, d_train, X_val, y_val, d_val,
-                    epochs=50, batch_size=64, lr=1e-3, patience=5, 
-                    device='cuda' if torch.cuda.is_available() else 'cpu'):
+                    epochs=50, batch_size=64, lr=1e-3, patience=5,
+                    device='cuda' if torch.cuda.is_available() else 'cpu', X_target=None):
     """
-    Training loop for DeepCORAL.
-    DeepCORAL aligns feature covariances between domains.
-    Loss = Classification Loss + lambda * CORAL Loss between domain pairs
+    DeepCORAL (TLL-style): L = L_cls(source) + lambda * CORAL(f_s, f_t).
+    Requires unlabeled target samples (X_target).
     """
+    if X_target is None:
+        raise ValueError("DeepCORAL requires X_target for UDA. Use --uda to provide target samples.")
+
     model = model.to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    weight_decay = model.hparams.get('weight_decay', 0.0)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
     class_criterion = nn.CrossEntropyLoss()
-    
-    # Separate data by domain for CORAL calculation
-    unique_domains = np.unique(d_train)
-    if len(unique_domains) < 2:
-        # If only one domain, train as standard classifier
-        print("Warning: Only one domain found, training as standard classifier")
-        return train_standard(model, X_train, y_train, X_val, y_val, 
-                            epochs, batch_size, lr, patience, device)
-    
-    # Create domain-specific datasets
-    domain_data = {}
-    for domain in unique_domains:
-        mask = d_train == domain
-        domain_data[domain] = {
-            'X': torch.tensor(X_train[mask], dtype=torch.float32),
-            'y': torch.tensor(y_train[mask], dtype=torch.long)
-        }
-    
-    # Validation dataset
+    coral = CorrelationAlignmentLoss()
+    trade_off = model.hparams.get('coral_lambda', model.hparams.get('mmd_gamma', 1.0))
+
+    # Dataloaders
+    train_dataset = torch.utils.data.TensorDataset(
+        torch.tensor(X_train, dtype=torch.float32),
+        torch.tensor(y_train, dtype=torch.long)
+    )
     val_dataset = torch.utils.data.TensorDataset(
         torch.tensor(X_val, dtype=torch.float32),
         torch.tensor(y_val, dtype=torch.long)
     )
+    target_dataset = torch.utils.data.TensorDataset(
+        torch.tensor(X_target, dtype=torch.float32)
+    )
+
+    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
     val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
-    
+    target_loader = torch.utils.data.DataLoader(target_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
+
+    def infinite_iterator(loader):
+        while True:
+            for batch in loader:
+                yield batch
+
+    target_iter = infinite_iterator(target_loader)
+
     import copy
-    best_val_loss = float('inf')
+    from tqdm import tqdm
+    best_val_score = -float('inf')
     best_model_state = None
     patience_counter = 0
-    
-    from tqdm import tqdm
+
     epoch_iterator = tqdm(range(epochs), desc="DeepCORAL Training")
     for epoch in epoch_iterator:
         model.train()
         train_loss = 0.0
-        num_batches = 0
-        
-        # Create dataloaders for each domain with same batch size
-        domain_loaders = {}
-        for domain in unique_domains:
-            dataset = torch.utils.data.TensorDataset(
-                domain_data[domain]['X'], domain_data[domain]['y']
-            )
-            domain_loaders[domain] = torch.utils.data.DataLoader(
-                dataset, batch_size=batch_size, shuffle=True, drop_last=True
-            )
-        
-        # Iterate through batches (zip to get same number of batches from each domain)
-        min_batches = min(len(loader) for loader in domain_loaders.values())
-        domain_iters = {d: iter(loader) for d, loader in domain_loaders.items()}
-        
-        for _ in range(min_batches):
+
+        for X_s, y_s in train_loader:
+            X_s, y_s = X_s.to(device), y_s.to(device)
+            X_t, = next(target_iter)
+            X_t = X_t.to(device)
+
             optimizer.zero_grad()
-            
-            # Get batches from each domain
-            domain_batches = {}
-            for domain in unique_domains:
-                X_batch, y_batch = next(domain_iters[domain])
-                domain_batches[domain] = (X_batch.to(device), y_batch.to(device))
-            
-            # Classification loss on all domains
-            cls_loss = 0
-            for domain in unique_domains:
-                X_batch, y_batch = domain_batches[domain]
-                logits = model.predict(X_batch)
-                cls_loss += class_criterion(logits, y_batch)
-            cls_loss = cls_loss / len(unique_domains)
-            
-            # CORAL loss: align each domain to the first domain (reference)
-            coral_loss_val = 0
-            ref_domain = unique_domains[0]
-            ref_features = model.feature_extractor(domain_batches[ref_domain][0])
-            
-            for domain in unique_domains[1:]:
-                domain_features = model.feature_extractor(domain_batches[domain][0])
-                coral_loss_val += coral_loss(ref_features, domain_features)
-            
-            if len(unique_domains) > 1:
-                coral_loss_val = coral_loss_val / (len(unique_domains) - 1)
-            
-            # Total loss
-            lambda_coral = 1.0  # Weight for CORAL loss
-            loss = cls_loss + lambda_coral * coral_loss_val
-            
+
+            f_s = model.feature_extractor(X_s)
+            f_t = model.feature_extractor(X_t)
+            logits_s = model.classifier(f_s)
+
+            cls_loss = class_criterion(logits_s, y_s)
+            transfer_loss = coral(f_s, f_t)
+            loss = cls_loss + trade_off * transfer_loss
+
             loss.backward()
             optimizer.step()
-            
+
             train_loss += loss.item()
-            num_batches += 1
-        
-        if num_batches > 0:
-            train_loss /= num_batches
-        
+
+        train_loss /= max(1, len(train_loader))
+
         # Validation
         model.eval()
         val_loss = 0.0
+        val_probs = []
+        val_targets = []
         with torch.no_grad():
             for X_batch, y_batch in val_loader:
                 X_batch, y_batch = X_batch.to(device), y_batch.to(device)
                 logits = model.predict(X_batch)
                 val_loss += class_criterion(logits, y_batch).item()
+                probs = torch.softmax(logits, dim=1)[:, 1]
+                val_probs.extend(probs.cpu().numpy())
+                val_targets.extend(y_batch.cpu().numpy())
+
         val_loss /= len(val_loader)
-        
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
+        try:
+            val_auroc = roc_auc_score(val_targets, val_probs)
+        except:
+            val_auroc = 0.5
+
+        if val_auroc > best_val_score:
+            best_val_score = val_auroc
             best_model_state = copy.deepcopy(model.state_dict())
             patience_counter = 0
         else:
             patience_counter += 1
             if patience_counter >= patience:
-                epoch_iterator.write(f"Early stopping at epoch {epoch}")
+                epoch_iterator.write(f"Early stopping at epoch {epoch} (Best AUROC: {best_val_score:.4f})")
                 break
-        
-        epoch_iterator.set_postfix({'Loss': f'{train_loss:.4f}', 'Val Loss': f'{val_loss:.4f}'})
-    
+
+        epoch_iterator.set_postfix({'Loss': f'{train_loss:.4f}', 'Val Loss': f'{val_loss:.4f}', 'Val AUC': f'{val_auroc:.4f}'})
+
     if best_model_state:
         model.load_state_dict(best_model_state)
-    
+
+    return model
+
+# --- CGDM: Cross-Domain Gradient Discrepancy Minimization (CVPR 2021) ---
+# Ported from /home/iclab/minseo/DomainAdaptation/CGDM with minimal changes.
+
+class CGDMBackbone(nn.Module):
+    """
+    CGDM ResBottle (MLP for tabular features).
+    """
+    def __init__(self, input_dim=4):
+        super(CGDMBackbone, self).__init__()
+        self.fc1 = nn.Linear(input_dim, 512)
+        self.bn1 = nn.BatchNorm1d(512)
+        self.fc2 = nn.Linear(512, 256)
+        self.bn2 = nn.BatchNorm1d(256)
+        self.fc3 = nn.Linear(256, 128)
+        self.bn3 = nn.BatchNorm1d(128)
+        self.dim = 128
+
+    def forward(self, x):
+        out = self.fc1(x)
+        out = F.relu(self.bn1(out))
+        out = self.fc2(out)
+        out = F.relu(self.bn2(out))
+        out = self.fc3(out)
+        out = F.relu(self.bn3(out))
+        return out
+
+    def output_num(self):
+        return self.dim
+
+
+def grad_reverse(x, lambd=1.0):
+    return GradientReversalLayer.apply(x, lambd)
+
+
+class CGDMClassifier(nn.Module):
+    """
+    CGDM ResClassifier (MLP classifier head).
+    """
+    def __init__(self, num_classes=3, num_layer=4, num_unit=128, prob=0.5, middle=64):
+        super(CGDMClassifier, self).__init__()
+        layers = []
+        in_dim = num_unit
+
+        layers.append(nn.Dropout(p=prob))
+        layers.append(nn.Linear(in_dim, middle))
+        layers.append(nn.BatchNorm1d(middle))
+        layers.append(nn.ReLU(inplace=True))
+
+        for _ in range(num_layer - 1):
+            layers.append(nn.Dropout(p=prob))
+            layers.append(nn.Linear(middle, middle))
+            layers.append(nn.BatchNorm1d(middle))
+            layers.append(nn.ReLU(inplace=True))
+
+        layers.append(nn.Linear(middle, num_classes))
+        self.classifier = nn.Sequential(*layers)
+        self.lambd = 1.0
+
+    def set_lambda(self, lambd):
+        self.lambd = lambd
+
+    def forward(self, x, reverse=False):
+        if reverse:
+            x = grad_reverse(x, self.lambd)
+        x = self.classifier(x)
+        return x
+
+
+class CGDM(nn.Module):
+    """
+    CGDM model container: feature extractor + two classifiers.
+    """
+    def __init__(self, input_dim=8, num_classes=6):
+        super(CGDM, self).__init__()
+        self.feature_extractor = CGDMBackbone(input_dim=input_dim)
+        self.classifier1 = CGDMClassifier(num_classes=num_classes, num_layer=2, num_unit=self.feature_extractor.output_num(), middle=1000)
+        self.classifier2 = CGDMClassifier(num_classes=num_classes, num_layer=2, num_unit=self.feature_extractor.output_num(), middle=1000)
+
+    def forward(self, x):
+        feat = self.feature_extractor(x)
+        out1 = self.classifier1(feat)
+        out2 = self.classifier2(feat)
+        return out1, out2
+
+    def predict(self, x):
+        out1, out2 = self.forward(x)
+        return out1 + out2
+
+
+def weights_init(m):
+    classname = m.__class__.__name__
+    if classname.find('Conv') != -1:
+        m.weight.data.normal_(0.0, 0.01)
+        m.bias.data.normal_(0.0, 0.01)
+    elif classname.find('BatchNorm') != -1:
+        m.weight.data.normal_(1.0, 0.01)
+        m.bias.data.fill_(0)
+    elif classname.find('Linear') != -1:
+        m.weight.data.normal_(0.0, 0.01)
+        m.bias.data.normal_(0.0, 0.01)
+
+
+def discrepancy(out1, out2):
+    return torch.mean(torch.abs(F.softmax(out1, dim=1) - F.softmax(out2, dim=1)))
+
+
+def Entropy_div(input_):
+    epsilon = 1e-5
+    input_ = torch.mean(input_, 0) + epsilon
+    entropy = input_ * torch.log(input_)
+    entropy = torch.sum(entropy)
+    return entropy
+
+
+def Entropy_condition(input_):
+    entropy = -input_ * torch.log(input_ + 1e-5)
+    entropy = torch.sum(entropy, dim=1).mean()
+    return entropy
+
+
+def Entropy(input_):
+    return Entropy_condition(input_) + Entropy_div(input_)
+
+
+def Weighted_CrossEntropy(input_, labels):
+    input_s = F.softmax(input_, dim=1)
+    entropy = -input_s * torch.log(input_s + 1e-5)
+    entropy = torch.sum(entropy, dim=1)
+    weight = 1.0 + torch.exp(-entropy)
+    weight = weight / torch.sum(weight).detach().item()
+    return torch.mean(weight * nn.CrossEntropyLoss(reduction='none')(input_, labels))
+
+
+def obtain_label(loader, netE, netC1, netC2, device):
+    start_test = True
+    netE.eval()
+    netC1.eval()
+    netC2.eval()
+    with torch.no_grad():
+        for data in loader:
+            inputs, labels = data[0], data[1]
+            inputs = inputs.to(device)
+            feas = netE(inputs)
+            outputs1 = netC1(feas)
+            outputs2 = netC2(feas)
+            outputs = outputs1 + outputs2
+            if start_test:
+                all_fea = feas.float().cpu()
+                all_output = outputs.float().cpu()
+                all_label = labels.float()
+                start_test = False
+            else:
+                all_fea = torch.cat((all_fea, feas.float().cpu()), 0)
+                all_output = torch.cat((all_output, outputs.float().cpu()), 0)
+                all_label = torch.cat((all_label, labels.float()), 0)
+
+    all_output = nn.Softmax(dim=1)(all_output)
+    _, predict = torch.max(all_output, 1)
+    label_np = all_label.float().cpu().numpy()
+    has_labels = np.unique(label_np).size > 1
+    if has_labels:
+        accuracy = torch.sum(predict.to(device).float() == all_label.to(device)).item() / float(all_label.size()[0])
+
+    all_fea = torch.cat((all_fea, torch.ones(all_fea.size(0), 1)), 1)
+    all_fea = (all_fea.t() / torch.norm(all_fea, p=2, dim=1)).t()
+    all_fea = all_fea.float().cpu().numpy()
+
+    K = all_output.size(1)
+    aff = all_output.float().cpu().numpy()
+    initc = aff.transpose().dot(all_fea)
+    initc = initc / (1e-8 + aff.sum(axis=0)[:, None])
+    dd = cdist(all_fea, initc, 'cosine')
+    pred_label = dd.argmin(axis=1)
+    if has_labels:
+        acc = np.sum(pred_label == label_np) / len(all_fea)
+
+    for _ in range(1):
+        aff = np.eye(K)[pred_label]
+        initc = aff.transpose().dot(all_fea)
+        initc = initc / (1e-8 + aff.sum(axis=0)[:, None])
+        dd = cdist(all_fea, initc, 'cosine')
+        pred_label = dd.argmin(axis=1)
+        if has_labels:
+            acc = np.sum(pred_label == label_np) / len(all_fea)
+
+    if has_labels:
+        log_str = 'Only source accuracy = {:.2f}% -> After the clustering = {:.2f}%'.format(accuracy * 100, acc * 100)
+        print(log_str + '\n')
+    else:
+        print("Target labels unavailable/constant; skipping accuracy report.\n")
+    return pred_label.astype('int')
+
+
+def gradient_discrepancy_loss_margin(p_s1, p_s2, s_y, p_t1, p_t2, t_y, netE, netC1, netC2):
+    loss_w = Weighted_CrossEntropy
+    loss = nn.CrossEntropyLoss()
+
+    src_loss1 = loss(p_s1, s_y)
+    tgt_loss1 = loss_w(p_t1, t_y)
+
+    src_loss2 = loss(p_s2, s_y)
+    tgt_loss2 = loss_w(p_t2, t_y)
+
+    grad_cossim11 = []
+    grad_cossim22 = []
+
+    for _, p in netC1.named_parameters():
+        real_grad = grad([src_loss1], [p], create_graph=True, only_inputs=True, allow_unused=False)[0]
+        fake_grad = grad([tgt_loss1], [p], create_graph=True, only_inputs=True, allow_unused=False)[0]
+
+        if len(p.shape) > 1:
+            _cossim = F.cosine_similarity(fake_grad, real_grad, dim=1).mean()
+        else:
+            _cossim = F.cosine_similarity(fake_grad, real_grad, dim=0)
+        grad_cossim11.append(_cossim)
+
+    grad_cossim1 = torch.stack(grad_cossim11)
+    gm_loss1 = (1.0 - grad_cossim1).mean()
+
+    for _, p in netC2.named_parameters():
+        real_grad = grad([src_loss2], [p], create_graph=True, only_inputs=True)[0]
+        fake_grad = grad([tgt_loss2], [p], create_graph=True, only_inputs=True)[0]
+
+        if len(p.shape) > 1:
+            _cossim = F.cosine_similarity(fake_grad, real_grad, dim=1).mean()
+        else:
+            _cossim = F.cosine_similarity(fake_grad, real_grad, dim=0)
+        grad_cossim22.append(_cossim)
+
+    grad_cossim2 = torch.stack(grad_cossim22)
+    gm_loss2 = (1.0 - grad_cossim2).mean()
+    gm_loss = (gm_loss1 + gm_loss2) / 2.0
+
+    return gm_loss
+
+
+def train_cgdm(model, X_source, y_source, X_target, y_target=None,
+               X_val=None, y_val=None,
+               epochs=20, batch_size=64, lr=1e-4, weight_decay=5e-4, num_k=4, log_interval=100,
+               device='cuda' if torch.cuda.is_available() else 'cpu'):
+    """
+    CGDM Training Loop (ported from DomainAdaptation/CGDM/train.py).
+    """
+    model = model.to(device)
+
+    if y_target is None:
+        y_target = np.zeros(len(X_target), dtype=np.int64)
+
+    X_source_t = torch.tensor(X_source, dtype=torch.float32)
+    y_source_t = torch.tensor(y_source, dtype=torch.long)
+    X_target_t = torch.tensor(X_target, dtype=torch.float32)
+    y_target_t = torch.tensor(y_target, dtype=torch.long)
+
+    class IndexedTensorDataset(torch.utils.data.Dataset):
+        def __init__(self, x_tensor, y_tensor):
+            self.x = x_tensor
+            self.y = y_tensor
+
+        def __len__(self):
+            return len(self.x)
+
+        def __getitem__(self, index):
+            return self.x[index], self.y[index], index
+
+    train_dataset = torch.utils.data.TensorDataset(X_source_t, y_source_t)
+    test_dataset = IndexedTensorDataset(X_target_t, y_target_t)
+
+    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=False, drop_last=False)
+    test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=batch_size, shuffle=True, drop_last=False)
+    test_loader_eval = torch.utils.data.DataLoader(test_dataset, batch_size=batch_size, shuffle=False, drop_last=False)
+
+    val_loader = None
+    if X_val is not None and y_val is not None:
+        X_val_t = torch.tensor(X_val, dtype=torch.float32)
+        y_val_t = torch.tensor(y_val, dtype=torch.long)
+        val_dataset = torch.utils.data.TensorDataset(X_val_t, y_val_t)
+        val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=batch_size, shuffle=False, drop_last=False)
+
+    G = model.feature_extractor
+    F1 = model.classifier1
+    F2 = model.classifier2
+
+    F1.apply(weights_init)
+    F2.apply(weights_init)
+
+    optimizer_g = torch.optim.Adam(G.parameters(), lr=lr, weight_decay=weight_decay)
+    optimizer_f = torch.optim.Adam(list(F1.parameters()) + list(F2.parameters()), lr=lr, weight_decay=weight_decay)
+
+    start = 0
+    criterion = nn.CrossEntropyLoss()
+
+    def _eval_val():
+        if val_loader is None:
+            return None, None
+        model.eval()
+        criterion = nn.CrossEntropyLoss()
+        all_probs = []
+        all_targets = []
+        total_loss = 0.0
+        with torch.no_grad():
+            for xb, yb in val_loader:
+                xb = xb.to(device)
+                yb = yb.to(device)
+                logits = model.predict(xb)
+                total_loss += criterion(logits, yb).item()
+                probs = torch.softmax(logits, dim=1).detach().cpu().numpy()
+                all_probs.append(probs)
+                all_targets.append(yb.detach().cpu().numpy())
+        total_loss /= max(1, len(val_loader))
+        all_probs = np.concatenate(all_probs, axis=0)
+        all_targets = np.concatenate(all_targets, axis=0)
+        try:
+            if all_probs.shape[1] == 2:
+                val_auroc = roc_auc_score(all_targets, all_probs[:, 1])
+            else:
+                val_auroc = roc_auc_score(all_targets, all_probs, multi_class='ovr')
+        except Exception:
+            val_auroc = 0.5
+        return total_loss, val_auroc
+
+    for ep in range(epochs):
+        iter_source = iter(train_loader)
+        from itertools import cycle
+        iter_target = cycle(test_loader)
+        steps = len(train_loader)
+
+        for batch_idx in range(steps - 1):
+            if ep > start and batch_idx % 250 == 0:
+                print("Obtaining target label...")
+                mem_label = obtain_label(test_loader_eval, G, F1, F2, device)
+                mem_label = torch.from_numpy(mem_label).to(device)
+
+            G.train()
+            F1.train()
+            F2.train()
+
+            try:
+                data_s, label_s = next(iter_source)
+            except StopIteration:
+                iter_source = iter(train_loader)
+                data_s, label_s = next(iter_source)
+
+            data_t, label_t, idx_t = next(iter_target)
+
+            if ep > start:
+                pseudo_label_t = mem_label[idx_t].to(device)
+
+            data_s, label_s = data_s.to(device), label_s.to(device)
+            data_t, label_t = data_t.to(device), label_t.to(device)
+            data_all = torch.cat((data_s, data_t), 0)
+            bs = len(label_s)
+
+            optimizer_g.zero_grad()
+            optimizer_f.zero_grad()
+            output = G(data_all)
+            output1 = F1(output)
+            output2 = F2(output)
+            output_s1 = output1[:bs, :]
+            output_s2 = output2[:bs, :]
+            output_t1 = output1[bs:, :]
+            output_t2 = output2[bs:, :]
+            output_t1_s = F.softmax(output_t1, dim=1)
+            output_t2_s = F.softmax(output_t2, dim=1)
+
+            entropy_loss = Entropy(output_t1_s) + Entropy(output_t2_s)
+
+            if ep > start:
+                supervision_loss = Weighted_CrossEntropy(output_t1, pseudo_label_t) + Weighted_CrossEntropy(output_t2, pseudo_label_t)
+            else:
+                supervision_loss = 0
+
+            loss1 = criterion(output_s1, label_s)
+            loss2 = criterion(output_s2, label_s)
+            all_loss = loss1 + loss2 + 0.01 * entropy_loss + 0.01 * supervision_loss
+            all_loss.backward()
+            optimizer_g.step()
+            optimizer_f.step()
+
+            optimizer_g.zero_grad()
+            optimizer_f.zero_grad()
+            output = G(data_all)
+            output1 = F1(output)
+            output2 = F2(output)
+            output_s1 = output1[:bs, :]
+            output_s2 = output2[:bs, :]
+            output_t1 = output1[bs:, :]
+            output_t2 = output2[bs:, :]
+            output_t1_s = F.softmax(output_t1, dim=1)
+            output_t2_s = F.softmax(output_t2, dim=1)
+
+            loss1 = criterion(output_s1, label_s)
+            loss2 = criterion(output_s2, label_s)
+
+            entropy_loss = Entropy(output_t1_s) + Entropy(output_t2_s)
+            loss_dis = discrepancy(output_t1, output_t2)
+
+            all_loss = loss1 + loss2 - 1.0 * loss_dis + 0.01 * entropy_loss
+            all_loss.backward()
+            optimizer_f.step()
+
+            for _ in range(num_k):
+                optimizer_g.zero_grad()
+                optimizer_f.zero_grad()
+
+                output = G(data_all)
+                output1 = F1(output)
+                output2 = F2(output)
+                output_s1 = output1[:bs, :]
+                output_s2 = output2[:bs, :]
+                output_t1 = output1[bs:, :]
+                output_t2 = output2[bs:, :]
+                output_t1_s = F.softmax(output_t1, dim=1)
+                output_t2_s = F.softmax(output_t2, dim=1)
+
+                entropy_loss = Entropy(output_t1_s) + Entropy(output_t2_s)
+                loss_dis = discrepancy(output_t1, output_t2)
+
+                if ep > start:
+                    gmn_loss = gradient_discrepancy_loss_margin(output_s1, output_s2, label_s, output_t1, output_t2, pseudo_label_t, G, F1, F2)
+                else:
+                    gmn_loss = 0
+
+                all_loss = 1.0 * loss_dis + 0.01 * entropy_loss + 0.01 * gmn_loss
+                all_loss.backward()
+                optimizer_g.step()
+
+            if batch_idx % log_interval == 0:
+                print(
+                    'Train Ep: {} [{}/{} ({:.6f}%)]\\tLoss1: {:.6f}\\tLoss2: {:.6f}\\t CDD: {:.6f} Entropy: {:.6f} '.format(
+                        ep, batch_idx, steps, 100. * batch_idx / steps,
+                        loss1.item(), loss2.item(), loss_dis.item(), entropy_loss.item()))
+
+        val_loss, val_auroc = _eval_val()
+        if val_loss is not None:
+            print(f"Epoch {ep} Val Loss: {val_loss:.4f} Val AUC: {val_auroc:.4f}")
+
     return model
 
 class DeepCORAL(DAModel):
@@ -301,255 +672,162 @@ class DeepCORAL(DAModel):
     # Standard forward uses DAModel.predict
 
 
+class DAN(DAModel):
+    """
+    Deep Adaptation Network (DAN).
+    Uses MK-MMD to align source/target feature distributions.
+    """
+    def __init__(self, input_dim, num_classes=2, hparams=None):
+        super(DAN, self).__init__(input_dim, num_classes, hparams)
+
+
 # --- Training Logic ---
 
-def train_adversarial_da(model, X_train, y_train, d_train, X_val, y_val, d_val,
-                           epochs=50, batch_size=64, lr=1e-3, patience=5, device='cuda' if torch.cuda.is_available() else 'cpu', X_target=None):
+def train_standard(model, X_train, y_train, X_val, y_val,
+                   epochs=50, batch_size=64, lr=1e-3, patience=5,
+                   device='cuda' if torch.cuda.is_available() else 'cpu'):
     """
-    Generic adversarial training loop for DANN and CDAN.
-    Supports both:
-    1. DG Mode (Multi-Source Users): X_target=None. Discriminator aligns User Domains (d_train).
-    2. UDA Mode (Source vs Target): X_target provided. Discriminator aligns Source (d=0) vs Target (d=1).
+    Simple supervised training wrapper (used for fallback in DA methods).
     """
-    model = model.to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    class_criterion = nn.CrossEntropyLoss()
-    domain_criterion = nn.CrossEntropyLoss()
-    
-    # Dataset & Loader Setup
-    train_dataset = torch.utils.data.TensorDataset(
-        torch.tensor(X_train, dtype=torch.float32), 
-        torch.tensor(y_train, dtype=torch.long),
-        torch.tensor(d_train, dtype=torch.long)
+    from src.models import train_torch_model
+    return train_torch_model(
+        model,
+        X_train,
+        y_train,
+        X_val,
+        y_val,
+        epochs=epochs,
+        batch_size=batch_size,
+        lr=lr,
+        patience=patience,
+        device=device,
     )
-    val_dataset = torch.utils.data.TensorDataset(
-        torch.tensor(X_val, dtype=torch.float32), 
-        torch.tensor(y_val, dtype=torch.long),
-        torch.tensor(d_val, dtype=torch.long)
-    )
-    
-    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
-    val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
-    
-    target_loader = None
-    if X_target is not None:
-        # UDA Mode: Create Target Loader (Unlabeled)
-        # We dummy y and d for consistency, d=1 for Target
-        y_target_dummy = torch.zeros(len(X_target), dtype=torch.long)
-        d_target = torch.ones(len(X_target), dtype=torch.long) # Domain 1 = Target
-        
-        target_dataset = torch.utils.data.TensorDataset(
-            torch.tensor(X_target, dtype=torch.float32),
-            y_target_dummy,
-            d_target
-        )
-        target_loader = torch.utils.data.DataLoader(target_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
-        # Infinite iterator for target
-        def infinite_iterator(loader):
-            while True:
-                for batch in loader:
-                    yield batch
-        target_iter = infinite_iterator(target_loader)
 
-    best_val_score = -float('inf')
-    best_model_state = None
-    patience_counter = 0
-    import copy
-    from tqdm import tqdm
+def _infinite_iterator(loader):
+    while True:
+        for batch in loader:
+            yield batch
 
-    epoch_iterator = tqdm(range(epochs), desc="Adversarial DA Training" if X_target is None else "UDA Training")
 
-    for epoch in epoch_iterator:
-        model.train()
-        train_loss = 0.0
-        
-        p = epoch / epochs
-        alpha = 2.0 / (1.0 + np.exp(-10 * p)) - 1.0
-        
-        for batch_s in train_loader:
-            X_s, y_s, d_s = batch_s
-            X_s, y_s, d_s = X_s.to(device), y_s.to(device), d_s.to(device)
-            
-            X_t, d_t = None, None
-            if target_loader:
-                # Sample Target Batch
-                try:
-                    X_t, _, d_t = next(target_iter)
-                except StopIteration:
-                    target_iter = infinite_iterator(target_loader)
-                    X_t, _, d_t = next(target_iter)
-                
-                X_t, d_t = X_t.to(device), d_t.to(device)
-            
-            optimizer.zero_grad()
-            
-            # Forward pass
-            if target_loader:
-                # Combined Batch: Source + Target
-                # This ensures Discriminator sees both domains in one step for stability
-                # Or we can do separate passes. Let's do separate passes to keep logic clean?
-                # DANN forward handles single batch.
-                # Standard UDA DANN implementation:
-                # 1. Feature Extractor on Source -> Class Pred + Domain Pred (0)
-                # 2. Feature Extractor on Target -> Domain Pred (1)
-                
-                # --- Source Pass ---
-                class_out_s, domain_out_s = model(X_s, alpha=alpha)
-                err_s_label = class_criterion(class_out_s, y_s)
-                err_s_domain = domain_criterion(domain_out_s, d_s) # d_s should be 0s
-                
-                # --- Target Pass ---
-                _, domain_out_t = model(X_t, alpha=alpha)
-                err_t_domain = domain_criterion(domain_out_t, d_t) # d_t should be 1s
-                
-                loss = err_s_label + err_s_domain + err_t_domain
-                
-            else:
-                # DG Mode: Single Batch (Mixed Users)
-                class_out, domain_out = model(X_s, alpha=alpha)
-                err_s_label = class_criterion(class_out, y_s)
-                err_s_domain = domain_criterion(domain_out, d_s)
-                loss = err_s_label + err_s_domain
-
-            loss.backward()
-            optimizer.step()
-            
-            train_loss += loss.item()
-            
-        train_loss /= len(train_loader)
-        
-        # Validation (Always Source-Labeled Val)
-        model.eval()
-        val_loss = 0.0
-        val_probs = []
-        val_targets = []
-        
-        with torch.no_grad():
-            for X_batch, y_batch, _ in val_loader:
-                X_batch, y_batch = X_batch.to(device), y_batch.to(device)
-                class_out = model.predict(X_batch)
-                loss = class_criterion(class_out, y_batch)
-                val_loss += loss.item()
-                
-                probs = torch.softmax(class_out, dim=1)[:, 1]
-                val_probs.extend(probs.cpu().numpy())
-                val_targets.extend(y_batch.cpu().numpy())
-        
-        val_loss /= len(val_loader)
-        try:
-            val_auroc = roc_auc_score(val_targets, val_probs)
-        except:
-            val_auroc = 0.5
-        
-        if val_auroc > best_val_score:
-            best_val_score = val_auroc
-            best_model_state = copy.deepcopy(model.state_dict())
-            patience_counter = 0
-        else:
-            patience_counter += 1
-            if patience_counter >= patience:
-                epoch_iterator.write(f"Early stopping at epoch {epoch} (Best AUROC: {best_val_score:.4f})")
-                break
-        
-        epoch_iterator.set_postfix({'Loss': f'{train_loss:.4f}', 'Val Loss': f'{val_loss:.4f}', 'Val AUC': f'{val_auroc:.4f}'})
-                
-    if best_model_state:
-        model.load_state_dict(best_model_state)
-        
-    return model
-
-# Alias implementation for backward compatibility if needed, or simply replace use cases
-def train_dann(*args, **kwargs):
-    return train_adversarial_da(*args, **kwargs)
-
-def train_mcc(model, X_train, y_train, d_train, X_val, y_val, d_val,
-              epochs=50, batch_size=64, lr=1e-3, patience=5, device='cuda' if torch.cuda.is_available() else 'cpu'):
-    """
-    Training loop for MCC (Minimum Class Confusion).
-    MCC minimizes class confusion on target domains.
-    For 'Within-Dataset', we treat different users as domains.
-    MCC usually requires: L_classification(Source) + mu * L_mcc(Target)
-    Here, X_train contains multiple domains.
-    """
-    model = model.to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    class_criterion = nn.CrossEntropyLoss()
-    
-    unique_domains = np.unique(d_train)
-    # MCC usually formulated for Source -> Target UDA.
-    # In DG/Multi-source setting: L_cls(Source) + L_mcc(All Domains?)
-    # or L_cls(Source) + L_mcc(Target)??
-    # If we are doing DG (no specific target during training), MCC helps align domains?
-    # Jin et al. MCC is for UDA. 
-    # Let's apply MCC loss to ALL training samples, treating them effectively as "target" for confusion minimization
-    # in addition to classification loss.
-    
+def _build_loaders(X_train, y_train, X_val, y_val, X_target, batch_size):
     train_dataset = torch.utils.data.TensorDataset(
-        torch.tensor(X_train, dtype=torch.float32), 
+        torch.tensor(X_train, dtype=torch.float32),
         torch.tensor(y_train, dtype=torch.long)
     )
     val_dataset = torch.utils.data.TensorDataset(
-        torch.tensor(X_val, dtype=torch.float32), 
+        torch.tensor(X_val, dtype=torch.float32),
         torch.tensor(y_val, dtype=torch.long)
     )
-    
     train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
     val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
-    
+
+    target_loader = None
+    if X_target is not None:
+        target_dataset = torch.utils.data.TensorDataset(
+            torch.tensor(X_target, dtype=torch.float32)
+        )
+        target_loader = torch.utils.data.DataLoader(target_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
+
+    return train_loader, val_loader, target_loader
+
+
+def _evaluate_val(model, val_loader, device):
+    class_criterion = nn.CrossEntropyLoss()
+    model.eval()
+    val_loss = 0.0
+    val_probs = []
+    val_targets = []
+    with torch.no_grad():
+        for X_batch, y_batch in val_loader:
+            X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+            logits = model.predict(X_batch)
+            val_loss += class_criterion(logits, y_batch).item()
+            probs = torch.softmax(logits, dim=1).cpu().numpy()
+            val_probs.append(probs)
+            val_targets.append(y_batch.cpu().numpy())
+    val_loss /= len(val_loader)
+    val_probs = np.concatenate(val_probs, axis=0)
+    val_targets = np.concatenate(val_targets, axis=0)
+    try:
+        if val_probs.shape[1] == 2:
+            val_auroc = roc_auc_score(val_targets, val_probs[:, 1])
+        else:
+            val_auroc = roc_auc_score(val_targets, val_probs, multi_class='ovr', average='macro')
+    except:
+        val_auroc = 0.5
+    return val_loss, val_auroc
+
+
+def train_dann(model, X_train, y_train, d_train, X_val, y_val, d_val,
+               epochs=50, batch_size=64, lr=1e-3, patience=5,
+               device='cuda' if torch.cuda.is_available() else 'cpu', X_target=None):
+    """
+    DANN (TLL-style): L = L_cls(source) + lambda * DomainAdversarialLoss(f_s, f_t).
+    Requires unlabeled target samples (X_target).
+    """
+    if X_target is None:
+        raise ValueError("DANN requires X_target for UDA. Use --uda to provide target samples.")
+
+    model = model.to(device)
+    weight_decay = model.hparams.get('weight_decay', 0.0)
+    disc_hidden = model.hparams.get('disc_hidden', 1024)
+    disc_lr = model.hparams.get('discriminator_lr', lr)
+    trade_off = model.hparams.get('trade_off', 1.0)
+
+    train_loader, val_loader, target_loader = _build_loaders(X_train, y_train, X_val, y_val, X_target, batch_size)
+    target_iter = _infinite_iterator(target_loader)
+
+    feature_dim = model.feature_extractor.output_dim
+    domain_discriminator = DomainDiscriminator(feature_dim, disc_hidden, batch_norm=True, sigmoid=True).to(device)
+    grl = WarmStartGradientReverseLayer(alpha=1.0, lo=0.0, hi=1.0, max_iters=epochs * len(train_loader), auto_step=True)
+    domain_adv = DomainAdversarialLoss(domain_discriminator, grl=grl, sigmoid=True)
+
+    optimizer = torch.optim.Adam(
+        [
+            {"params": model.feature_extractor.parameters()},
+            {"params": model.classifier.parameters()},
+            {"params": domain_discriminator.parameters(), "lr": disc_lr},
+        ],
+        lr=lr,
+        weight_decay=weight_decay,
+    )
+    class_criterion = nn.CrossEntropyLoss()
+
     import copy
+    from tqdm import tqdm
     best_val_score = -float('inf')
     best_model_state = None
     patience_counter = 0
-    
-    from tqdm import tqdm
-    epoch_iterator = tqdm(range(epochs), desc="MCC Training")
-    
+
+    epoch_iterator = tqdm(range(epochs), desc="DANN Training")
     for epoch in epoch_iterator:
         model.train()
+        domain_discriminator.train()
         train_loss = 0.0
-        
-        for X_batch, y_batch in train_loader:
-            X_batch, y_batch = X_batch.to(device), y_batch.to(device)
-            
+
+        for X_s, y_s in train_loader:
+            X_s, y_s = X_s.to(device), y_s.to(device)
+            X_t, = next(target_iter)
+            X_t = X_t.to(device)
+
             optimizer.zero_grad()
-            
-            logits = model.predict(X_batch)
-            cls_loss = class_criterion(logits, y_batch)
-            
-            # MCC Loss
-            probs = F.softmax(logits / model.temperature, dim=1) # (B, C)
-            cov = torch.mm(probs.t(), probs) / X_batch.size(0)
-            mcc_loss = (torch.sum(cov) - torch.trace(cov)) 
-            
-            loss = cls_loss + 1.0 * mcc_loss # weight 1.0
-            
+
+            f_s = model.feature_extractor(X_s)
+            f_t = model.feature_extractor(X_t)
+            logits_s = model.classifier(f_s)
+
+            cls_loss = class_criterion(logits_s, y_s)
+            transfer_loss = domain_adv(f_s, f_t)
+            loss = cls_loss + trade_off * transfer_loss
+
             loss.backward()
             optimizer.step()
+
             train_loss += loss.item()
-            
-        train_loss /= len(train_loader)
-        
-        # Validation
-        model.eval()
-        val_loss = 0.0
-        val_probs = []
-        val_targets = []
-        with torch.no_grad():
-            for X_batch, y_batch in val_loader:
-                X_batch, y_batch = X_batch.to(device), y_batch.to(device)
-                logits = model.predict(X_batch)
-                val_loss += class_criterion(logits, y_batch).item()
-                
-                probs = torch.softmax(logits, dim=1)[:, 1]
-                val_probs.extend(probs.cpu().numpy())
-                val_targets.extend(y_batch.cpu().numpy())
-                
-        val_loss /= len(val_loader)
-        try:
-            val_auroc = roc_auc_score(val_targets, val_probs)
-        except:
-            val_auroc = 0.5
-        
+
+        train_loss /= max(1, len(train_loader))
+        val_loss, val_auroc = _evaluate_val(model, val_loader, device)
+
         if val_auroc > best_val_score:
             best_val_score = val_auroc
             best_model_state = copy.deepcopy(model.state_dict())
@@ -559,7 +837,269 @@ def train_mcc(model, X_train, y_train, d_train, X_val, y_val, d_val,
             if patience_counter >= patience:
                 epoch_iterator.write(f"Early stopping at epoch {epoch} (Best AUROC: {best_val_score:.4f})")
                 break
-        
+
+        epoch_iterator.set_postfix({'Loss': f'{train_loss:.4f}', 'Val Loss': f'{val_loss:.4f}', 'Val AUC': f'{val_auroc:.4f}'})
+
+    if best_model_state:
+        model.load_state_dict(best_model_state)
+
+    return model
+
+
+def train_cdan(model, X_train, y_train, d_train, X_val, y_val, d_val,
+               epochs=50, batch_size=64, lr=1e-3, patience=5,
+               device='cuda' if torch.cuda.is_available() else 'cpu', X_target=None):
+    """
+    CDAN (TLL-style): L = L_cls(source) + lambda * ConditionalDomainAdversarialLoss(g_s, f_s, g_t, f_t).
+    Requires unlabeled target samples (X_target).
+    """
+    if X_target is None:
+        raise ValueError("CDAN requires X_target for UDA. Use --uda to provide target samples.")
+
+    model = model.to(device)
+    weight_decay = model.hparams.get('weight_decay', 0.0)
+    disc_hidden = model.hparams.get('disc_hidden', 1024)
+    disc_lr = model.hparams.get('discriminator_lr', lr)
+    trade_off = model.hparams.get('trade_off', 1.0)
+    randomized = model.hparams.get('cdan_randomized', False)
+    entropy_conditioning = model.hparams.get('cdan_entropy', True)
+    randomized_dim = model.hparams.get('cdan_randomized_dim', 1024)
+
+    train_loader, val_loader, target_loader = _build_loaders(X_train, y_train, X_val, y_val, X_target, batch_size)
+    target_iter = _infinite_iterator(target_loader)
+
+    feature_dim = model.feature_extractor.output_dim
+    num_classes = model.classifier[-1].out_features
+    disc_in_dim = randomized_dim if randomized else feature_dim * num_classes
+    domain_discriminator = DomainDiscriminator(disc_in_dim, disc_hidden, batch_norm=True, sigmoid=True).to(device)
+    cdan_loss = ConditionalDomainAdversarialLoss(
+        domain_discriminator,
+        entropy_conditioning=entropy_conditioning,
+        randomized=randomized,
+        num_classes=num_classes,
+        features_dim=feature_dim,
+        randomized_dim=randomized_dim,
+        sigmoid=True,
+    )
+    cdan_loss.grl.max_iters = epochs * len(train_loader)
+
+    optimizer = torch.optim.Adam(
+        [
+            {"params": model.feature_extractor.parameters()},
+            {"params": model.classifier.parameters()},
+            {"params": domain_discriminator.parameters(), "lr": disc_lr},
+        ],
+        lr=lr,
+        weight_decay=weight_decay,
+    )
+    class_criterion = nn.CrossEntropyLoss()
+
+    import copy
+    from tqdm import tqdm
+    best_val_score = -float('inf')
+    best_model_state = None
+    patience_counter = 0
+
+    epoch_iterator = tqdm(range(epochs), desc="CDAN Training")
+    for epoch in epoch_iterator:
+        model.train()
+        domain_discriminator.train()
+        train_loss = 0.0
+
+        for X_s, y_s in train_loader:
+            X_s, y_s = X_s.to(device), y_s.to(device)
+            X_t, = next(target_iter)
+            X_t = X_t.to(device)
+
+            optimizer.zero_grad()
+
+            f_s = model.feature_extractor(X_s)
+            f_t = model.feature_extractor(X_t)
+            g_s = model.classifier(f_s)
+            g_t = model.classifier(f_t)
+
+            cls_loss = class_criterion(g_s, y_s)
+            transfer_loss = cdan_loss(g_s, f_s, g_t, f_t)
+            loss = cls_loss + trade_off * transfer_loss
+
+            loss.backward()
+            optimizer.step()
+            train_loss += loss.item()
+
+        train_loss /= max(1, len(train_loader))
+        val_loss, val_auroc = _evaluate_val(model, val_loader, device)
+
+        if val_auroc > best_val_score:
+            best_val_score = val_auroc
+            best_model_state = copy.deepcopy(model.state_dict())
+            patience_counter = 0
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                epoch_iterator.write(f"Early stopping at epoch {epoch} (Best AUROC: {best_val_score:.4f})")
+                break
+
+        epoch_iterator.set_postfix({'Loss': f'{train_loss:.4f}', 'Val Loss': f'{val_loss:.4f}', 'Val AUC': f'{val_auroc:.4f}'})
+
+    if best_model_state:
+        model.load_state_dict(best_model_state)
+
+    return model
+
+
+def train_adversarial_da(model, X_train, y_train, d_train, X_val, y_val, d_val,
+                         epochs=50, batch_size=64, lr=1e-3, patience=5,
+                         device='cuda' if torch.cuda.is_available() else 'cpu', X_target=None):
+    """
+    Backward-compatible wrapper: dispatch to DANN/CDAN depending on model type.
+    """
+    if isinstance(model, CDAN):
+        return train_cdan(model, X_train, y_train, d_train, X_val, y_val, d_val,
+                          epochs=epochs, batch_size=batch_size, lr=lr, patience=patience, device=device, X_target=X_target)
+    if isinstance(model, DANN):
+        return train_dann(model, X_train, y_train, d_train, X_val, y_val, d_val,
+                          epochs=epochs, batch_size=batch_size, lr=lr, patience=patience, device=device, X_target=X_target)
+    raise ValueError("train_adversarial_da supports DANN or CDAN models only.")
+
+
+def train_mcc(model, X_train, y_train, d_train, X_val, y_val, d_val,
+              epochs=50, batch_size=64, lr=1e-3, patience=5,
+              device='cuda' if torch.cuda.is_available() else 'cpu', X_target=None):
+    """
+    MCC (TLL-style): L = L_cls(source) + mu * MCC(target_logits).
+    Requires unlabeled target samples (X_target).
+    """
+    if X_target is None:
+        raise ValueError("MCC requires X_target for UDA. Use --uda to provide target samples.")
+
+    model = model.to(device)
+    weight_decay = model.hparams.get('weight_decay', 0.0)
+    trade_off = model.hparams.get('mcc_trade_off', 1.0)
+    mcc_loss_fn = MinimumClassConfusionLoss(model.temperature)
+
+    train_loader, val_loader, target_loader = _build_loaders(X_train, y_train, X_val, y_val, X_target, batch_size)
+    target_iter = _infinite_iterator(target_loader)
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+    class_criterion = nn.CrossEntropyLoss()
+
+    import copy
+    from tqdm import tqdm
+    best_val_score = -float('inf')
+    best_model_state = None
+    patience_counter = 0
+
+    epoch_iterator = tqdm(range(epochs), desc="MCC Training")
+    for epoch in epoch_iterator:
+        model.train()
+        train_loss = 0.0
+
+        for X_s, y_s in train_loader:
+            X_s, y_s = X_s.to(device), y_s.to(device)
+            X_t, = next(target_iter)
+            X_t = X_t.to(device)
+
+            optimizer.zero_grad()
+
+            logits_s = model.predict(X_s)
+            logits_t = model.predict(X_t)
+
+            cls_loss = class_criterion(logits_s, y_s)
+            transfer_loss = mcc_loss_fn(logits_t)
+            loss = cls_loss + trade_off * transfer_loss
+
+            loss.backward()
+            optimizer.step()
+            train_loss += loss.item()
+
+        train_loss /= max(1, len(train_loader))
+        val_loss, val_auroc = _evaluate_val(model, val_loader, device)
+
+        if val_auroc > best_val_score:
+            best_val_score = val_auroc
+            best_model_state = copy.deepcopy(model.state_dict())
+            patience_counter = 0
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                epoch_iterator.write(f"Early stopping at epoch {epoch} (Best AUROC: {best_val_score:.4f})")
+                break
+
+        epoch_iterator.set_postfix({'Loss': f'{train_loss:.4f}', 'Val Loss': f'{val_loss:.4f}', 'Val AUC': f'{val_auroc:.4f}'})
+
+    if best_model_state:
+        model.load_state_dict(best_model_state)
+    return model
+
+
+def train_dan(model, X_train, y_train, d_train, X_val, y_val, d_val,
+              epochs=50, batch_size=64, lr=1e-3, patience=5,
+              device='cuda' if torch.cuda.is_available() else 'cpu', X_target=None):
+    """
+    DAN (TLL-style): L = L_cls(source) + lambda * MK-MMD(f_s, f_t).
+    Requires unlabeled target samples (X_target).
+    """
+    if X_target is None:
+        raise ValueError("DAN requires X_target for UDA. Use --uda to provide target samples.")
+
+    model = model.to(device)
+    weight_decay = model.hparams.get('weight_decay', 0.0)
+    trade_off = model.hparams.get('dan_trade_off', 1.0)
+    kernel_num = model.hparams.get('dan_kernel_num', 5)
+    linear = model.hparams.get('dan_linear', False)
+
+    kernels = [GaussianKernel(alpha=2 ** k) for k in range(kernel_num)]
+    mkmmd = MultipleKernelMaximumMeanDiscrepancy(kernels, linear=linear)
+
+    train_loader, val_loader, target_loader = _build_loaders(X_train, y_train, X_val, y_val, X_target, batch_size)
+    target_iter = _infinite_iterator(target_loader)
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+    class_criterion = nn.CrossEntropyLoss()
+
+    import copy
+    from tqdm import tqdm
+    best_val_score = -float('inf')
+    best_model_state = None
+    patience_counter = 0
+
+    epoch_iterator = tqdm(range(epochs), desc="DAN Training")
+    for epoch in epoch_iterator:
+        model.train()
+        train_loss = 0.0
+
+        for X_s, y_s in train_loader:
+            X_s, y_s = X_s.to(device), y_s.to(device)
+            X_t, = next(target_iter)
+            X_t = X_t.to(device)
+
+            optimizer.zero_grad()
+
+            f_s = model.feature_extractor(X_s)
+            f_t = model.feature_extractor(X_t)
+            logits_s = model.classifier(f_s)
+
+            cls_loss = class_criterion(logits_s, y_s)
+            transfer_loss = mkmmd(f_s, f_t)
+            loss = cls_loss + trade_off * transfer_loss
+
+            loss.backward()
+            optimizer.step()
+            train_loss += loss.item()
+
+        train_loss /= max(1, len(train_loader))
+        val_loss, val_auroc = _evaluate_val(model, val_loader, device)
+
+        if val_auroc > best_val_score:
+            best_val_score = val_auroc
+            best_model_state = copy.deepcopy(model.state_dict())
+            patience_counter = 0
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                epoch_iterator.write(f"Early stopping at epoch {epoch} (Best AUROC: {best_val_score:.4f})")
+                break
+
         epoch_iterator.set_postfix({'Loss': f'{train_loss:.4f}', 'Val Loss': f'{val_loss:.4f}', 'Val AUC': f'{val_auroc:.4f}'})
 
     if best_model_state:
@@ -568,180 +1108,265 @@ def train_mcc(model, X_train, y_train, d_train, X_val, y_val, d_val,
 
 class ADDA(nn.Module):
     """
-    Adversarial Discriminative Domain Adaptation (Tzeng et al., 2017)
-    Uses separate source and target encoders with weight sharing/initialization.
+    Adversarial Discriminative Domain Adaptation (Tzeng et al., 2017).
+    Separate source/target encoders with adversarial discriminator.
     """
     def __init__(self, input_dim, num_classes=2, hparams=None):
         super(ADDA, self).__init__()
         self.hparams = hparams if hparams else {}
-        
-        # Source Model (Encoder + Classifier) - Pretrained on Source
+
+        # Source model (encoder + classifier)
         self.source_model = DAModel(input_dim, num_classes, hparams)
-        
-        # Target Encoder - Initialized from Source Encoder later
-        # We define it here to have the structure
+
+        # Target encoder initialized from source encoder
         import copy
         self.target_encoder = copy.deepcopy(self.source_model.feature_extractor)
-        
-        # Discriminator
-        hidden_dim = 128 # Output of featurizer
-        dropout = self.hparams.get('dropout', 0.3)
-        self.discriminator = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, 1) # Real vs Fake (Sigmoid logic via BCEWithLogits)
-        )
-        
+
+        # Domain discriminator (binary, sigmoid output)
+        feature_dim = self.source_model.feature_extractor.output_dim
+        disc_hidden = self.hparams.get('disc_hidden', 1024)
+        self.discriminator = DomainDiscriminator(feature_dim, disc_hidden, batch_norm=True, sigmoid=True)
+
     def predict(self, x):
-        # Inference uses Target Encoder + Source Classifier
         feat = self.target_encoder(x)
         return self.source_model.classifier(feat)
-        
+
     def forward(self, x):
         return self.predict(x)
 
+
 def train_adda(model, X_train, y_train, d_train, X_val, y_val, d_val,
-               epochs=50, batch_size=64, lr=1e-3, patience=5, device='cuda' if torch.cuda.is_available() else 'cpu'):
+               epochs=50, batch_size=64, lr=1e-3, patience=5,
+               device='cuda' if torch.cuda.is_available() else 'cpu', X_target=None):
     """
-    ADDA Training Loop.
-    Phase 1: Pretrain Source Model (Encoder + Classifier) on Source Data.
-    Phase 2: Adversarial Adaptation (Train Target Encoder vs Discriminator).
-    
-    In this 'Within-Dataset' benchmark (Global Pool), we treat the training set as Source.
-    Without a distinct unlabeled Target set provided during training, standard ADDA reduces to Source Pretraining.
-    We effectively return the Pretrained Source Model wrapped in ADDA architecture.
+    ADDA training:
+      1) Pretrain source encoder+classifier on labeled source.
+      2) Adversarially train target encoder to fool discriminator.
+    Requires unlabeled target samples (X_target).
     """
+    if X_target is None:
+        raise ValueError("ADDA requires X_target for UDA. Use --uda to provide target samples.")
+
     model = model.to(device)
-    
-    # Phase 1: Train Source Model (Standard ERM)
-    # We can reuse the generic adversarial training loop (ignoring domain adv part by alpha=0) 
-    # OR simply use a standard training loop.
-    # Let's use a simple training loop on model.source_model
+    model.discriminator = model.discriminator.to(device)
+
     from src.models import train_torch_model
-    
-    # We need to wrap model.source_model (DAModel) to be compatible?
-    # DAModel is nn.Module, so train_torch_model works if we pass X/y.
-    
-    # print("ADDA Phase 1: Pretraining Source Model...")
-    # train_torch_model expects a model that returns logits. DAModel.forward calls predict() -> logits.
-    # So this works.
-    trained_source = train_torch_model(model.source_model, X_train, y_train, X_val, y_val, 
-                                       epochs=epochs, batch_size=batch_size, lr=lr, patience=patience, device=device)
-    
-    model.source_model = trained_source
-    
-    # Phase 2: Init Target Encoder from Source Encoder
+
+    # Phase 1: source pretraining
+    model.source_model = train_torch_model(
+        model.source_model, X_train, y_train, X_val, y_val,
+        epochs=epochs, batch_size=batch_size, lr=lr, patience=patience, device=device
+    )
+
+    # Init target encoder from source
     model.target_encoder.load_state_dict(model.source_model.feature_extractor.state_dict())
-    
-    # Phase 3: Adversarial Adaptation
-    # Requires distinct Target data. Since we don't have it in this function call signature (X_test is hidden),
-    # and X_train is labeled (Source), we skip Phase 3.
-    # Ideally, one would pass Unlabeled Target Data here.
-    
+
+    # Freeze source encoder and classifier
+    for p in model.source_model.parameters():
+        p.requires_grad = False
+
+    weight_decay = model.hparams.get('weight_decay', 0.0)
+    disc_lr = model.hparams.get('discriminator_lr', lr)
+    opt_d = torch.optim.Adam(model.discriminator.parameters(), lr=disc_lr, weight_decay=weight_decay)
+    opt_t = torch.optim.Adam(model.target_encoder.parameters(), lr=lr, weight_decay=weight_decay)
+    bce = nn.BCELoss()
+
+    # Dataloaders
+    train_dataset = torch.utils.data.TensorDataset(
+        torch.tensor(X_train, dtype=torch.float32),
+        torch.tensor(y_train, dtype=torch.long)
+    )
+    target_dataset = torch.utils.data.TensorDataset(
+        torch.tensor(X_target, dtype=torch.float32)
+    )
+    val_dataset = torch.utils.data.TensorDataset(
+        torch.tensor(X_val, dtype=torch.float32),
+        torch.tensor(y_val, dtype=torch.long)
+    )
+    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
+    target_loader = torch.utils.data.DataLoader(target_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
+    val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+
+    target_iter = _infinite_iterator(target_loader)
+
+    import copy
+    from tqdm import tqdm
+    best_val_score = -float('inf')
+    best_model_state = None
+    patience_counter = 0
+
+    epoch_iterator = tqdm(range(epochs), desc="ADDA Training")
+    for epoch in epoch_iterator:
+        model.target_encoder.train()
+        model.discriminator.train()
+        train_loss = 0.0
+
+        for X_s, _ in train_loader:
+            X_s = X_s.to(device)
+            X_t, = next(target_iter)
+            X_t = X_t.to(device)
+
+            # 1) Train discriminator
+            with torch.no_grad():
+                f_s = model.source_model.feature_extractor(X_s)
+            f_t = model.target_encoder(X_t)
+
+            d_in = torch.cat([f_s, f_t], dim=0)
+            d_out = model.discriminator(d_in)
+            d_labels = torch.cat([
+                torch.ones((f_s.size(0), 1), device=device),
+                torch.zeros((f_t.size(0), 1), device=device)
+            ], dim=0)
+
+            opt_d.zero_grad()
+            loss_d = bce(d_out, d_labels)
+            loss_d.backward()
+            opt_d.step()
+
+            # 2) Train target encoder to fool discriminator
+            f_t = model.target_encoder(X_t)
+            d_out_t = model.discriminator(f_t)
+            fool_labels = torch.ones((f_t.size(0), 1), device=device)
+            opt_t.zero_grad()
+            loss_t = bce(d_out_t, fool_labels)
+            loss_t.backward()
+            opt_t.step()
+
+            train_loss += (loss_d.item() + loss_t.item())
+
+        train_loss /= max(1, len(train_loader))
+        val_loss, val_auroc = _evaluate_val(model, val_loader, device)
+
+        if val_auroc > best_val_score:
+            best_val_score = val_auroc
+            best_model_state = copy.deepcopy(model.state_dict())
+            patience_counter = 0
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                epoch_iterator.write(f"Early stopping at epoch {epoch} (Best AUROC: {best_val_score:.4f})")
+                break
+
+        epoch_iterator.set_postfix({'Loss': f'{train_loss:.4f}', 'Val Loss': f'{val_loss:.4f}', 'Val AUC': f'{val_auroc:.4f}'})
+
+    if best_model_state:
+        model.load_state_dict(best_model_state)
+
     return model
 
 
 
 class MCD(DAModel):
+    """
+    Maximum Classifier Discrepancy (MCD).
+    Two classifiers over a shared feature extractor.
+    """
     def __init__(self, input_dim, num_classes=2, hparams=None):
         super(MCD, self).__init__(input_dim, num_classes, hparams)
-        # 2 Classifiers
-        hidden_dim = 128
-        self.classifier1 = nn.Linear(hidden_dim, num_classes)
-        self.classifier2 = nn.Linear(hidden_dim, num_classes)
-        # Override standard classifier
-        self.classifier = None 
-        
+        feat_dim = self.feature_extractor.output_dim
+        self.classifier1 = nn.Linear(feat_dim, num_classes)
+        self.classifier2 = nn.Linear(feat_dim, num_classes)
+        self.classifier = None  # override
+
     def predict(self, x):
         feat = self.feature_extractor(x)
         o1 = self.classifier1(feat)
         o2 = self.classifier2(feat)
-        return o1 + o2 # Ensemble? or output tuple?
-        
+        return (o1 + o2) / 2.0
+
     def forward(self, x):
-         feat = self.feature_extractor(x)
-         o1 = self.classifier1(feat)
-         o2 = self.classifier2(feat)
-         return o1, o2
+        feat = self.feature_extractor(x)
+        o1 = self.classifier1(feat)
+        o2 = self.classifier2(feat)
+        return o1, o2
+
 
 def train_mcd(model, X_train, y_train, d_train, X_val, y_val, d_val,
-               epochs=50, batch_size=64, lr=1e-3, patience=5, device='cuda' if torch.cuda.is_available() else 'cpu'):
-               
+              epochs=50, batch_size=64, lr=1e-3, patience=5,
+              device='cuda' if torch.cuda.is_available() else 'cpu', X_target=None):
+    """
+    MCD (TLL-style):
+      A) Min CE on source (G, C1, C2)
+      B) Max discrepancy on target (C1, C2) while fitting source
+      C) Min discrepancy on target (G)
+    Requires unlabeled target samples (X_target).
+    """
+    if X_target is None:
+        raise ValueError("MCD requires X_target for UDA. Use --uda to provide target samples.")
+
     model = model.to(device)
+    weight_decay = model.hparams.get('weight_decay', 0.0)
+    trade_off = model.hparams.get('mcd_trade_off', 1.0)
+    k_steps = model.hparams.get('mcd_k', 4)
+
+    optimizer_g = torch.optim.Adam(model.feature_extractor.parameters(), lr=lr, weight_decay=weight_decay)
+    optimizer_c = torch.optim.Adam(
+        list(model.classifier1.parameters()) + list(model.classifier2.parameters()),
+        lr=lr,
+        weight_decay=weight_decay
+    )
+    criterion = nn.CrossEntropyLoss()
+
+    train_loader, val_loader, target_loader = _build_loaders(X_train, y_train, X_val, y_val, X_target, batch_size)
+    target_iter = _infinite_iterator(target_loader)
+
     import copy
     from tqdm import tqdm
-    
-    # Split params
-    optimizer_g = torch.optim.Adam(model.feature_extractor.parameters(), lr=lr)
-    optimizer_c = torch.optim.Adam(list(model.classifier1.parameters()) + list(model.classifier2.parameters()), lr=lr)
-    
-    train_dataset = torch.utils.data.TensorDataset(torch.tensor(X_train, dtype=torch.float32), torch.tensor(y_train, dtype=torch.long))
-    val_dataset = torch.utils.data.TensorDataset(torch.tensor(X_val, dtype=torch.float32), torch.tensor(y_val, dtype=torch.long))
-
-    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
-    val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
-    
     best_val_score = -float('inf')
     best_model_state = None
     patience_counter = 0
-    
-    criterion = nn.CrossEntropyLoss()
-    
+
     epoch_iterator = tqdm(range(epochs), desc="MCD Training")
-    
     for epoch in epoch_iterator:
         model.train()
         train_loss = 0.0
-        
-        for X_batch, y_batch in train_loader:
-            X_batch, y_batch = X_batch.to(device), y_batch.to(device)
-            
+
+        for X_s, y_s in train_loader:
+            X_s, y_s = X_s.to(device), y_s.to(device)
+            X_t, = next(target_iter)
+            X_t = X_t.to(device)
+
+            # Step A: train G, C1, C2 on source
             optimizer_g.zero_grad()
             optimizer_c.zero_grad()
-            
-            o1, o2 = model(X_batch)
-            loss1 = criterion(o1, y_batch)
-            loss2 = criterion(o2, y_batch)
-            loss = loss1 + loss2
-            loss.backward()
+            f_s = model.feature_extractor(X_s)
+            o1_s = model.classifier1(f_s)
+            o2_s = model.classifier2(f_s)
+            loss_s = criterion(o1_s, y_s) + criterion(o2_s, y_s)
+            loss_s.backward()
             optimizer_g.step()
             optimizer_c.step()
-            
-            train_loss += loss.item()
-            
-        train_loss /= len(train_loader)
 
-        # Validation
-        model.eval()
-        val_loss = 0.0
-        val_probs = []
-        val_targets = []
-        with torch.no_grad():
-            for X_batch, y_batch in val_loader:
-                X_batch, y_batch = X_batch.to(device), y_batch.to(device)
-                o1, o2 = model(X_batch)
-                l1 = criterion(o1, y_batch)
-                l2 = criterion(o2, y_batch)
-                val_loss += (l1 + l2).item()
-                
-                # Use ensemble for prediction
-                logits = (o1 + o2) / 2.0
-                probs = torch.softmax(logits, dim=1)[:, 1]
-                val_probs.extend(probs.cpu().numpy())
-                val_targets.extend(y_batch.cpu().numpy())
-        
-        val_loss /= len(val_loader)
-        try:
-            val_auroc = roc_auc_score(val_targets, val_probs)
-        except:
-            val_auroc = 0.5
-        
-        epoch_iterator.set_postfix({'Loss': f'{train_loss:.4f}', 'Val Loss': f'{val_loss:.4f}', 'Val AUC': f'{val_auroc:.4f}'})
-        
+            # Step B: train C1, C2 to maximize discrepancy on target
+            optimizer_c.zero_grad()
+            f_s_det = model.feature_extractor(X_s).detach()
+            f_t_det = model.feature_extractor(X_t).detach()
+            o1_s = model.classifier1(f_s_det)
+            o2_s = model.classifier2(f_s_det)
+            o1_t = model.classifier1(f_t_det)
+            o2_t = model.classifier2(f_t_det)
+            loss_s = criterion(o1_s, y_s) + criterion(o2_s, y_s)
+            dis = classifier_discrepancy(F.softmax(o1_t, dim=1), F.softmax(o2_t, dim=1))
+            loss_c = loss_s - trade_off * dis
+            loss_c.backward()
+            optimizer_c.step()
+
+            # Step C: train G to minimize discrepancy on target
+            for _ in range(k_steps):
+                optimizer_g.zero_grad()
+                f_t = model.feature_extractor(X_t)
+                o1_t = model.classifier1(f_t)
+                o2_t = model.classifier2(f_t)
+                dis = classifier_discrepancy(F.softmax(o1_t, dim=1), F.softmax(o2_t, dim=1))
+                loss_g = trade_off * dis
+                loss_g.backward()
+                optimizer_g.step()
+
+            train_loss += loss_s.item()
+
+        train_loss /= max(1, len(train_loader))
+        val_loss, val_auroc = _evaluate_val(model, val_loader, device)
+
         if val_auroc > best_val_score:
             best_val_score = val_auroc
             best_model_state = copy.deepcopy(model.state_dict())
@@ -751,159 +1376,88 @@ def train_mcd(model, X_train, y_train, d_train, X_val, y_val, d_val,
             if patience_counter >= patience:
                 epoch_iterator.write(f"Early stopping at epoch {epoch} (Best AUROC: {best_val_score:.4f})")
                 break
+
+        epoch_iterator.set_postfix({'Loss': f'{train_loss:.4f}', 'Val Loss': f'{val_loss:.4f}', 'Val AUC': f'{val_auroc:.4f}'})
 
     if best_model_state:
         model.load_state_dict(best_model_state)
     return model
     
-# OK, reverting to DANN but adding the actual ADDA/MCD text as requested. 
-# Implementing standard DANN/CDAN/MCC/DeepCORAL was good.
-# I will add the **ADDA** class but implementation of `train_adda` will assume we split `X_train` into Source/Target or it's a placeholder for future specific DA setups.
-# Given I must update `src/da_models.py`, I will append ADDA and MCD classes.
-
 # --- JAN: Joint Adaptation Network ---
 
 class JAN(DAModel):
     """
     Joint Adaptation Network (Long et al., 2017)
-    Aligns Joint Distribution P(X, Y) using JMMD.
+    Aligns joint distributions via JMMD.
     """
     def __init__(self, input_dim, num_classes=2, hparams=None):
         super(JAN, self).__init__(input_dim, num_classes, hparams)
         self.num_classes = num_classes
-        
+
     def forward(self, x):
         return self.predict(x)
 
-def gaussian_kernel(source, target, kernel_mul=2.0, kernel_num=5, fix_sigma=None):
-    n_samples = int(source.size()[0]) + int(target.size()[0])
-    total = torch.cat([source, target], dim=0)
-    total0 = total.unsqueeze(0).expand(int(total.size(0)), int(total.size(0)), int(total.size(1)))
-    total1 = total.unsqueeze(1).expand(int(total.size(0)), int(total.size(0)), int(total.size(1)))
-    L2_distance = ((total0-total1)**2).sum(2)
-    if fix_sigma:
-        bandwidth = fix_sigma
-    else:
-        bandwidth = torch.sum(L2_distance.data) / (n_samples**2-n_samples)
-    bandwidth /= kernel_mul ** (kernel_num // 2)
-    bandwidth_list = [bandwidth * (kernel_mul**i) for i in range(kernel_num)]
-    kernel_val = [torch.exp(-L2_distance / bandwidth_temp) for bandwidth_temp in bandwidth_list]
-    return sum(kernel_val)
-
-def jmmd_loss(source_list, target_list, kernel_mul=2.0, kernel_num=5, fix_sigma=None):
-    """
-    Joint MMD Loss.
-    source_list: list of tensors [feature, softmax_output] for source
-    target_list: list of tensors [feature, softmax_output] for target
-    """
-    batch_size = int(source_list[0].size()[0])
-    n_samples = len(source_list)
-    joint_kernels = None
-    
-    for i in range(n_samples):
-        source = source_list[i]
-        target = target_list[i]
-        kernel_val = gaussian_kernel(source, target, kernel_mul, kernel_num, fix_sigma)
-        if joint_kernels is None:
-            joint_kernels = kernel_val
-        else:
-            joint_kernels = joint_kernels * kernel_val
-            
-    loss = 0
-    for i in range(batch_size):
-        s1, s2 = i, (i+1)%batch_size
-        t1, t2 = i+batch_size, (i+1)%batch_size + batch_size
-        
-        loss += joint_kernels[s1, s2] + joint_kernels[t1, t2]
-        loss -= joint_kernels[s1, t2] + joint_kernels[s2, t1]
-        
-    return loss / float(batch_size)
 
 def train_jan(model, X_train, y_train, d_train, X_val, y_val, d_val,
-               epochs=50, batch_size=64, lr=1e-3, patience=5, device='cuda' if torch.cuda.is_available() else 'cpu'):
+              epochs=50, batch_size=64, lr=1e-3, patience=5,
+              device='cuda' if torch.cuda.is_available() else 'cpu', X_target=None):
     """
-    JAN Training Loop.
-    Minimizes CE(Source) + lambda * JMMD(Source, Target).
+    JAN (TLL-style): L = L_cls(source) + lambda * JMMD((f_s, p_s), (f_t, p_t)).
+    Requires unlabeled target samples (X_target).
     """
-    model = model.to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    criterion = nn.CrossEntropyLoss()
-    
-    train_dataset = torch.utils.data.TensorDataset(torch.tensor(X_train, dtype=torch.float32), torch.tensor(y_train, dtype=torch.long))
-    val_dataset = torch.utils.data.TensorDataset(torch.tensor(X_val, dtype=torch.float32), torch.tensor(y_val, dtype=torch.long))
+    if X_target is None:
+        raise ValueError("JAN requires X_target for UDA. Use --uda to provide target samples.")
 
-    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
-    val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
-    
+    model = model.to(device)
+    weight_decay = model.hparams.get('weight_decay', 0.0)
+    trade_off = model.hparams.get('jmmd_lambda', 1.0)
+    kernel_num = model.hparams.get('jan_kernel_num', 5)
+    linear = model.hparams.get('jan_linear', True)
+
+    kernels = [GaussianKernel(alpha=2 ** k) for k in range(kernel_num)]
+    jmmd = JointMultipleKernelMaximumMeanDiscrepancy(kernels=(kernels, kernels), linear=linear)
+
+    train_loader, val_loader, target_loader = _build_loaders(X_train, y_train, X_val, y_val, X_target, batch_size)
+    target_iter = _infinite_iterator(target_loader)
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+    class_criterion = nn.CrossEntropyLoss()
+
+    import copy
+    from tqdm import tqdm
     best_val_score = -float('inf')
     best_model_state = None
     patience_counter = 0
 
-    import copy
-    from tqdm import tqdm
     epoch_iterator = tqdm(range(epochs), desc="JAN Training")
-
     for epoch in epoch_iterator:
         model.train()
         train_loss = 0.0
-        
-        for X_batch, y_batch in train_loader:
-            X_batch, y_batch = X_batch.to(device), y_batch.to(device)
-            
-            # Split batch for JMMD simulation
-            half = batch_size // 2
-            if half < 2: continue
-            
-            X_s, X_t = X_batch[:half], X_batch[half:]
-            y_s, y_t = y_batch[:half], y_batch[half:]
-            
+
+        for X_s, y_s in train_loader:
+            X_s, y_s = X_s.to(device), y_s.to(device)
+            X_t, = next(target_iter)
+            X_t = X_t.to(device)
+
             optimizer.zero_grad()
-            
-            feat_s = model.feature_extractor(X_s)
-            out_s = model.classifier(feat_s)
-            
-            feat_t = model.feature_extractor(X_t)
-            out_t = model.classifier(feat_t)
-            
-            cls_loss = criterion(out_s, y_s) + criterion(out_t, y_t)
-            
-            prob_s = F.softmax(out_s, dim=1)
-            prob_t = F.softmax(out_t, dim=1)
-            
-            loss_jmmd = jmmd_loss(
-                [feat_s, prob_s],
-                [feat_t, prob_t]
-            )
-            
-            loss = cls_loss + 1.0 * loss_jmmd
-            
+            f_s = model.feature_extractor(X_s)
+            f_t = model.feature_extractor(X_t)
+            g_s = model.classifier(f_s)
+            g_t = model.classifier(f_t)
+
+            cls_loss = class_criterion(g_s, y_s)
+            p_s = F.softmax(g_s, dim=1)
+            p_t = F.softmax(g_t, dim=1)
+            transfer_loss = jmmd((f_s, p_s), (f_t, p_t))
+            loss = cls_loss + trade_off * transfer_loss
+
             loss.backward()
             optimizer.step()
             train_loss += loss.item()
-            
-        train_loss /= len(train_loader)
-        
-        # Validation
-        model.eval()
-        val_loss = 0.0
-        val_probs = []
-        val_targets = []
-        with torch.no_grad():
-            for X_batch, y_batch in val_loader:
-                X_batch, y_batch = X_batch.to(device), y_batch.to(device)
-                logit = model.predict(X_batch)
-                val_loss += criterion(logit, y_batch).item()
-                
-                probs = torch.softmax(logit, dim=1)[:, 1]
-                val_probs.extend(probs.cpu().numpy())
-                val_targets.extend(y_batch.cpu().numpy())
 
-        val_loss /= len(val_loader)
-        try:
-            val_auroc = roc_auc_score(val_targets, val_probs)
-        except:
-            val_auroc = 0.5
-        
+        train_loss /= max(1, len(train_loader))
+        val_loss, val_auroc = _evaluate_val(model, val_loader, device)
+
         if val_auroc > best_val_score:
             best_val_score = val_auroc
             best_model_state = copy.deepcopy(model.state_dict())
@@ -913,9 +1467,9 @@ def train_jan(model, X_train, y_train, d_train, X_val, y_val, d_val,
             if patience_counter >= patience:
                 epoch_iterator.write(f"Early stopping at epoch {epoch} (Best AUROC: {best_val_score:.4f})")
                 break
-        
+
         epoch_iterator.set_postfix({'Loss': f'{train_loss:.4f}', 'Val Loss': f'{val_loss:.4f}', 'Val AUC': f'{val_auroc:.4f}'})
-                
+
     if best_model_state:
         model.load_state_dict(best_model_state)
     return model
@@ -933,87 +1487,202 @@ class SHOT(DAModel):
     def forward(self, x):
         return self.predict(x)
 
-def train_shot(model, X_train, y_train, d_train, X_val, y_val, d_val,
-               epochs=50, batch_size=64, lr=1e-3, patience=5, device='cuda' if torch.cuda.is_available() else 'cpu'):
-    """
-    SHOT Training Loop.
-    Phase 1: Train Source Model (ERM).
-    Phase 2: Source-Free Adaptation (Information Maximization).
-    """
-    model = model.to(device)
-    
-    # Phase 1: Train Source Model (ERM)
-    from src.models import train_torch_model
-    trained_source = train_torch_model(model, X_train, y_train, X_val, y_val, 
-                                       epochs=epochs, batch_size=batch_size, lr=lr, patience=patience, device=device)
-    model = trained_source
-    
-    # Phase 2: Adaptation (InfoMax)
-    for param in model.classifier.parameters():
-        param.requires_grad = False
-        
-    optimizer = torch.optim.Adam(model.feature_extractor.parameters(), lr=lr/10.0)
-    
-    train_dataset = torch.utils.data.TensorDataset(torch.tensor(X_train, dtype=torch.float32))
-    val_dataset = torch.utils.data.TensorDataset(torch.tensor(X_val, dtype=torch.float32), torch.tensor(y_val, dtype=torch.long))
+def _shot_op_copy(optimizer):
+    for param_group in optimizer.param_groups:
+        param_group['lr0'] = param_group['lr']
+    return optimizer
 
-    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
+
+def _shot_lr_scheduler(optimizer, iter_num, max_iter, gamma=10, power=0.75):
+    decay = (1 + gamma * iter_num / max_iter) ** (-power)
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = param_group['lr0'] * decay
+        param_group['weight_decay'] = 1e-3
+        param_group['momentum'] = 0.9
+        param_group['nesterov'] = True
+    return optimizer
+
+
+def _shot_obtain_label(loader, model, num_classes, distance='cosine', threshold=0, epsilon=1e-5, device='cuda'):
+    start = True
+    with torch.no_grad():
+        for X_batch, idx in loader:
+            X_batch = X_batch.to(device)
+            feat = model.feature_extractor(X_batch)
+            outputs = model.classifier(feat)
+            if start:
+                all_fea = feat.float().cpu()
+                all_output = outputs.float().cpu()
+                start = False
+            else:
+                all_fea = torch.cat((all_fea, feat.float().cpu()), 0)
+                all_output = torch.cat((all_output, outputs.float().cpu()), 0)
+
+    all_output = F.softmax(all_output, dim=1)
+    ent = torch.sum(-all_output * torch.log(all_output + epsilon), dim=1)
+    _unknown_weight = 1 - ent / np.log(num_classes)
+    _, predict = torch.max(all_output, 1)
+
+    if distance == 'cosine':
+        all_fea = torch.cat((all_fea, torch.ones(all_fea.size(0), 1)), 1)
+        all_fea = (all_fea.t() / torch.norm(all_fea, p=2, dim=1)).t()
+
+    all_fea = all_fea.float().cpu().numpy()
+    aff = all_output.float().cpu().numpy()
+
+    for _ in range(2):
+        initc = aff.transpose().dot(all_fea)
+        initc = initc / (1e-8 + aff.sum(axis=0)[:, None])
+        cls_count = np.eye(num_classes)[predict].sum(axis=0)
+        labelset = np.where(cls_count > threshold)[0]
+        dd = cdist(all_fea, initc[labelset], distance)
+        pred_label = dd.argmin(axis=1)
+        predict = labelset[pred_label]
+        aff = np.eye(num_classes)[predict]
+
+    return predict.astype('int')
+
+
+def train_shot(model, X_train, y_train, d_train, X_val, y_val, d_val,
+               epochs=50, batch_size=64, lr=1e-3, patience=5,
+               device='cuda' if torch.cuda.is_available() else 'cpu', X_target=None):
+    """
+    SHOT (official-style):
+      1) Train source model on labeled source.
+      2) Freeze classifier, adapt feature extractor with pseudo-labels + InfoMax on target.
+    Requires unlabeled target samples (X_target).
+    """
+    if X_target is None:
+        raise ValueError("SHOT requires X_target for UDA. Use --uda to provide target samples.")
+
+    model = model.to(device)
+
+    # Phase 1: Source pretraining
+    from src.models import train_torch_model
+    model = train_torch_model(model, X_train, y_train, X_val, y_val,
+                              epochs=epochs, batch_size=batch_size, lr=lr, patience=patience, device=device)
+
+    # Freeze classifier
+    for p in model.classifier.parameters():
+        p.requires_grad = False
+
+    # Hyperparams (from official defaults)
+    cls_par = model.hparams.get('shot_cls_par', 0.3)
+    ent_par = model.hparams.get('shot_ent_par', 1.0)
+    gent = model.hparams.get('shot_gent', True)
+    ent = model.hparams.get('shot_ent', True)
+    threshold = model.hparams.get('shot_threshold', 0)
+    distance = model.hparams.get('shot_distance', 'cosine')
+    epsilon = model.hparams.get('shot_epsilon', 1e-5)
+    adapt_epochs = model.hparams.get('shot_epochs', max(1, epochs // 2))
+    interval = model.hparams.get('shot_interval', 15)
+    lr_decay = model.hparams.get('shot_lr_decay', 0.1)
+
+    # Target loaders with indices
+    target_dataset = torch.utils.data.TensorDataset(
+        torch.tensor(X_target, dtype=torch.float32),
+        torch.arange(len(X_target), dtype=torch.long)
+    )
+    target_loader = torch.utils.data.DataLoader(target_dataset, batch_size=batch_size, shuffle=True, drop_last=False)
+    target_loader_eval = torch.utils.data.DataLoader(target_dataset, batch_size=batch_size * 3, shuffle=False, drop_last=False)
+
+    # Validation loader (source)
+    val_dataset = torch.utils.data.TensorDataset(
+        torch.tensor(X_val, dtype=torch.float32),
+        torch.tensor(y_val, dtype=torch.long)
+    )
     val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
-    
-    best_val_acc = 0.0
-    best_model_state = None
-    adapt_epochs = max(1, epochs // 2) 
+
+    # Optimizer (SGD + official LR schedule)
+    optimizer = torch.optim.SGD(model.feature_extractor.parameters(), lr=lr * lr_decay)
+    optimizer = _shot_op_copy(optimizer)
+
+    max_iter = adapt_epochs * len(target_loader)
+    interval_iter = max_iter // interval if interval > 0 else max_iter
+    iter_num = 0
 
     import copy
     from tqdm import tqdm
+    best_val_score = -float('inf')
+    best_model_state = None
+    patience_counter = 0
+
     epoch_iterator = tqdm(range(adapt_epochs), desc="SHOT Adaptation")
+    target_iter = iter(target_loader)
+    mem_label = None
 
     for epoch in epoch_iterator:
         model.train()
         model.feature_extractor.train()
         model.classifier.eval()
-        
+
         train_loss = 0.0
-        
-        for X_batch, in train_loader:
-             X_batch = X_batch.to(device)
-             optimizer.zero_grad()
-             
-             logits = model(X_batch)
-             softmax_out = F.softmax(logits, dim=1)
-             
-             entropy_loss = -torch.mean(torch.sum(softmax_out * torch.log(softmax_out + 1e-5), dim=1))
-             
-             mean_prob = torch.mean(softmax_out, dim=0)
-             diversity_loss = torch.sum(mean_prob * torch.log(mean_prob + 1e-5)) 
-             
-             loss = entropy_loss + diversity_loss 
-             
-             loss.backward()
-             optimizer.step()
-             train_loss += loss.item()
-             
-        # Validation
-        model.eval()
-        correct = 0
-        total = 0
-        with torch.no_grad():
-            for X_batch, y_batch in val_loader:
-                X_batch, y_batch = X_batch.to(device), y_batch.to(device)
-                logits = model(X_batch)
-                preds = torch.argmax(logits, dim=1)
-                correct += (preds == y_batch).sum().item()
-                total += y_batch.size(0)
-        
-        val_acc = correct / total
-        
-        if best_model_state is None or val_acc > best_val_acc: 
-             best_val_acc = val_acc
-             best_model_state = copy.deepcopy(model.state_dict())
-             
+        for _ in range(len(target_loader)):
+            try:
+                X_t, idx = next(target_iter)
+            except StopIteration:
+                target_iter = iter(target_loader)
+                X_t, idx = next(target_iter)
+
+            if X_t.size(0) == 1:
+                continue
+
+            if iter_num % interval_iter == 0 and cls_par > 0:
+                model.eval()
+                mem_label = _shot_obtain_label(
+                    target_loader_eval, model, model.classifier[-1].out_features,
+                    distance=distance, threshold=threshold, epsilon=epsilon, device=device
+                )
+                mem_label = torch.from_numpy(mem_label).to(device)
+                model.train()
+                model.classifier.eval()
+
+            X_t = X_t.to(device)
+            idx = idx.to(device)
+
+            iter_num += 1
+            _shot_lr_scheduler(optimizer, iter_num=iter_num, max_iter=max_iter)
+
+            features_t = model.feature_extractor(X_t)
+            outputs_t = model.classifier(features_t)
+
+            loss = torch.tensor(0.0, device=device)
+            if cls_par > 0 and mem_label is not None:
+                pseudo = mem_label[idx]
+                loss = loss + cls_par * nn.CrossEntropyLoss()(outputs_t, pseudo)
+
+            if ent:
+                softmax_out = F.softmax(outputs_t, dim=1)
+                entropy_loss = torch.mean(tllib_entropy(softmax_out))
+                if gent:
+                    msoftmax = softmax_out.mean(dim=0)
+                    gentropy_loss = torch.sum(-msoftmax * torch.log(msoftmax + epsilon))
+                    entropy_loss -= gentropy_loss
+                loss = loss + ent_par * entropy_loss
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            train_loss += loss.item()
+
+        train_loss /= max(1, len(target_loader))
+        val_loss, val_auroc = _evaluate_val(model, val_loader, device)
+
+        if val_auroc > best_val_score:
+            best_val_score = val_auroc
+            best_model_state = copy.deepcopy(model.state_dict())
+            patience_counter = 0
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                epoch_iterator.write(f"Early stopping at epoch {epoch} (Best AUROC: {best_val_score:.4f})")
+                break
+
+        epoch_iterator.set_postfix({'Loss': f'{train_loss:.4f}', 'Val Loss': f'{val_loss:.4f}', 'Val AUC': f'{val_auroc:.4f}'})
+
     if best_model_state:
         model.load_state_dict(best_model_state)
-        
+
     return model
 
 # CBST (Class-Balanced Self-Training)
@@ -1024,211 +1693,101 @@ class CBST(DAModel):
     """
     def __init__(self, input_dim, num_classes=2, hparams=None):
         super(CBST, self).__init__(input_dim, num_classes, hparams)
-        # Standard DA Model structure w/ classifier
 
-def train_cbst(model, X_train, y_train, d_train, X_val, y_val, d_val, epochs=50, batch_size=64, lr=1e-3, patience=5, device='cuda' if torch.cuda.is_available() else 'cpu'):
+
+def train_cbst(model, X_train, y_train, d_train, X_val, y_val, d_val,
+               epochs=50, batch_size=64, lr=1e-3, patience=5,
+               device='cuda' if torch.cuda.is_available() else 'cpu', X_target=None):
     """
-    CBST Training Loop.
-    1. Train on Source.
-    2. Iteratively: Generate Pseudo-labels on Target (Validation) -> Select Balanced -> Retrain.
+    CBST (official-style):
+      1) Train on source.
+      2) Iteratively select class-balanced pseudo-labels on target and retrain.
+    Requires unlabeled target samples (X_target).
     """
-    import copy
-    model.to(device)
-    
-    # 1. Initial Training on Source
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    if X_target is None:
+        raise ValueError("CBST requires X_target for UDA. Use --uda to provide target samples.")
+
+    model = model.to(device)
+    weight_decay = model.hparams.get('weight_decay', 0.0)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
     criterion = nn.CrossEntropyLoss()
-    
+
+    # Source data
     X_s = torch.tensor(X_train, dtype=torch.float32).to(device)
     y_s = torch.tensor(y_train, dtype=torch.long).to(device)
-    
-    # Target (treated as Unlabeled for adaptation, though we know labels for val/eval)
-    # We use X_val as Target Domain for adaptation
-    X_t = torch.tensor(X_val, dtype=torch.float32).to(device)
-    
-    # Create DataLoader for source
     ds_s = torch.utils.data.TensorDataset(X_s, y_s)
-    loader_s = torch.utils.data.DataLoader(ds_s, batch_size=batch_size, shuffle=True)
-    
-    print("CBST: Step 1 - Train on Source")
-    model.train()
-    # Pretrain fewer epochs or full? Let's do partial or full.
-    # Logic: Pretrain enough to get reasonable pseudo labels.
-    pretrain_epochs = epochs // 2
-    
-    for epoch in range(pretrain_epochs): 
-        for x, y in loader_s:
-            optimizer.zero_grad()
-            logits = model(x)
-            loss = criterion(logits, y)
-            loss.backward()
-            optimizer.step()
-            
-    # 2. Iterative Self-Training
-    max_iter = 5 
-    portion_step = 0.1 
-    
-    for round_idx in range(max_iter):
-        model.eval()
-        with torch.no_grad():
-            logits_t = model(X_t)
-            probs_t = F.softmax(logits_t, dim=1)
-            max_probs, preds = torch.max(probs_t, dim=1)
-            
-        # Class-Balanced Selection
-        current_portion = min(0.2 + round_idx * portion_step, 0.8)
-        
-        pseudo_idx = []
-        pseudo_labels = []
-        
-        num_classes = 2
-        for c in range(num_classes):
-            c_idx = (preds == c).nonzero(as_tuple=True)[0]
-            if len(c_idx) == 0: continue
-            
-            c_probs = max_probs[c_idx]
-            k = int(len(c_idx) * current_portion)
-            if k == 0: continue
-            
-            topk_vals, topk_indices = torch.topk(c_probs, k)
-            global_indices = c_idx[topk_indices]
-            
-            pseudo_idx.append(global_indices)
-            pseudo_labels.append(torch.full((k,), c, dtype=torch.long).to(device))
-            
-        if not pseudo_idx:
-            print("CBST: No pseudo-labels selected, skipping round.")
-            continue
-            
-        pseudo_idx_cat = torch.cat(pseudo_idx)
-        pseudo_labels_cat = torch.cat(pseudo_labels)
-        X_pseudo = X_t[pseudo_idx_cat]
-        
-        # 3. Retrain on Source + Pseudo-Target
-        X_aug = torch.cat([X_s, X_pseudo])
-        y_aug = torch.cat([y_s, pseudo_labels_cat])
-        
-        ds_aug = torch.utils.data.TensorDataset(X_aug, y_aug)
-        loader_aug = torch.utils.data.DataLoader(ds_aug, batch_size=batch_size, shuffle=True)
-        
-        print(f"CBST: Round {round_idx+1}/{max_iter} - Retraining with {len(X_pseudo)} pseudo-labels")
-        
-        model.train()
-        for epoch in range(5): # Short retrain per round
-            for x, y in loader_aug:
-                optimizer.zero_grad()
-                logits = model(x)
-                loss = criterion(logits, y)
-                loss.backward()
-                optimizer.step()
-                
-    return model
+    loader_s = torch.utils.data.DataLoader(ds_s, batch_size=batch_size, shuffle=True, drop_last=True)
 
-# CBST (Class-Balanced Self-Training)
-class CBST(DAModel):
-    """
-    CBST: Class-Balanced Self-Training (Zou et al., 2018)
-    Iterative self-training with class-balanced pseudo-label selection.
-    """
-    def __init__(self, input_dim, num_classes=2, hparams=None):
-        super(CBST, self).__init__(input_dim, num_classes, hparams)
-        # Standard DA Model structure w/ classifier
+    # Target data (unlabeled)
+    X_t = torch.tensor(X_target, dtype=torch.float32).to(device)
 
-def train_cbst(model, X_train, y_train, d_train, X_val, y_val, d_val, epochs=50, batch_size=64, lr=1e-3, patience=5, device='cuda' if torch.cuda.is_available() else 'cpu'):
-    """
-    CBST Training Loop.
-    1. Train on Source.
-    2. Iteratively: Generate Pseudo-labels on Target (Validation) -> Select Balanced -> Retrain.
-    """
-    import copy
-    model.to(device)
-    
-    # 1. Initial Training on Source
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    criterion = nn.CrossEntropyLoss()
-    
-    X_s = torch.tensor(X_train, dtype=torch.float32).to(device)
-    y_s = torch.tensor(y_train, dtype=torch.long).to(device)
-    
-    # Target (treated as Unlabeled for adaptation, though we know labels for val/eval)
-    # We use X_val as Target Domain for adaptation
-    X_t = torch.tensor(X_val, dtype=torch.float32).to(device)
-    
-    # Create DataLoader for source
-    ds_s = torch.utils.data.TensorDataset(X_s, y_s)
-    loader_s = torch.utils.data.DataLoader(ds_s, batch_size=batch_size, shuffle=True)
-    
-    print("CBST: Step 1 - Train on Source")
-    model.train()
-    # Pretrain fewer epochs or full? Let's do partial or full.
-    # Logic: Pretrain enough to get reasonable pseudo labels.
-    pretrain_epochs = epochs // 2
-    
+    # 1) Pretrain on source
+    pretrain_epochs = model.hparams.get('cbst_pretrain_epochs', max(1, epochs // 2))
     from tqdm import tqdm
-    for epoch in tqdm(range(pretrain_epochs), desc="CBST Pretrain"): 
+    for epoch in tqdm(range(pretrain_epochs), desc="CBST Pretrain"):
+        model.train()
         for x, y in loader_s:
             optimizer.zero_grad()
             logits = model(x)
             loss = criterion(logits, y)
             loss.backward()
             optimizer.step()
-            
-    # 2. Iterative Self-Training
-    max_iter = 5 
-    portion_step = 0.1 
-    
+
+    # 2) Iterative self-training with class-balanced thresholds
+    max_iter = model.hparams.get('cbst_max_iter', 5)
+    init_port = model.hparams.get('cbst_init_port', 0.2)
+    port_step = model.hparams.get('cbst_port_step', 0.1)
+    max_port = model.hparams.get('cbst_max_port', 0.8)
+    retrain_epochs = model.hparams.get('cbst_retrain_epochs', 5)
+
+    num_classes = model.classifier[-1].out_features
+
     for round_idx in range(max_iter):
         model.eval()
         with torch.no_grad():
             logits_t = model(X_t)
             probs_t = F.softmax(logits_t, dim=1)
             max_probs, preds = torch.max(probs_t, dim=1)
-            
-        # Class-Balanced Selection
-        current_portion = min(0.2 + round_idx * portion_step, 0.8)
-        
+
+        current_port = min(init_port + round_idx * port_step, max_port)
         pseudo_idx = []
         pseudo_labels = []
-        
-        num_classes = 2
+
         for c in range(num_classes):
             c_idx = (preds == c).nonzero(as_tuple=True)[0]
-            if len(c_idx) == 0: continue
-            
+            if len(c_idx) == 0:
+                continue
             c_probs = max_probs[c_idx]
-            k = int(len(c_idx) * current_portion)
-            if k == 0: continue
-            
+            k = int(len(c_idx) * current_port)
+            if k == 0:
+                continue
             topk_vals, topk_indices = torch.topk(c_probs, k)
             global_indices = c_idx[topk_indices]
-            
             pseudo_idx.append(global_indices)
             pseudo_labels.append(torch.full((k,), c, dtype=torch.long).to(device))
-            
+
         if not pseudo_idx:
             print("CBST: No pseudo-labels selected, skipping round.")
             continue
-            
+
         pseudo_idx_cat = torch.cat(pseudo_idx)
         pseudo_labels_cat = torch.cat(pseudo_labels)
         X_pseudo = X_t[pseudo_idx_cat]
-        
-        # 3. Retrain on Source + Pseudo-Target
+
+        # Retrain on source + pseudo-target
         X_aug = torch.cat([X_s, X_pseudo])
         y_aug = torch.cat([y_s, pseudo_labels_cat])
-        
         ds_aug = torch.utils.data.TensorDataset(X_aug, y_aug)
-        loader_aug = torch.utils.data.DataLoader(ds_aug, batch_size=batch_size, shuffle=True)
-        
+        loader_aug = torch.utils.data.DataLoader(ds_aug, batch_size=batch_size, shuffle=True, drop_last=True)
+
         print(f"CBST: Round {round_idx+1}/{max_iter} - Retraining with {len(X_pseudo)} pseudo-labels")
-        
         model.train()
-        for epoch in range(5): # Short retrain per round
+        for _ in range(retrain_epochs):
             for x, y in loader_aug:
                 optimizer.zero_grad()
                 logits = model(x)
                 loss = criterion(logits, y)
                 loss.backward()
                 optimizer.step()
-                
+
     return model

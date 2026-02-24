@@ -197,6 +197,23 @@ class StressDataset:
             normalized = (user_X - mean) / std
             self.X[user_mask] = normalized.astype(np.float32)
 
+        # Clip extreme values based on training distribution to stabilize validation/test
+        clip_percentile = 99.9
+        clip_min = 10.0
+        train_vals = self.X[train_idx].reshape(-1)
+        sample_size = min(1_000_000, train_vals.size)
+        rng = np.random.default_rng(0)
+        if train_vals.size > sample_size:
+            sample_idx = rng.choice(train_vals.size, size=sample_size, replace=False)
+            sample = np.abs(train_vals[sample_idx])
+        else:
+            sample = np.abs(train_vals)
+        clip_value = float(np.percentile(sample, clip_percentile))
+        if clip_value < clip_min:
+            clip_value = clip_min
+        print(f"Clipping normalized features to ±{clip_value:.4f} (p{clip_percentile}, min {clip_min})")
+        self.X = np.clip(self.X, -clip_value, clip_value).astype(np.float32)
+
     def get_temporal_splits(self, train_ratio: float = 0.6, val_ratio: float = 0.2):
         """
         Generates indices for train, val, and test splits based on temporal order per user.

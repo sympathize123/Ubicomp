@@ -2,27 +2,25 @@ import subprocess
 import sys
 import os
 
-# List of all models to verify
+# List of all models to verify (non-DA)
 MODELS = [
     # Baselines
-    'XGB', 'LGB', 'MLP', 'ResNet', 
+    'XGB', 'LGB', 'MLP', 'ResNet',
     # DL / Transformers
     'TabNet', 'TabTransformer', 'NODE', 'DCN',
-    # DA
-    'DANN', 'CDAN', 'DeepCORAL', 'MCC', 'ADDA', 'MCD', 'JAN', 'SHOT', 'CBST', 
     # DG
     'IRM', 'VREx', 'GroupDRO', 'MixStyle', 'ERM_DG', 'MLDG', 'MASF', 'Fish', 'CSD', 'SagNet'
 ]
 
-# Additional configurations
-UDA_MODELS = ['DANN'] # Add others if UDA enabled for them
+# DA models (require --uda)
+DA_MODELS = ['DANN', 'CDAN', 'DAN', 'DeepCORAL', 'MCC', 'ADDA', 'MCD', 'JAN', 'SHOT', 'CBST', 'CGDM']
 
 def run_verification():
     failed_models = []
     passed_models = []
     
     print("Starting Full Suite Verification...")
-    print(f"Total Models to Verify: {len(MODELS) + len(UDA_MODELS)}")
+    print(f"Total Models to Verify: {len(MODELS) + len(DA_MODELS)}")
     
     # 1. Standard Verification (DG/Supervised Mode)
     for model in MODELS:
@@ -64,7 +62,7 @@ def run_verification():
             failed_models.append(model)
 
     # 2. UDA Verification
-    for model in UDA_MODELS:
+    for model in DA_MODELS:
         print(f"\n[Verifying] {model} (UDA Mode)...")
         try:
             cmd = [

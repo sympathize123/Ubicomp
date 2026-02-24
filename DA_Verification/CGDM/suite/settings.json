@@ -1,0 +1,14 @@
+{
+  "num_classes": 6,
+  "num_dims": 8,
+  "num_samples_source": 1600,
+  "num_samples_target": 1600,
+  "epochs": 20,
+  "batch_size": 64,
+  "perplexity": 500,
+  "max_tsne": 5000,
+  "max_pca": 10000,
+  "dg_domains": 4,
+  "seed": 20,
+  "device": "cuda"
+}

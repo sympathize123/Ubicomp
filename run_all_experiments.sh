@@ -11,9 +11,12 @@ LABELS=("valence" "arousal" "disturbance")
 MODELS=(
     "XGB" "LGB" "MLP" "ResNet"
     "TabNet" "TabTransformer" "NODE" "DCN"
-    "DANN" "CDAN" "DeepCORAL" "MCC" "ADDA" "MCD" "JAN" "SHOT" "CBST"
+    "DANN" "CDAN" "DAN" "DeepCORAL" "MCC" "ADDA" "MCD" "JAN" "SHOT" "CBST"
     "IRM" "VREx" "GroupDRO" "MixStyle" "ERM_DG" "MLDG" "MASF" "Fish" "CSD" "SagNet"
 )
+
+# DA models (require --uda)
+DA_MODELS=("DANN" "CDAN" "DAN" "DeepCORAL" "MCC" "ADDA" "MCD" "JAN" "SHOT" "CBST")
 
 # Output directory
 mkdir -p results_final
@@ -35,7 +38,14 @@ for label in "${LABELS[@]}"; do
             echo "[$(date)] Running Model: $model on Dataset: $dataset for Label: $label"
             
             # Clean command with 5 HPO trials
-            CMD="python3 execute_benchmark.py --label $label --dataset $dataset --model $model --hpo_trials 5"
+            USE_UDA=""
+            for da_model in "${DA_MODELS[@]}"; do
+                if [[ "$model" == "$da_model" ]]; then
+                    USE_UDA="--uda"
+                    break
+                fi
+            done
+            CMD="python3 execute_benchmark.py --label $label --dataset $dataset --model $model --hpo_trials 5 $USE_UDA"
             
             # Log file incorporates the label
             LOG_FILE="results_final/${dataset}_${label}_${model}.log"

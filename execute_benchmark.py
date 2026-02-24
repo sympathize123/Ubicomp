@@ -10,7 +10,7 @@ import sys
 import time  # ADDED: For timing measurements
 from src.data_loader import StressDataset
 from src.models import XGBoostWrapper, LightGBMWrapper, MLP, ResNet, TabNetWrapper, TabPFNWrapper, WidedeepWrapper, PytorchTabularWrapper, DeepCTRWrapper, train_torch_model, evaluate_model
-from src.da_models import DANN, CDAN, DeepCORAL, MCC, ADDA, MCD, JAN, SHOT, CBST, train_adversarial_da, train_mcd, train_dann, train_adda, train_jan, train_shot, train_cbst, train_deepcoral, train_mcc
+from src.da_models import DANN, CDAN, DAN, DeepCORAL, MCC, ADDA, MCD, JAN, SHOT, CBST, CGDM, train_adversarial_da, train_mcd, train_dann, train_cdan, train_adda, train_jan, train_shot, train_cbst, train_deepcoral, train_mcc, train_dan, train_cgdm
 from src.domainbed_algos import ERM as DG_ERM, IRM, VREx, GroupDRO, MixStyle, MLDG, MASF, Fish, CSD, SagNet, train_dg_model
 from src.hparams_registry import get_hparams
 from sklearn.preprocessing import LabelEncoder
@@ -27,8 +27,7 @@ class DANNInferenceWrapper(nn.Module):
         self.model = dann_model
         
     def forward(self, x):
-        class_out, _ = self.model(x, alpha=0)
-        return class_out
+        return self.model.predict(x)
 
 class CDANInferenceWrapper(nn.Module):
     def __init__(self, cdan_model):
@@ -36,9 +35,7 @@ class CDANInferenceWrapper(nn.Module):
         self.model = cdan_model
         
     def forward(self, x):
-        # CDAN returns (class_out, domain_out), we only need class_out for inference
-        class_out, _ = self.model(x, alpha=0)
-        return class_out
+        return self.model.predict(x)
 
 class MCDInferenceWrapper(nn.Module):
     def __init__(self, mcd_model):
@@ -49,11 +46,19 @@ class MCDInferenceWrapper(nn.Module):
         o1, o2 = self.model(x)
         return (o1 + o2) / 2.0 # Ensemble average
 
+class CGDMInferenceWrapper(nn.Module):
+    def __init__(self, cgdm_model):
+        super().__init__()
+        self.model = cgdm_model
+        
+    def forward(self, x):
+        return self.model.predict(x)
+
 def get_args():
     parser = argparse.ArgumentParser(description="Run Within-Dataset Benchmark")
     parser.add_argument('--dataset', type=str, required=True, choices=['D-1', 'D-2', 'D-3'], help='Dataset to benchmark')
     parser.add_argument('--label', type=str, default='stress_binary', help='Target label to predict (e.g., stress_binary, arousal, valence, disturbance, happy, angry)')
-    parser.add_argument('--model', type=str, required=True, choices=['XGB', 'LGB', 'MLP', 'ResNet', 'DANN', 'CDAN', 'DeepCORAL', 'MCC', 'ADDA', 'MCD', 'JAN', 'SHOT', 'CBST', 'TabNet', 'TabPFN', 'SAINT', 'TabTransformer', 'FastFormer', 'Perceiver', 'NODE', 'DCN', 'IRM', 'VREx', 'GroupDRO', 'MixStyle', 'ERM_DG', 'MLDG', 'MASF', 'Fish', 'CSD', 'SagNet'], help='Model to use')
+    parser.add_argument('--model', type=str, required=True, choices=['XGB', 'LGB', 'MLP', 'ResNet', 'DANN', 'CDAN', 'DAN', 'DeepCORAL', 'MCC', 'ADDA', 'MCD', 'JAN', 'SHOT', 'CBST', 'CGDM', 'TabNet', 'TabPFN', 'SAINT', 'TabTransformer', 'FastFormer', 'Perceiver', 'NODE', 'DCN', 'IRM', 'VREx', 'GroupDRO', 'MixStyle', 'ERM_DG', 'MLDG', 'MASF', 'Fish', 'CSD', 'SagNet'], help='Model to use')
     parser.add_argument('--backbone', type=str, default='MLP', choices=['MLP', 'ResNet', 'Transformer'], help='Backbone for DG/DA models')
     parser.add_argument('--epochs', type=int, default=50, help='Epochs for DL models')
     parser.add_argument('--batch_size', type=int, default=64, help='Batch size for DL models')
@@ -83,6 +88,11 @@ def train_model(args, X_train, y_train, d_train, X_val, y_val, d_val,
     lr = hparams.get('lr', args.lr)
     batch_size = hparams.get('batch_size', args.batch_size)
     epochs = args.epochs
+    dropout = hparams.get('dropout', 0.3)
+    hidden_dim = hparams.get('hidden_dim', 256)
+    num_layers = hparams.get('num_layers', 3)
+    num_blocks = hparams.get('num_blocks', 2)
+    nhead = hparams.get('nhead', 4)
 
     if args.model == 'XGB':
         model = XGBoostWrapper(n_estimators=hparams.get('n_estimators', 100), max_depth=hparams.get('max_depth', 6), 
@@ -151,20 +161,27 @@ def train_model(args, X_train, y_train, d_train, X_val, y_val, d_val,
         model = DeepCTRWrapper(model_type='DCN', dnn_hidden_units=_dnn_hidden_units, 
                                dnn_dropout=_dropout, batch_size=batch_size, epochs=epochs, patience=patience, **hparams)
     elif args.model == 'MLP':
-        net = MLP(input_dim=input_dim, hidden_dim=256)
+        net = MLP(input_dim=input_dim, hidden_dim=hidden_dim, num_layers=num_layers, dropout=dropout)
         model = train_torch_model(net, X_train, y_train, X_val, y_val, 
                                     epochs=epochs, batch_size=batch_size, lr=lr, patience=patience)
     elif args.model == 'ResNet':
-        net = ResNet(input_dim=input_dim, hidden_dim=256, num_blocks=2, dropout=0.3) 
+        net = ResNet(input_dim=input_dim, hidden_dim=hidden_dim, num_blocks=num_blocks, dropout=dropout) 
         model = train_torch_model(net, X_train, y_train, X_val, y_val, 
                                     epochs=epochs, batch_size=batch_size, lr=lr, patience=patience)
     elif args.model == 'DANN':
         net = DANN(input_dim=input_dim, num_classes=2, num_domains=num_domains, 
-            hparams={'lr': lr, 'backbone': backbone, 'dropout': hparams.get('dropout', 0.3), 'hidden_dim': 256})
+            hparams={**hparams, 'lr': lr, 'backbone': backbone, 'dropout': dropout,
+                     'hidden_dim': hidden_dim, 'num_layers': num_layers, 'num_blocks': num_blocks, 'nhead': nhead})
         model = train_dann(net, X_train, y_train, d_train, X_val, y_val, d_val,
-                        epochs=epochs, batch_size=batch_size, patience=patience)
+                        epochs=epochs, batch_size=batch_size, patience=patience, X_target=X_target)
         model = DANNInferenceWrapper(model)
     
+    elif args.model == 'DAN':
+        net = DAN(input_dim=input_dim, num_classes=2,
+            hparams={**hparams, 'lr': lr, 'backbone': backbone, 'dropout': dropout,
+                     'hidden_dim': hidden_dim, 'num_layers': num_layers, 'num_blocks': num_blocks, 'nhead': nhead})
+        model = train_dan(net, X_train, y_train, d_train, X_val, y_val, d_val,
+                        epochs=epochs, batch_size=batch_size, lr=lr, patience=patience, X_target=X_target)
 
     
     # DG Models
@@ -191,51 +208,73 @@ def train_model(args, X_train, y_train, d_train, X_val, y_val, d_val,
     
     # DA Models
     elif args.model == 'ADDA':
-        net = ADDA(input_dim=input_dim, num_classes=2, hparams={'lr': lr, 'backbone': backbone, **hparams})
-        model = train_adda(net, X_train, y_train, d_train, X_val, y_val, d_val, epochs=epochs, batch_size=batch_size, lr=lr, patience=patience)
+        net = ADDA(input_dim=input_dim, num_classes=2,
+                   hparams={**hparams, 'lr': lr, 'backbone': backbone, 'dropout': dropout,
+                            'hidden_dim': hidden_dim, 'num_layers': num_layers, 'num_blocks': num_blocks, 'nhead': nhead})
+        model = train_adda(net, X_train, y_train, d_train, X_val, y_val, d_val, epochs=epochs, batch_size=batch_size, lr=lr, patience=patience, X_target=X_target)
         
     elif args.model == 'MCD':
-        net = MCD(input_dim=input_dim, num_classes=2, hparams={'lr': lr, 'backbone': backbone, **hparams})
-        model = train_mcd(net, X_train, y_train, d_train, X_val, y_val, d_val, epochs=epochs, batch_size=batch_size, lr=lr, patience=patience)
+        net = MCD(input_dim=input_dim, num_classes=2,
+                  hparams={**hparams, 'lr': lr, 'backbone': backbone, 'dropout': dropout,
+                           'hidden_dim': hidden_dim, 'num_layers': num_layers, 'num_blocks': num_blocks, 'nhead': nhead})
+        model = train_mcd(net, X_train, y_train, d_train, X_val, y_val, d_val, epochs=epochs, batch_size=batch_size, lr=lr, patience=patience, X_target=X_target)
         model = MCDInferenceWrapper(model)
         
     elif args.model == 'JAN':
-        net = JAN(input_dim=input_dim, num_classes=2, hparams={'lr': lr, 'backbone': backbone, **hparams})
-        model = train_jan(net, X_train, y_train, d_train, X_val, y_val, d_val, epochs=epochs, batch_size=batch_size, lr=lr, patience=patience)
+        net = JAN(input_dim=input_dim, num_classes=2,
+                  hparams={**hparams, 'lr': lr, 'backbone': backbone, 'dropout': dropout,
+                           'hidden_dim': hidden_dim, 'num_layers': num_layers, 'num_blocks': num_blocks, 'nhead': nhead})
+        model = train_jan(net, X_train, y_train, d_train, X_val, y_val, d_val, epochs=epochs, batch_size=batch_size, lr=lr, patience=patience, X_target=X_target)
 
     elif args.model == 'SHOT':
-        net = SHOT(input_dim=input_dim, num_classes=2, hparams={'lr': lr, 'backbone': backbone, **hparams})
-        model = train_shot(net, X_train, y_train, d_train, X_val, y_val, d_val, epochs=epochs, batch_size=batch_size, lr=lr, patience=patience)
+        net = SHOT(input_dim=input_dim, num_classes=2,
+                   hparams={**hparams, 'lr': lr, 'backbone': backbone, 'dropout': dropout,
+                            'hidden_dim': hidden_dim, 'num_layers': num_layers, 'num_blocks': num_blocks, 'nhead': nhead})
+        model = train_shot(net, X_train, y_train, d_train, X_val, y_val, d_val, epochs=epochs, batch_size=batch_size, lr=lr, patience=patience, X_target=X_target)
 
     elif args.model == 'CBST':
-        net = CBST(input_dim=input_dim, num_classes=2, hparams={'lr': lr, 'backbone': backbone, **hparams})
-        model = train_cbst(net, X_train, y_train, d_train, X_val, y_val, d_val, epochs=epochs, batch_size=batch_size, lr=lr, patience=patience)
+        net = CBST(input_dim=input_dim, num_classes=2,
+                   hparams={**hparams, 'lr': lr, 'backbone': backbone, 'dropout': dropout,
+                            'hidden_dim': hidden_dim, 'num_layers': num_layers, 'num_blocks': num_blocks, 'nhead': nhead})
+        model = train_cbst(net, X_train, y_train, d_train, X_val, y_val, d_val, epochs=epochs, batch_size=batch_size, lr=lr, patience=patience, X_target=X_target)
 
     elif args.model == 'CDAN':
         net = CDAN(input_dim=input_dim, num_classes=2, num_domains=num_domains, 
-            hparams={'lr': lr, 'backbone': backbone, 'dropout': hparams.get('dropout', 0.3)})
-        model = train_adversarial_da(net, X_train, y_train, d_train, X_val, y_val, d_val,
-                        epochs=epochs, batch_size=batch_size, patience=patience)
+            hparams={**hparams, 'lr': lr, 'backbone': backbone, 'dropout': dropout,
+                     'hidden_dim': hidden_dim, 'num_layers': num_layers, 'num_blocks': num_blocks, 'nhead': nhead})
+        model = train_cdan(net, X_train, y_train, d_train, X_val, y_val, d_val,
+                        epochs=epochs, batch_size=batch_size, lr=lr, patience=patience, X_target=X_target)
         model = CDANInferenceWrapper(model)
     
     elif args.model == 'DeepCORAL':
         net = DeepCORAL(input_dim=input_dim, num_classes=2, 
-            hparams={'lr': lr, 'backbone': backbone, 'dropout': hparams.get('dropout', 0.3)})
+            hparams={**hparams, 'lr': lr, 'backbone': backbone, 'dropout': dropout,
+                     'hidden_dim': hidden_dim, 'num_layers': num_layers, 'num_blocks': num_blocks, 'nhead': nhead})
         model = train_deepcoral(net, X_train, y_train, d_train, X_val, y_val, d_val,
-                        epochs=epochs, batch_size=batch_size, lr=lr, patience=patience)
+                        epochs=epochs, batch_size=batch_size, lr=lr, patience=patience, X_target=X_target)
     
     elif args.model == 'MCC':
         net = MCC(input_dim=input_dim, num_classes=2, 
-            hparams={'lr': lr, 'backbone': backbone, 'dropout': hparams.get('dropout', 0.3)})
+            hparams={**hparams, 'lr': lr, 'backbone': backbone, 'dropout': dropout,
+                     'hidden_dim': hidden_dim, 'num_layers': num_layers, 'num_blocks': num_blocks, 'nhead': nhead})
         model = train_mcc(net, X_train, y_train, d_train, X_val, y_val, d_val,
-                        epochs=epochs, batch_size=batch_size, lr=lr, patience=patience)
+                        epochs=epochs, batch_size=batch_size, lr=lr, patience=patience, X_target=X_target)
+    elif args.model == 'CGDM':
+        if X_target is None:
+            raise ValueError("CGDM requires X_target (use --uda).")
+        net = CGDM(input_dim=input_dim, num_classes=num_classes)
+        model = train_cgdm(net, X_train, y_train, X_target,
+                           X_val=X_val, y_val=y_val,
+                           epochs=epochs, batch_size=batch_size, lr=lr,
+                           weight_decay=hparams.get('weight_decay', 5e-4))
+        model = CGDMInferenceWrapper(model)
 
     # Train (if not already trained inside helper)
     if args.model in ['XGB', 'LGB', 'TabNet', 'TabPFN', 'SAINT', 'TabTransformer', 'FastFormer', 'Perceiver', 'NODE', 'DCN']:
         model.fit(X_train, y_train, X_val, y_val)
     elif args.model in ['IRM', 'VREx', 'GroupDRO', 'MixStyle', 'ERM_DG', 'MLDG', 'MASF', 'Fish', 'CSD', 'SagNet']:
         model = train_dg_model(model, X_train, y_train, d_train, X_val, y_val, d_val,
-                               epochs=epochs, batch_size=32, domains_per_batch=8, patience=patience)
+                               epochs=epochs, batch_size=batch_size, domains_per_batch=8, patience=patience)
         
     return model
 
@@ -273,7 +312,7 @@ def main():
     X_test, y_test = ds.X[test_idx], ds.y[test_idx]
     
     # Domain Labels
-    DG_MODELS = ['DANN', 'CDAN', 'DeepCORAL', 'MCC', 'IRM', 'VREx', 'GroupDRO', 'MixStyle', 'ERM_DG', 'MLDG', 'MASF', 'ADDA', 'MCD', 'JAN', 'SHOT', 'CBST', 'Fish', 'CSD', 'SagNet']
+    DG_MODELS = ['DANN', 'CDAN', 'DAN', 'DeepCORAL', 'MCC', 'CGDM', 'IRM', 'VREx', 'GroupDRO', 'MixStyle', 'ERM_DG', 'MLDG', 'MASF', 'ADDA', 'MCD', 'JAN', 'SHOT', 'CBST', 'Fish', 'CSD', 'SagNet']
     
     d_train, d_val, num_domains = None, None, 0
     X_target = None # For UDA
@@ -309,7 +348,7 @@ def main():
     # 4. Hyperparameter Optimization
     if args.hpo_trials > 0:
         # Only print backbone if it's a DG/DA model that uses it
-        dg_da_models = ['DANN', 'CDAN', 'DeepCORAL', 'MCC', 'ADDA', 'MCD', 'JAN', 'SHOT', 'CBST', 
+        dg_da_models = ['DANN', 'CDAN', 'DAN', 'DeepCORAL', 'MCC', 'ADDA', 'MCD', 'JAN', 'SHOT', 'CBST', 
                         'IRM', 'VREx', 'GroupDRO', 'MixStyle', 'MLDG', 'MASF', 'Fish', 'CSD', 'SagNet', 'ERM_DG']
         
         if args.model in dg_da_models:
@@ -371,7 +410,7 @@ def main():
         start_time = time.time()
         
         model = train_model(args, X_train, y_train, d_train, X_val, y_val, d_val, 
-                            input_dim, num_classes, num_domains, hparams=best_hparams, seed=seed, patience=args.patience)
+                            input_dim, num_classes, num_domains, hparams=best_hparams, seed=seed, patience=args.patience, X_target=X_target)
         
         # ADDED: End timing
         end_time = time.time()
