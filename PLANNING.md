@@ -31,16 +31,20 @@ We are building a comprehensive benchmark suite. Detailed guide available in `CO
 - [x] **MixStyle** (Feature Statistics Mixing)
 - [x] **MLDG** (Meta-Learning DG)
 - [x] **MASF** (MMD-based DG)
+- [x] **Fish** (Gradient Matching) - *Implemented & Verified*
+- [x] **CSD** (Common Specific Decomposition) - *Implemented & Verified*
+- [x] **SagNet** (Style Agnostic Networks) - *Implemented & Verified*
 
 #### Domain Adaptation (DA) - *In Progress*
 - [x] **DANN** (Domain-Adversarial NN) - *Refactored & Verified*
 - [x] **CDAN** (Conditional DANN) - *Implemented & Verified*
 - [x] **MCC** (Minimum Class Confusion) - *Implemented & Verified*
 - [x] **DeepCORAL** (Correlation Alignment) - *Implemented*
-- [ ] **ADDA** (Adversarial Discriminative DA)
-- [ ] **DAN / JAN** (MMD-based)
-- [ ] **MCD** (Classifier Discrepancy)
-- [ ] **SHOT** (Source-Free DA)
+- [x] **ADDA** (Adversarial Discriminative DA) - *Implemented*
+- [x] **JAN** (Joint Adaptation Network) - *Implemented*
+- [x] **MCD** (Maximum Classifier Discrepancy) - *Implemented*
+- [x] **SHOT** (Source-Free DA) - *Implemented*
+- [x] **CBST** (Class-Balanced Self-Training) - *Implemented & Verified*
 
 ### 2.3 Documentation
 - [x] `CONTRIBUTING_GUIDE.md`: Detailed instructions for team members to implement remaining algorithms and code sources.

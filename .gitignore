@@ -16,6 +16,7 @@ myenv/
 .pytest_cache/
 .ipynb_checkpoints/
 .vscode/
+*.log
 
 # Dataset artifacts
 results/
@@ -26,12 +27,22 @@ selected_users_dataset/
 *.xls
 *.xlsx
 *.pdf
+*.ckpt
+*.yaml
+events.out.*
 data/
-GLOBEM/
-FEEL/
-domain_adaptation/
-analysis/
-D-4
+
+# DA verification outputs
+DA_Verification/CGDM/DA_Verification/
+DA_Verification/CGDM/cgdm_only/
+DA_Verification/CGDM/**/metrics.json
+DA_Verification/CGDM/**/metrics.txt
+DA_Verification/CGDM/**/tsne_*.jpg
+DA_Verification/CGDM/**/pca_*.jpg
+DA_Verification/CGDM/**/tsne_*.png
+DA_Verification/CGDM/**/pca_*.png
+DA_Verification/CGDM/**/*.pt
+DA_Verification/CGDM/**/*.pth
 
 
 # Folders
@@ -40,7 +51,6 @@ FEEL/
 domain_adaptation/
 analysis/
 D-4
-
 
 # OS junk
 .DS_Store

@@ -11,10 +11,6 @@ DEFAULT_ARGS=(
   --scenarios "GLOBEM+D-2->D-3"
 )
 
-# 0.2 0.4 0.6
-# recevied results dl_erm dl_clustering dl_reorder dl_masf dl_dann dl_irm dl_csd dl_mldg
-# error dl_siamese
-
 if [[ "$#" -eq 0 ]]; then
   args=("${DEFAULT_ARGS[@]}")
 else

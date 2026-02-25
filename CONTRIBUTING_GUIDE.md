@@ -60,20 +60,20 @@ Goal: Leverage specialized architectures for tabular data (beyond simple MLP/Res
     - **Rationale**: Directly minimizes class confusion on the target domain. A non-adversarial, class-wise alignment method.
     - **Code Source**: [thuml/Transfer-Learning-Library/MCC](https://github.com/thuml/Transfer-Learning-Library/blob/master/examples/domain_adaptation/image_classification/mcc.py)
     - **Paper**: Jin et al., 2020 (ECCV).
-- [ ] **ADDA (Adversarial Discriminative Domain Adaptation)**
-    - **Rationale**: Decouples source and target encoders with GAN loss.
-    - **Code Source**: [jvanvugt/pytorch-domain-adaptation](https://github.com/jvanvugt/pytorch-domain-adaptation)
+- [x] **ADDA (Adversarial Discriminative Domain Adaptation)** (Implemented)
+    - **Rationale**: Decouples source and target encoders with GAN loss. (Implemented as Phase 1 Pretraining for Within-Dataset Benchmark).
+    - **Code Source**: Adapted from [jvanvugt/pytorch-domain-adaptation](https://github.com/jvanvugt/pytorch-domain-adaptation)
     - **Paper**: Tzeng et al., 2017 (CVPR).
-- [ ] **DAN (Deep Adaptation Network)** / **JAN (Joint Adaptation Network)**
-    - **Rationale**: MMD-based distribution alignment. JAN aligns joint distributions of features and labels.
+- [x] **JAN (Joint Adaptation Network)** (Implemented)
+    - **Rationale**: MMD-based distribution alignment. JAN aligns joint distributions of features and labels using JMMD.
     - **Code Source**: [thuml/Transfer-Learning-Library/DAN](https://github.com/thuml/Transfer-Learning-Library/blob/master/examples/domain_adaptation/image_classification/dan.py)
-    - **Paper**: Long et al., 2015/2017 (ICML).
-- [ ] **MCD (Maximum Classifier Discrepancy)**
+    - **Paper**: Long et al., 2017 (ICML).
+- [x] **MCD (Maximum Classifier Discrepancy)** (Implemented)
     - **Rationale**: Uses two classifiers to align distributions by minimizing their discrepancy on target data.
     - **Code Source**: [mil-tokyo/MCD_DA](https://github.com/mil-tokyo/MCD_DA)
     - **Paper**: Saito et al., 2018 (CVPR).
-- [ ] **SHOT (Source Hypothesis Transfer)**
-    - **Rationale**: Recent SOTA for Source-Free Domain Adaptation (SFDA). Adapts using information maximization and pseudo-labeling without source data.
+- [x] **SHOT (Source Hypothesis Transfer)** (Implemented)
+    - **Rationale**: Recent SOTA for Source-Free Domain Adaptation (SFDA). Adapts using information maximization and pseudo-labeling.
     - **Code Source**: [tim-learn/SHOT](https://github.com/tim-learn/SHOT)
     - **Paper**: Liang et al., 2020 (ICML).
 - [ ] **CBST (Class-Balanced Self-Training)**
@@ -122,6 +122,26 @@ Goal: Train on source domains to generalize to unseen target domains.
     - **Source**: Shi et al., 2021 (ICLR).
 
 
+
+### Tabular Deep Learning & Transformers
+Goal: Modern architectures specifically designed for tabular data, including high-dimensional feature sets.
+
+**Implemented:**
+- [x] **TabTransformer** (Implemented)
+    - **Rationale**: Transformer encoder for tabular data. Handles categorical embeddings effectively.
+    - **Code Source**: `pytorch-widedeep` / Huang et al., 2020.
+- [x] **FastFormer** (Implemented)
+    - **Rationale**: Efficient Additive Attention ($O(N)$). Crucial for datasets with many features (>100 features).
+    - **Code Source**: `pytorch-widedeep` / Wu et al., 2021.
+- [x] **Perceiver** (Implemented)
+    - **Rationale**: Latent Attention. Decouples compute from input size, enabling handling of very high-dimensional data.
+    - **Code Source**: `pytorch-widedeep` / Jaegle et al., 2021 (DeepMind).
+- [x] **TabNet** (Implemented)
+    - **Rationale**: Attentive interpretable tabular learning.
+    - **Code Source**: `pytorch-tabnet` / Arik & Pfister, 2020.
+- [x] **NODE (Neural Oblivious Decision Ensembles)** (Implemented)
+    - **Rationale**: Deep learning architecture that mimics decision trees.
+    - **Code Source**: `pytorch_tabular` / Popov et al., 2019.
 
 ---
 
@@ -251,3 +271,18 @@ elif args.model == 'MyDAModel':
 3.  [ ] **Backbone**: Ensure strict usage of `hparams['backbone']` to select `MLP`, `ResNet`, etc.
 4.  [ ] **Execution**: Update `execute_benchmark.py` imports, arguments, and training calls.
 5.  [ ] **Verify**: Run `python execute_benchmark.py --dataset D-1 --model MyNewAlgo --epochs 1` to test.
+
+
+---
+
+## Model Limitations & Best Practices
+
+### TabPFN (Tabular Prior-Data Fitted Network)
+**Limitations:**
+- **Dataset Size:** TabPFN is designed for small to medium-sized datasets. It has a hard limit on input size (typically 2048 samples) and feature count (100 features).
+- **Subsampling:** For datasets larger than these limits, the model requires subsampling. This can lead to significant information loss and suboptimal performance on large-scale datasets (like D-3 with >20k samples).
+- **Recommendation:** Avoid using TabPFN for large-scale benchmarks (>5k samples, >100 features) unless investigating few-shot performance or specific subsampling strategies.
+
+### Tabular Deep Learning Models (SAINT, TabTransformer, etc.)
+- Ensure hyperparameters match the specific implementation (e.g., `pytorch-widedeep`).
+- Use `n_jobs` for data loading carefully to avoid CPU bottlenecks.

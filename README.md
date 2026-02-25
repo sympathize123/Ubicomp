@@ -1,87 +1,92 @@
-# Ubicomp Stress Detection Benchmark
+# Stress Detection Benchmark: Domain Generalization & Adaptation
 
-This repository contains the source code for benchmarking **Domain Generalization (DG)** and **Domain Adaptation (DA)** methods on wearable stress detection datasets. The project aims to evaluate model performance under user-based domain shifts using a backbone-agnostic approach.
+## 📌 Project Overview
+This repository hosts a rigorous **Within-Dataset Benchmark** for Stress Detection using wearable physiological data. It integrates state-of-the-art **Domain Generalization (DG)** and **Domain Adaptation (DA)** algorithms, alongside modern **Tabular Deep Learning** models and **Foundation Models**.
 
-## 📂 Directory Structure
+The goal is to evaluate if advanced alignment techniques can improve generalization across users (subjects) in physiological stress detection tasks, adhering to strict protocols (NeurIPS/DomainBed standards).
 
-The codebase has been refactored to a `src/` based architecture for better modularity.
+---
+
+## 📂 Project Structure
 
 ```
 Ubicomp/
+├── execute_benchmark.py    # MAIN ENTRY POINT: Run experiments
+├── PLANNING.md             # Detailed Roadmap, Rules, and Benchmark Protocol
+├── CONTRIBUTING_GUIDE.md   # How to implement new DG/DA models
 ├── src/
-│   ├── models.py           # Standard Baselines (XGB, LGB, MLP, ResNet, TabNet...)
-│   ├── da_models.py        # Domain Adaptation Models (DANN, CDAN, MCC, DeepCORAL...)
-│   ├── domainbed_algos.py  # Domain Generalization Algorithms (IRM, GroupDRO, MixStyle...)
-│   ├── backbones.py        # Shared Feature Extractors (MLP, ResNet, Transformer)
-│   └── data_loader.py      # Data Loading & Processing (User-wise Normalization)
-├── execute_benchmark.py    # Main Entry Point for Running Experiments
-└── run_benchmark_all.sh    # Optimization & Batch Execution Script
+│   ├── models.py           # Tabular DL Models (TabNet, SAINT, NODE, etc.)
+│   ├── da_models.py        # DA Models (DANN, CDAN, ADDA, MCD, JAN, SHOT)
+│   ├── domainbed_algos.py  # DG Models (IRM, VREx, GroupDRO, MixStyle, etc.)
+│   ├── backbones.py        # Shared Backbones (MLP, ResNet, Transformer)
+│   ├── data_loader.py      # Data loading & preprocessing
+│   └── hparams_registry.py # Hyperparameter definitions
+└── archive/                # Deprecated files & old analysis
 ```
+
+---
 
 ## 🚀 Supported Algorithms
 
-Detailed descriptions and implementation status can be found in [CONTRIBUTING_GUIDE.md](CONTRIBUTING_GUIDE.md).
+We support over 20+ algorithms across three categories. See `CONTRIBUTING_GUIDE.md` for implementation details.
 
-### 1. Standard Baselines
-- **XGBoost**, **LightGBM** (Tree-based)
-- **MLP**, **ResNet** (Deep Tabular)
-- *Planned*: TabNet, FT-Transformer, TabPFN
+### 1. Domain Adaptation (DA)
+*Strategies to align Source (Train) and Target (Test) distributions.*
+- **Adversarial**: DANN, CDAN, ADDA
+- **Statistical**: DeepCORAL, JAN (JMMD), MCC
+- **Source-free**: SHOT
+- **Discrepancy**: MCD
 
 ### 2. Domain Generalization (DG)
-- **ERM** (Empirical Risk Minimization - Baseline)
-- **IRM** (Invariant Risk Minimization)
-- **V-REx** (Variance Risk Extrapolation)
-- **GroupDRO** (Group Distributionally Robust Optimization)
-- **MixStyle** (Domain Mixing for features)
-- **MLDG** (Meta-Learning for Domain Generalization)
-- **MASF** (Domain-Invariant Feature Learning)
+*Learning invariant features across training domains to generalize to unseen domains.*
+- **Optimization**: IRM, VREx, GroupDRO
+- **Feature Alignment**: MASF, MixStyle
+- **Meta-Learning**: MLDG
+- **Baseline**: ERM (Empirical Risk Minimization)
 
-### 3. Domain Adaptation (DA)
-- **DANN** (Domain-Adversarial Neural Network)
-- **CDAN** (Conditional Adversarial Domain Adaptation)
-- **MCC** (Minimum Class Confusion)
-- **DeepCORAL** (Correlation Alignment)
-- *Planned*: ADDA, MCD, SHOT, JAN
+### 3. Transformers & Tabular Deep Learning
+- **TabNet** (Arik & Pfister, 2020)
+- **SAINT** (Somepalli et al., 2021)
+- **TabTransformer** (Huang et al., 2020)
+- **FT-Transformer** (Gorishniy et al., 2021)
+- **FastFormer** (Wu et al., 2021): Efficient Additive Attention ($O(N)$ complexity). Recommended for high-dimensional feature sets (e.g., >1000 features).
+- **Perceiver** (Jaegle et al., 2021): Latent Attention mechanism. Handles very large input dimensions by projecting to a fixed-size latent space.
 
-## 🛠 Usage
+*Note: TabPFN is excluded from large-scale benchmarks due to memory/time constraints ($N > 10,000$, $D > 100$).*
 
-### Prerequisites
-Ensure you have the necessary dependencies installed (PyTorch, Scikit-learn, XGBoost, LightGBM).
+---
+
+## 🛠️ Usage
+
+### Environment
+Ensure you are in the correct Conda environment:
 ```bash
-conda activate navsim  # Or your preferred environment
+conda activate navsim
 ```
 
-### Running a Benchmark
-Use `execute_benchmark.py` to run a specific model on a dataset.
+### Running the Benchmark
+Use `execute_benchmark.py` to run experiments.
+
+**Basic Command:**
+```bash
+python execute_benchmark.py --dataset D-1 --model DANN --backbone MLP --epochs 50
+```
 
 **Arguments:**
 - `--dataset`: `D-1`, `D-2`, `D-3`
-- `--model`: Model name (e.g., `DANN`, `IRM`, `XGB`, `ResNet`)
+- `--model`: Choose from supported models (e.g., `XGB`, `TabNet`, `DANN`, `IRM`, `ADDA`, `SHOT`...)
 - `--backbone`: `MLP`, `ResNet`, `Transformer` (for DG/DA models)
-- `--epochs`: Number of training epochs (default: 50)
+- `--lr`: Learning rate (default: 1e-3)
+- `--batch_size`: Batch size (default: 64)
 
-**Example 1: Run DANN with ResNet backbone on D-1**
-```bash
-python3 execute_benchmark.py --dataset D-1 --model DANN --backbone ResNet --epochs 50
-```
+---
 
-**Example 2: Run MCC with MLP backbone**
-```bash
-python3 execute_benchmark.py --dataset D-1 --model MCC --backbone MLP
-```
+## 📚 Documentation & Planning
 
-**Example 3: Run XGBoost Baseline**
-```bash
-python3 execute_benchmark.py --dataset D-1 --model XGB
-```
+- **[PLANNING.md](PLANNING.md)**: The central "Source of Truth" for the project roadmap, experimental design, and HPO protocols. **Check this for the current project status.**
+- **[CONTRIBUTING_GUIDE.md](CONTRIBUTING_GUIDE.md)**: Detailed guide on adding new algorithms and understanding the code structure.
 
-## 📊 Evaluation Protocol
-- **Validation Strategy**: User-based Temporal Split (60% Train / 20% Val / 20% Test).
-- **Metric**: Accuracy, F1-Score, AUROC.
-- **Seeds**: Experiments are averaged over 3 random seeds (42, 0, 1).
+---
 
-## 📅 Roadmap & Planning
-Check [PLANNING.md](PLANNING.md) for the detailed implementation roadmap and future phases (Tabular DL, Foundation Models, HPO).
-
-## 🤝 Contributing
-See [CONTRIBUTING_GUIDE.md](CONTRIBUTING_GUIDE.md) for instructions on adding new algorithms or datasets.
+## 📧 Contact & Maintenance
+Maintained by Minseo (ICLAB).
