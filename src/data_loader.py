@@ -124,7 +124,7 @@ class BenchmarkDataset:
         self.timestamps = self.timestamps[valid_indices]
         print(f"Taking {len(valid_indices)} samples after filtering.")
 
-    def normalize_features(self, train_idx, val_idx, test_idx):
+    def normalize_features(self, train_idx, val_idx=None, test_idx=None):
         print("Normalizing features per user (using Train-only statistics)...")
         unique_users = np.unique(self.users)
 
@@ -134,17 +134,16 @@ class BenchmarkDataset:
             user_train_indices = np.intersect1d(user_indices, train_idx)
 
             if len(user_train_indices) == 0:
-                mean = np.zeros(self.X.shape[1])
-                std = np.ones(self.X.shape[1])
+                user_X_all = self.X[user_indices]
+                mean = np.mean(user_X_all, axis=0)
+                std = np.std(user_X_all, axis=0)
             else:
                 user_X_train = self.X[user_train_indices]
                 mean = np.mean(user_X_train, axis=0)
                 std = np.std(user_X_train, axis=0)
-                std[std < 1e-6] = 1.0
 
-            user_X = self.X[user_mask]
-            normalized = (user_X - mean) / std
-            self.X[user_mask] = normalized.astype(np.float32)
+            std[std < 1e-6] = 1.0
+            self.X[user_mask] = ((self.X[user_mask] - mean) / std).astype(np.float32)
 
         clip_percentile = 99.9
         clip_min = 10.0
