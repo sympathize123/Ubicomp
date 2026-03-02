@@ -179,110 +179,84 @@ class WidedeepWrapper(BaseEstimator, ClassifierMixin):
         # Define Model
         if self.model_type == 'SAINT':
             if self.efficient_attention:
-                # NOTE: We do not implement linear attention ourselves.
-                # This path swaps SAINT -> TabFastFormer from pytorch_widedeep (linear/efficient attention).
-                print(f"[INFO] efficient_attention=True: Swapping SAINT -> FastFormer (Additive Attention O(N)) for efficiency.")
+                print("[INFO] efficient_attention=True: Swapping SAINT -> FastFormer (Additive Attention O(N)) for efficiency.")
                 from pytorch_widedeep.models import TabFastFormer
-                # Use SAINT params but adapted for FastFormer where applicable
                 ff_params = self.kwargs.copy()
+                _TRAIN_KEYS = {'lr', 'weight_decay', 'batch_size', 'mlp_dropout', 'num_layers', 'hidden_dim'}
+                for k in _TRAIN_KEYS: ff_params.pop(k, None)
                 if 'dropout' in ff_params:
                     dropout_val = ff_params.pop('dropout')
-                    if 'attn_dropout' not in ff_params: ff_params['attn_dropout'] = dropout_val
-                    if 'ff_dropout' not in ff_params: ff_params['ff_dropout'] = dropout_val
-                if 'input_dim' not in ff_params: ff_params['input_dim'] = 32
-                if 'n_heads' not in ff_params: ff_params['n_heads'] = 4
-                
-                deeptabular = TabFastFormer(column_idx=self.preprocessor.column_idx, continuous_cols=self.col_names, 
+                    ff_params.setdefault('attn_dropout', dropout_val)
+                    ff_params.setdefault('ff_dropout', dropout_val)
+                ff_params.setdefault('input_dim', 32)
+                ff_params.setdefault('n_heads', 4)
+                deeptabular = TabFastFormer(column_idx=self.preprocessor.column_idx, continuous_cols=self.col_names,
                                             embed_continuous_method='standard', **ff_params)
             else:
-                # SAINT parameters
                 saint_params = self.kwargs.copy()
+                _TRAIN_KEYS = {'lr', 'weight_decay', 'batch_size', 'mlp_dropout', 'num_layers', 'hidden_dim', 'transformer_dropout'}
+                for k in _TRAIN_KEYS: saint_params.pop(k, None)
                 if 'dropout' in saint_params:
-                    # Fix: SAINT usually takes dropout or transformer_dropout? 
-                    # If TabTransformer failed, likely SAINT does too.
-                    # SAINT sig: (..., transformer_dropout, ...) usually? 
-                    # Wait, if TabTransformer failed, SAINT likely uses same convention.
-                    # I'll map dropout to attn_dropout/ff_dropout here too just in case.
                     dropout_val = saint_params.pop('dropout')
-                    if 'transformer_dropout' not in saint_params: 
-                         # Try removing transformer_dropout assignment if it fails verification.
-                         # But SAINT paper uses transformer_dropout. 
-                         # I'll assume standard naming might be different. 
-                         # Safe bet: pass it as 'dropout' to kwargs if supported? No, specific args.
-                         # Let's try passing 'attn_dropout' and 'ff_dropout' as well.
-                         if 'attn_dropout' not in saint_params: saint_params['attn_dropout'] = dropout_val
-                         if 'ff_dropout' not in saint_params: saint_params['ff_dropout'] = dropout_val
-                
-                # Pop transformer_dropout if it exists in kwargs (double check)
-                if 'transformer_dropout' in saint_params:
-                     saint_params.pop('transformer_dropout')
-
-                deeptabular = SAINT(column_idx=self.preprocessor.column_idx, continuous_cols=self.col_names, 
+                    saint_params.setdefault('attn_dropout', dropout_val)
+                    saint_params.setdefault('ff_dropout', dropout_val)
+                deeptabular = SAINT(column_idx=self.preprocessor.column_idx, continuous_cols=self.col_names,
                                     **saint_params)
-                                
+
         elif self.model_type == 'TabTransformer':
             if self.efficient_attention:
-                # NOTE: We do not implement linear attention ourselves.
-                # This path swaps TabTransformer -> TabFastFormer from pytorch_widedeep (linear/efficient attention).
-                print(f"[INFO] efficient_attention=True: Swapping TabTransformer -> FastFormer (Additive Attention O(N)) for efficiency.")
+                print("[INFO] efficient_attention=True: Swapping TabTransformer -> FastFormer (Additive Attention O(N)) for efficiency.")
                 from pytorch_widedeep.models import TabFastFormer
                 ff_params = self.kwargs.copy()
+                _TRAIN_KEYS = {'lr', 'weight_decay', 'batch_size', 'mlp_dropout', 'num_layers', 'hidden_dim'}
+                for k in _TRAIN_KEYS: ff_params.pop(k, None)
                 if 'dropout' in ff_params:
                     dropout_val = ff_params.pop('dropout')
-                    if 'attn_dropout' not in ff_params: ff_params['attn_dropout'] = dropout_val
-                    if 'ff_dropout' not in ff_params: ff_params['ff_dropout'] = dropout_val
-                if 'input_dim' not in ff_params: ff_params['input_dim'] = 32
-                if 'n_heads' not in ff_params: ff_params['n_heads'] = 4
-                
-                deeptabular = TabFastFormer(column_idx=self.preprocessor.column_idx, continuous_cols=self.col_names, 
+                    ff_params.setdefault('attn_dropout', dropout_val)
+                    ff_params.setdefault('ff_dropout', dropout_val)
+                ff_params.setdefault('input_dim', 32)
+                ff_params.setdefault('n_heads', 4)
+                deeptabular = TabFastFormer(column_idx=self.preprocessor.column_idx, continuous_cols=self.col_names,
                                             embed_continuous_method='standard', **ff_params)
             else:
-                # TabTransformer parameters
                 tt_params = self.kwargs.copy()
-                
-                if 'input_dim' not in tt_params: tt_params['input_dim'] = 32
-                if 'n_heads' not in tt_params: tt_params['n_heads'] = 4
-                if 'n_blocks' not in tt_params: tt_params['n_blocks'] = 2
-                
-                # TabTransformer uses transformer_dropout -> Fix: likely uses attn_dropout/ff_dropout
+                _TRAIN_KEYS = {'lr', 'weight_decay', 'batch_size', 'mlp_dropout', 'num_layers', 'hidden_dim',
+                               'transformer_dropout', 'miscellaneous_dropout'}
+                for k in _TRAIN_KEYS: tt_params.pop(k, None)
                 if 'dropout' in tt_params:
-                     dropout_val = tt_params.pop('dropout')
-                     # Assume attn_dropout and ff_dropout exist if transformer_dropout failed
-                     if 'attn_dropout' not in tt_params: tt_params['attn_dropout'] = dropout_val
-                     if 'ff_dropout' not in tt_params: tt_params['ff_dropout'] = dropout_val
-                     if 'miscellaneous_dropout' in tt_params: tt_params['miscellaneous_dropout'] = dropout_val # If supported? No safe bet?
-                     # Do NOT set transformer_dropout as it fails
-
-                     # Do NOT set transformer_dropout as it fails
-                     if 'dropout' in tt_params: tt_params.pop('dropout') # Clean up if it was left
-
-                # Fix: TabTransformer (efficient -> FastFormer) failed with embed_continuous arg.
-                # Assuming TabTransformer standard also might fail if it uses embed_continuous, but error was transformer_dropout.
-                # But efficient uses TabFastFormer which failed.
-                deeptabular = TabTransformer(column_idx=self.preprocessor.column_idx, continuous_cols=self.col_names, 
+                    dropout_val = tt_params.pop('dropout')
+                    tt_params.setdefault('attn_dropout', dropout_val)
+                    tt_params.setdefault('ff_dropout', dropout_val)
+                tt_params.setdefault('input_dim', 32)
+                tt_params.setdefault('n_heads', 4)
+                tt_params.setdefault('n_blocks', 2)
+                deeptabular = TabTransformer(column_idx=self.preprocessor.column_idx, continuous_cols=self.col_names,
                                              embed_continuous_method='standard', **tt_params)
         elif self.model_type == 'FTTransformer':
+            _TRAIN_KEYS = {'lr', 'weight_decay', 'batch_size', 'mlp_dropout', 'num_layers', 'hidden_dim'}
             if self.efficient_attention:
                 print("[INFO] efficient_attention=True: Swapping FTTransformer -> FastFormer (Additive Attention O(N)) for efficiency.")
                 from pytorch_widedeep.models import TabFastFormer
                 ff_params = self.kwargs.copy()
+                for k in _TRAIN_KEYS: ff_params.pop(k, None)
                 if 'dropout' in ff_params:
                     dropout_val = ff_params.pop('dropout')
-                    if 'attn_dropout' not in ff_params: ff_params['attn_dropout'] = dropout_val
-                    if 'ff_dropout' not in ff_params: ff_params['ff_dropout'] = dropout_val
-                if 'input_dim' not in ff_params: ff_params['input_dim'] = 32
-                if 'n_heads' not in ff_params: ff_params['n_heads'] = 4
+                    ff_params.setdefault('attn_dropout', dropout_val)
+                    ff_params.setdefault('ff_dropout', dropout_val)
+                ff_params.setdefault('input_dim', 32)
+                ff_params.setdefault('n_heads', 4)
                 deeptabular = TabFastFormer(column_idx=self.preprocessor.column_idx, continuous_cols=self.col_names,
                                             embed_continuous_method='standard', **ff_params)
             else:
                 from pytorch_widedeep.models import FTTransformer
                 ft_params = self.kwargs.copy()
+                for k in _TRAIN_KEYS: ft_params.pop(k, None)
                 if 'dropout' in ft_params:
                     dropout_val = ft_params.pop('dropout')
-                    if 'attn_dropout' not in ft_params: ft_params['attn_dropout'] = dropout_val
-                    if 'ff_dropout' not in ft_params: ft_params['ff_dropout'] = dropout_val
-                if 'input_dim' not in ft_params: ft_params['input_dim'] = 32
-                if 'n_heads' not in ft_params: ft_params['n_heads'] = 4
+                    ft_params.setdefault('attn_dropout', dropout_val)
+                    ft_params.setdefault('ff_dropout', dropout_val)
+                ft_params.setdefault('input_dim', 32)
+                ft_params.setdefault('n_heads', 4)
                 deeptabular = FTTransformer(column_idx=self.preprocessor.column_idx, continuous_cols=self.col_names,
                                             embed_continuous_method='standard', **ft_params)
             

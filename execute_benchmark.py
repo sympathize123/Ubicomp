@@ -117,8 +117,13 @@ def train_model(args, X_train, y_train, d_train, X_val, y_val, d_val,
     elif args.model == 'TabPFN':
         model = TabPFNWrapper(seed=seed, subsample_seed=hparams.get('subsample_seed', None))
     elif args.model == 'SAINT':
-        model = WidedeepWrapper(model_type='SAINT', input_dim=hparams.get('input_dim', 32), n_heads=hparams.get('n_heads', 4),
-                                n_blocks=hparams.get('n_blocks', 2), dropout=hparams.get('dropout', 0.1), mlp_dropout=hparams.get('dropout', 0.1),
+        _input_dim = hparams.pop('input_dim', 32)
+        _n_heads = hparams.pop('n_heads', 4)
+        _n_blocks = hparams.pop('n_blocks', 2)
+        _dropout = hparams.pop('dropout', 0.1)
+        hparams.pop('lr', None)  # lr passed separately via WideTrainer
+        model = WidedeepWrapper(model_type='SAINT', input_dim=_input_dim, n_heads=_n_heads,
+                                n_blocks=_n_blocks, dropout=_dropout, mlp_dropout=_dropout,
                                 epochs=epochs, patience=patience, batch_size=batch_size,
                                 efficient_attention=args.efficient_attention, **hparams)
     elif args.model == 'TabTransformer':
