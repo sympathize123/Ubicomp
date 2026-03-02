@@ -59,7 +59,7 @@ def get_args():
     parser = argparse.ArgumentParser(description="Run Within-Dataset Benchmark")
     parser.add_argument('--dataset', type=str, required=True, choices=['D-1', 'D-2', 'D-3'])
     parser.add_argument('--label', type=str, default='stress_binary')
-    parser.add_argument('--model', type=str, required=True, choices=['XGB', 'LGB', 'MLP', 'ResNet', 'DANN', 'CDAN', 'DAN', 'DeepCORAL', 'MCC', 'ADDA', 'MCD', 'JAN', 'SHOT', 'CBST', 'CGDM', 'TabNet', 'TabPFN', 'SAINT', 'TabTransformer', 'DCN', 'IRM', 'VREx', 'GroupDRO', 'MixStyle', 'ERM_DG', 'MLDG', 'MASF', 'Fish', 'CSD', 'SagNet'])
+    parser.add_argument('--model', type=str, required=True, choices=['XGB', 'LGB', 'MLP', 'ResNet', 'DANN', 'CDAN', 'DAN', 'DeepCORAL', 'MCC', 'ADDA', 'MCD', 'JAN', 'SHOT', 'CBST', 'CGDM', 'TabNet', 'TabPFN', 'SAINT', 'TabTransformer', 'FTTransformer', 'DCN', 'AutoInt', 'IRM', 'VREx', 'GroupDRO', 'MixStyle', 'ERM_DG', 'MLDG', 'MASF', 'Fish', 'CSD', 'SagNet'])
     parser.add_argument('--backbone', type=str, default='MLP', choices=['MLP', 'ResNet', 'Transformer'])
     parser.add_argument('--epochs', type=int, default=50)
     parser.add_argument('--batch_size', type=int, default=64)
@@ -129,11 +129,24 @@ def train_model(args, X_train, y_train, d_train, X_val, y_val, d_val,
                                 n_blocks=_n_blocks, dropout=_dropout,
                                 epochs=epochs, patience=patience, batch_size=batch_size,
                                 efficient_attention=use_efficient, **hparams)
+    elif args.model == 'FTTransformer':
+        _input_dim = hparams.pop('input_dim', 32)
+        _n_heads = hparams.pop('n_heads', 4)
+        _n_blocks = hparams.pop('n_blocks', 2)
+        _dropout = hparams.pop('dropout', 0.1)
+        model = WidedeepWrapper(model_type='FTTransformer', input_dim=_input_dim, n_heads=_n_heads,
+                                n_blocks=_n_blocks, dropout=_dropout,
+                                epochs=epochs, patience=patience, batch_size=batch_size,
+                                efficient_attention=args.efficient_attention, **hparams)
     elif args.model == 'DCN':
         _dnn_hidden_units = hparams.pop('dnn_hidden_units', (256, 128))
         _dropout = hparams.pop('dropout', 0.1)
         model = DeepCTRWrapper(model_type='DCN', dnn_hidden_units=_dnn_hidden_units,
                                dnn_dropout=_dropout, batch_size=batch_size, epochs=epochs, patience=patience, **hparams)
+    elif args.model == 'AutoInt':
+        _dropout = hparams.pop('dropout', 0.1)
+        model = DeepCTRWrapper(model_type='AutoInt', dnn_dropout=_dropout,
+                               batch_size=batch_size, epochs=epochs, patience=patience, **hparams)
     elif args.model == 'MLP':
         net = MLP(input_dim=input_dim, hidden_dim=hidden_dim, num_layers=num_layers, dropout=dropout)
         model = train_torch_model(net, X_train, y_train, X_val, y_val,
@@ -227,7 +240,7 @@ def train_model(args, X_train, y_train, d_train, X_val, y_val, d_val,
                            epochs=epochs, batch_size=batch_size, lr=lr,
                            weight_decay=hparams.get('weight_decay', 5e-4))
 
-    if args.model in ['XGB', 'LGB', 'TabNet', 'TabPFN', 'SAINT', 'TabTransformer', 'DCN']:
+    if args.model in ['XGB', 'LGB', 'TabNet', 'TabPFN', 'SAINT', 'TabTransformer', 'FTTransformer', 'DCN', 'AutoInt']:
         model.fit(X_train, y_train, X_val, y_val)
     elif args.model in ['IRM', 'VREx', 'GroupDRO', 'MixStyle', 'MLDG', 'MASF', 'Fish', 'CSD', 'SagNet']:
         model = train_dg_model(model, X_train, y_train, d_train, X_val, y_val, d_val,

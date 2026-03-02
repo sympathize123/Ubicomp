@@ -10,6 +10,10 @@ from tabpfn import TabPFNClassifier
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
+import copy
+from typing import Dict, Any, Optional
+from tqdm import tqdm
 
 # Imports for new libraries: Moved to inside wrappers for lazy loading and memory safety
 # import pandas as pd # Already imported at top
@@ -17,15 +21,16 @@ import torch.optim as optim
 # from pytorch_tabular...
 # from deepctr_torch...
 
-from torch.utils.data import DataLoader, TensorDataset
-import copy
-from typing import Dict, Any, Optional
 
 # --- Baseline Models ---
 
 class XGBoostWrapper(BaseEstimator, ClassifierMixin):
     def __init__(self, n_jobs=-1, patience=20, **kwargs):
         self.patience = patience
+        # Force CPU by default to avoid CUDA errors in some environments.
+        # Users can still override by passing tree_method/predictor explicitly.
+        kwargs.setdefault("tree_method", "hist")
+        kwargs.setdefault("predictor", "cpu_predictor")
         # XGBoost 2.0+ requires early_stopping_rounds in constructor
         # use_label_encoder is deprecated/removed in 3.0+
         self.model = xgb.XGBClassifier(eval_metric='auc', n_jobs=n_jobs, early_stopping_rounds=patience, **kwargs)
@@ -174,14 +179,18 @@ class WidedeepWrapper(BaseEstimator, ClassifierMixin):
         # Define Model
         if self.model_type == 'SAINT':
             if self.efficient_attention:
+                # NOTE: We do not implement linear attention ourselves.
+                # This path swaps SAINT -> TabFastFormer from pytorch_widedeep (linear/efficient attention).
                 print(f"[INFO] efficient_attention=True: Swapping SAINT -> FastFormer (Additive Attention O(N)) for efficiency.")
                 from pytorch_widedeep.models import TabFastFormer
                 # Use SAINT params but adapted for FastFormer where applicable
                 ff_params = self.kwargs.copy()
-                if 'dropout' in ff_params: ff_params.pop('dropout') # Cleanup
+                if 'dropout' in ff_params:
+                    dropout_val = ff_params.pop('dropout')
+                    if 'attn_dropout' not in ff_params: ff_params['attn_dropout'] = dropout_val
+                    if 'ff_dropout' not in ff_params: ff_params['ff_dropout'] = dropout_val
                 if 'input_dim' not in ff_params: ff_params['input_dim'] = 32
                 if 'n_heads' not in ff_params: ff_params['n_heads'] = 4
-                if 'dropout' in ff_params: del ff_params['dropout']
                 
                 deeptabular = TabFastFormer(column_idx=self.preprocessor.column_idx, continuous_cols=self.col_names, 
                                             embed_continuous_method='standard', **ff_params)
@@ -213,12 +222,17 @@ class WidedeepWrapper(BaseEstimator, ClassifierMixin):
                                 
         elif self.model_type == 'TabTransformer':
             if self.efficient_attention:
+                # NOTE: We do not implement linear attention ourselves.
+                # This path swaps TabTransformer -> TabFastFormer from pytorch_widedeep (linear/efficient attention).
                 print(f"[INFO] efficient_attention=True: Swapping TabTransformer -> FastFormer (Additive Attention O(N)) for efficiency.")
                 from pytorch_widedeep.models import TabFastFormer
                 ff_params = self.kwargs.copy()
+                if 'dropout' in ff_params:
+                    dropout_val = ff_params.pop('dropout')
+                    if 'attn_dropout' not in ff_params: ff_params['attn_dropout'] = dropout_val
+                    if 'ff_dropout' not in ff_params: ff_params['ff_dropout'] = dropout_val
                 if 'input_dim' not in ff_params: ff_params['input_dim'] = 32
                 if 'n_heads' not in ff_params: ff_params['n_heads'] = 4
-                if 'dropout' in ff_params: del ff_params['dropout']
                 
                 deeptabular = TabFastFormer(column_idx=self.preprocessor.column_idx, continuous_cols=self.col_names, 
                                             embed_continuous_method='standard', **ff_params)
@@ -247,42 +261,30 @@ class WidedeepWrapper(BaseEstimator, ClassifierMixin):
                 # But efficient uses TabFastFormer which failed.
                 deeptabular = TabTransformer(column_idx=self.preprocessor.column_idx, continuous_cols=self.col_names, 
                                              embed_continuous_method='standard', **tt_params)
-        elif self.model_type == 'FastFormer':
-            from pytorch_widedeep.models import TabFastFormer
-            ff_params = self.kwargs.copy()
-            if 'input_dim' not in ff_params: ff_params['input_dim'] = 32
-            if 'n_heads' not in ff_params: ff_params['n_heads'] = 4
-            if 'dropout' in ff_params: del ff_params['dropout']
-            
-            # FastFormer uses dropout or transformer_dropout? Usually dropout. 
-            # But just in case, check if error occurs.
-            # Assuming standard args are fine or handled by **kwargs if compatible.
-            
-            # Fix: TabFastFormer.__init__() got an unexpected keyword argument 'embed_continuous'
-            deeptabular = TabFastFormer(column_idx=self.preprocessor.column_idx, continuous_cols=self.col_names, 
-                                        embed_continuous_method='standard', **ff_params)
-        elif self.model_type == 'Perceiver':
-             from pytorch_widedeep.models import TabPerceiver
-             p_params = self.kwargs.copy()
-             if 'input_dim' not in p_params: p_params['input_dim'] = 32
-             if 'n_latents' not in p_params: p_params['n_latents'] = 32  # Good default for complexity reduction
-             if 'latent_dim' not in p_params: p_params['latent_dim'] = 64
-             
-             if 'dropout' in p_params: 
-                 dropout_val = p_params.pop('dropout')
-                 if 'attn_dropout' not in p_params: p_params['attn_dropout'] = dropout_val
-                 if 'ff_dropout' not in p_params: p_params['ff_dropout'] = dropout_val
-             else:
-                 # Default dropout if not specified
-                 dropout_val = 0.1 
-                 if 'attn_dropout' not in p_params: p_params['attn_dropout'] = dropout_val
-                 if 'ff_dropout' not in p_params: p_params['ff_dropout'] = dropout_val
-             
-             # Fix: TabPerceiver might also not accept embed_continuous
-             deeptabular = TabPerceiver(column_idx=self.preprocessor.column_idx, continuous_cols=self.col_names,
-         					   embed_continuous_method='standard', **p_params)
-        elif self.model_type == 'FT-Transformer':
-            pass
+        elif self.model_type == 'FTTransformer':
+            if self.efficient_attention:
+                print("[INFO] efficient_attention=True: Swapping FTTransformer -> FastFormer (Additive Attention O(N)) for efficiency.")
+                from pytorch_widedeep.models import TabFastFormer
+                ff_params = self.kwargs.copy()
+                if 'dropout' in ff_params:
+                    dropout_val = ff_params.pop('dropout')
+                    if 'attn_dropout' not in ff_params: ff_params['attn_dropout'] = dropout_val
+                    if 'ff_dropout' not in ff_params: ff_params['ff_dropout'] = dropout_val
+                if 'input_dim' not in ff_params: ff_params['input_dim'] = 32
+                if 'n_heads' not in ff_params: ff_params['n_heads'] = 4
+                deeptabular = TabFastFormer(column_idx=self.preprocessor.column_idx, continuous_cols=self.col_names,
+                                            embed_continuous_method='standard', **ff_params)
+            else:
+                from pytorch_widedeep.models import FTTransformer
+                ft_params = self.kwargs.copy()
+                if 'dropout' in ft_params:
+                    dropout_val = ft_params.pop('dropout')
+                    if 'attn_dropout' not in ft_params: ft_params['attn_dropout'] = dropout_val
+                    if 'ff_dropout' not in ft_params: ft_params['ff_dropout'] = dropout_val
+                if 'input_dim' not in ft_params: ft_params['input_dim'] = 32
+                if 'n_heads' not in ft_params: ft_params['n_heads'] = 4
+                deeptabular = FTTransformer(column_idx=self.preprocessor.column_idx, continuous_cols=self.col_names,
+                                            embed_continuous_method='standard', **ft_params)
             
         model = WideDeep(deeptabular=deeptabular)
         
@@ -339,102 +341,7 @@ class WidedeepWrapper(BaseEstimator, ClassifierMixin):
         X_tab = self.preprocessor.transform(df)
         return self.trainer.predict_proba(X_tab={'X_tab': X_tab})
 
-class PytorchTabularWrapper(BaseEstimator, ClassifierMixin):
-    def __init__(self, model_type='NODE', batch_size=64, epochs=50, patience=20, **kwargs):
-        self.model_type = model_type
-        self.batch_size = batch_size
-        self.epochs = epochs
-        self.patience = patience
-        self.kwargs = kwargs
-        self.tabular_model = None
-        self.col_names = None
 
-    def fit(self, X, y, X_val=None, y_val=None):
-        from pytorch_tabular import TabularModel
-        from pytorch_tabular.models import NodeConfig
-        from pytorch_tabular.config import DataConfig, TrainerConfig, OptimizerConfig
-
-        self.col_names = [f"col_{i}" for i in range(X.shape[1])]
-        df_train = pd.DataFrame(X, columns=self.col_names)
-        df_train['target'] = y
-        
-        df_val = None
-        if X_val is not None:
-            df_val = pd.DataFrame(X_val, columns=self.col_names)
-            df_val['target'] = y_val
-
-        # Configs
-        data_config = DataConfig(
-            target=['target'],
-            continuous_cols=self.col_names,
-            num_workers=0,
-            # Fix: NODE failed with batch size 1. Add drop_last=True if supported via kwargs?
-            # PytorchTabular 1.2.0 might not support drop_last in DataConfig directly. 
-            # But let's try assuming standard implementation proxies args to DataLoader or use handle_missing_values=False? 
-            # Actually, check if 'dataloader_kwargs' works?
-            # If not, we might need another way. 
-            # Safe bet: If this fails, we just hope verification passes or user fixes dataset size.
-            # But let's try passing it to mimic standard DL.
-            # ... DataConfig(..., drop_last=True) might TypeError.
-            # Let's try finding 'dataloader_config' if 1.2.0? 1.2.0 introduced it.
-            # But we are using DataConfig separately. 
-            # I will omit drop_last here to avoid TypeError if inspection failed. 
-        )
-        trainer_config = TrainerConfig(
-            max_epochs=self.epochs,
-            batch_size=self.batch_size, 
-            accelerator='gpu' if torch.cuda.is_available() else 'cpu',
-            devices=1,
-            early_stopping_patience=self.patience
-        )
-        
-        if self.model_type == 'NODE':
-            # Fix: Remove kwargs that are already passed explicitly
-            if 'num_layers' in self.kwargs: self.kwargs.pop('num_layers')
-            if 'num_trees' in self.kwargs: self.kwargs.pop('num_trees') 
-            if 'depth' in self.kwargs: self.kwargs.pop('depth')
-
-            model_config = NodeConfig(
-                task='classification',
-                num_layers=2,
-                num_trees=512, 
-                depth=6,
-                **self.kwargs
-            )
-            
-        self.tabular_model = TabularModel(
-            data_config=data_config,
-            model_config=model_config,
-            optimizer_config=OptimizerConfig(),
-            trainer_config=trainer_config
-        )
-        
-        self.tabular_model.fit(train=df_train, validation=df_val)
-        return self
-
-    def predict(self, X):
-        df = pd.DataFrame(X, columns=self.col_names)
-        # Pytorch Tabular predict returns dataframe usually
-        pred_df = self.tabular_model.predict(df)
-        if 'target_prediction' in pred_df.columns:
-             return pred_df['target_prediction'].values
-        return pred_df['prediction'].values
-
-    def predict_proba(self, X):
-        df = pd.DataFrame(X, columns=self.col_names)
-        pred_df = self.tabular_model.predict(df)
-        # Returns probability for class 1? Check docs. Usually class_0_probability, class_1_probability
-        print(f"DEBUG: PytorchTabular prediction columns: {pred_df.columns}")
-        if '1_probability' in pred_df.columns:
-             return pred_df[['0_probability', '1_probability']].values
-        elif 'class_1_probability' in pred_df.columns:
-             return pred_df[['class_0_probability', 'class_1_probability']].values
-        elif 'target_1_probability' in pred_df.columns:
-             return pred_df[['target_0_probability', 'target_1_probability']].values
-        elif 'target_prediction' in pred_df.columns:
-             return pred_df['target_prediction'].values # Fallback (class labels)
-        
-        return pred_df['prediction'].values # Fallback
 
 class DeepCTRWrapper(BaseEstimator, ClassifierMixin):
     def __init__(self, model_type='DCN', batch_size=64, epochs=50, patience=20, **kwargs):
@@ -447,20 +354,20 @@ class DeepCTRWrapper(BaseEstimator, ClassifierMixin):
         self.feature_columns = None
 
     def fit(self, X, y, X_val=None, y_val=None):
-        from deepctr_torch.inputs import SparseFeat, DenseFeat, get_feature_names
-        from deepctr_torch.models import DCN
+        from deepctr_torch.inputs import DenseFeat
         from deepctr_torch.callbacks import EarlyStopping
-        
-        # DeepCTR expects dict input
+
         feature_names = [f"feat_{i}" for i in range(X.shape[1])]
         self.feature_columns = [DenseFeat(name, 1) for name in feature_names]
-        
         train_model_input = {name: X[:, i] for i, name in enumerate(feature_names)}
-        
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        
+
         if self.model_type == 'DCN':
+            from deepctr_torch.models import DCN
             self.model = DCN(self.feature_columns, self.feature_columns, task='binary', device=device, **self.kwargs)
+        elif self.model_type == 'AutoInt':
+            from deepctr_torch.models import AutoInt
+            self.model = AutoInt(self.feature_columns, self.feature_columns, task='binary', device=device, **self.kwargs)
             
         self.model.compile("adam", "binary_crossentropy", metrics=['binary_crossentropy', 'auc'])
         
@@ -547,10 +454,11 @@ class ResNet(nn.Module):
 
 # --- Training Loop for DL ---
 
-from tqdm import tqdm
 
 def train_torch_model(model, X_train, y_train, X_val, y_val, 
-                      epochs=50, batch_size=64, lr=1e-3, patience=5, device='cuda' if torch.cuda.is_available() else 'cpu'):
+                      epochs=50, batch_size=64, lr=1e-3, patience=5,
+                      device='cuda' if torch.cuda.is_available() else 'cpu',
+                      X_test=None, y_test=None):
     
     model = model.to(device)
     criterion = nn.CrossEntropyLoss()
@@ -565,6 +473,40 @@ def train_torch_model(model, X_train, y_train, X_val, y_val,
     criterion = nn.CrossEntropyLoss()
     
     epoch_iterator = tqdm(range(epochs), desc="Training Epochs")
+
+    def _evaluate_test():
+        if X_test is None or y_test is None:
+            return None, None
+        test_dataset = TensorDataset(
+            torch.tensor(X_test, dtype=torch.float32),
+            torch.tensor(y_test, dtype=torch.long)
+        )
+        test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+        all_probs = []
+        all_targets = []
+        correct = 0
+        total = 0
+        with torch.no_grad():
+            for X_batch, y_batch in test_loader:
+                X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+                outputs = model(X_batch)
+                probs = torch.softmax(outputs, dim=1)
+                preds = torch.argmax(probs, dim=1)
+                correct += (preds == y_batch).sum().item()
+                total += y_batch.size(0)
+                all_probs.append(probs.cpu().numpy())
+                all_targets.append(y_batch.cpu().numpy())
+        acc = correct / max(1, total)
+        all_probs = np.concatenate(all_probs, axis=0)
+        all_targets = np.concatenate(all_targets, axis=0)
+        try:
+            if all_probs.shape[1] == 2:
+                auroc = roc_auc_score(all_targets, all_probs[:, 1])
+            else:
+                auroc = roc_auc_score(all_targets, all_probs, multi_class='ovr', average='macro')
+        except Exception:
+            auroc = 0.5
+        return acc, auroc
     
     best_val_score = -float('inf')  # Changed from best_val_loss (inf)
     best_model_state = None
@@ -621,7 +563,11 @@ def train_torch_model(model, X_train, y_train, X_val, y_val,
                 epoch_iterator.write(f"Early stopping at epoch {epoch} (Best AUROC: {best_val_score:.4f})")
                 break
         
-        epoch_iterator.set_postfix({'Loss': f'{train_loss:.4f}', 'Val Loss': f'{val_loss:.4f}', 'Val AUC': f'{val_auroc:.4f}'})
+        test_acc, test_auroc = _evaluate_test()
+        postfix = {'Loss': f'{train_loss:.4f}', 'Val Loss': f'{val_loss:.4f}', 'Val AUC': f'{val_auroc:.4f}'}
+        if test_acc is not None:
+            postfix.update({'Test Acc': f'{test_acc:.4f}', 'Test AUC': f'{test_auroc:.4f}'})
+        epoch_iterator.set_postfix(postfix)
     
     if best_model_state:
         model.load_state_dict(best_model_state)

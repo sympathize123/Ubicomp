@@ -125,20 +125,24 @@ def get_hparams(algorithm, dataset, backbone='MLP'):
         hparams['n_blocks'] = lambda trial: trial.suggest_int('n_blocks', 1, 4)
         hparams['dropout'] = lambda trial: trial.suggest_float('dropout', 0.0, 0.3)
         hparams['lr'] = lambda trial: trial.suggest_float('lr', 1e-4, 1e-3, log=True)
-
-    elif algorithm == 'NODE':
-        hparams['num_layers'] = lambda trial: trial.suggest_int('num_layers', 2, 8)
-        hparams['num_trees'] = lambda trial: trial.suggest_categorical('num_trees', [256, 512, 1024])
-        hparams['depth'] = lambda trial: trial.suggest_int('depth', 4, 8)
+    elif algorithm == 'FTTransformer':
+        hparams['input_dim'] = lambda trial: trial.suggest_categorical('input_dim', [16, 32, 64])
+        hparams['n_heads'] = lambda trial: trial.suggest_categorical('n_heads', [2, 4, 8])
+        hparams['n_blocks'] = lambda trial: trial.suggest_int('n_blocks', 1, 4)
+        hparams['dropout'] = lambda trial: trial.suggest_float('dropout', 0.0, 0.3)
         hparams['lr'] = lambda trial: trial.suggest_float('lr', 1e-4, 1e-3, log=True)
-        
+
     elif algorithm == 'DCN':
         hparams['dnn_hidden_units'] = lambda trial: trial.suggest_categorical('dnn_hidden_units', [(128, 128), (256, 128), (256, 256)])
         hparams['dropout'] = lambda trial: trial.suggest_float('dropout', 0.0, 0.5)
-        
+
+    elif algorithm == 'AutoInt':
+        hparams['dropout'] = lambda trial: trial.suggest_float('dropout', 0.0, 0.3)
+        hparams['att_layer_num'] = lambda trial: trial.suggest_int('att_layer_num', 1, 4)
+        hparams['att_embedding_dim'] = lambda trial: trial.suggest_categorical('att_embedding_dim', [32, 64, 128])
+        hparams['att_head_num'] = lambda trial: trial.suggest_categorical('att_head_num', [2, 4, 8])
+
     elif algorithm == 'TabPFN':
-        # TabPFN has no structural hyperparameters to tune, but for large datasets, 
-        # the subsampling is critical. We treat the random seed for subsampling as a hyperparameter.
         hparams['subsample_seed'] = lambda trial: trial.suggest_int('subsample_seed', 0, 10000)
 
     # 4. Tree-based (XGB/LGB)
