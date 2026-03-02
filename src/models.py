@@ -576,27 +576,31 @@ def train_torch_model(model, X_train, y_train, X_val, y_val,
 
 def evaluate_model(model, X_test, y_test, device='cuda' if torch.cuda.is_available() else 'cpu'):
     is_torch = isinstance(model, nn.Module)
-    
+
     if is_torch:
         model.eval()
         model.to(device)
+        X_tensor = torch.tensor(X_test, dtype=torch.float32).to(device)
         with torch.no_grad():
-            X_tensor = torch.tensor(X_test, dtype=torch.float32).to(device)
-            outputs = model(X_tensor)
-            probs = torch.softmax(outputs, dim=1).cpu().numpy()
-            preds = np.argmax(probs, axis=1)
+            if hasattr(model, 'predict'):
+                # DG/DA models (DGModel, DAModel subclasses) expose predict() not forward()
+                logits = model.predict(X_tensor)
+            else:
+                logits = model(X_tensor)
+        probs = torch.softmax(logits, dim=1).cpu().numpy()
+        preds = np.argmax(probs, axis=1)
     else:
         probs = model.predict_proba(X_test)
         preds = model.predict(X_test)
-        
+
     acc = accuracy_score(y_test, preds)
-    f1 = f1_score(y_test, preds, average='macro') # Macro F1 for generic checking
+    f1 = f1_score(y_test, preds, average='macro')
     try:
         if probs.shape[1] == 2:
             auroc = roc_auc_score(y_test, probs[:, 1])
         else:
             auroc = roc_auc_score(y_test, probs, multi_class='ovr')
-    except:
+    except Exception:
         auroc = 0.5
-        
+
     return {"Accuracy": acc, "F1": f1, "AUROC": auroc}
