@@ -125,7 +125,6 @@ class BenchmarkDataset:
         print(f"Taking {len(valid_indices)} samples after filtering.")
 
     def normalize_features(self, train_idx, val_idx=None, test_idx=None):
-        print("Normalizing features per user (using Train-only statistics)...")
         unique_users = np.unique(self.users)
 
         for user in unique_users:
@@ -158,7 +157,6 @@ class BenchmarkDataset:
         clip_value = float(np.percentile(sample, clip_percentile))
         if clip_value < clip_min:
             clip_value = clip_min
-        print(f"Clipping normalized features to ±{clip_value:.4f} (p{clip_percentile}, min {clip_min})")
         self.X = np.clip(self.X, -clip_value, clip_value).astype(np.float32)
 
     def get_temporal_splits(self, train_ratio: float = 0.6, val_ratio: float = 0.2):
