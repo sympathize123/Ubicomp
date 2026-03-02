@@ -1,12 +1,12 @@
 import numpy as np
 import pandas as pd
-from src.data_loader import StressDataset
+from src.data_loader import BenchmarkDataset
 
 def verify_loader():
     dataset_path = "/home/iclab/minseo/CHI/data/Archived/stress_binary_personal-full.pkl"
     print(f"Testing with {dataset_path}")
     
-    ds = StressDataset("D-1", dataset_path)
+    ds = BenchmarkDataset("D-1", dataset_path)
     
     # Verify Normalization
     print("\nVerifying Normalization per user...")
