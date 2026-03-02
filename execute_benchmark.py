@@ -227,9 +227,9 @@ def train_model(args, X_train, y_train, d_train, X_val, y_val, d_val,
                            epochs=epochs, batch_size=batch_size, lr=lr,
                            weight_decay=hparams.get('weight_decay', 5e-4))
 
-    if args.model in ['XGB', 'LGB', 'TabNet', 'TabPFN', 'SAINT', 'TabTransformer', 'FastFormer', 'Perceiver', 'NODE', 'DCN']:
+    if args.model in ['XGB', 'LGB', 'TabNet', 'TabPFN', 'SAINT', 'TabTransformer', 'DCN']:
         model.fit(X_train, y_train, X_val, y_val)
-    elif args.model in ['IRM', 'VREx', 'GroupDRO', 'MixStyle', 'ERM_DG', 'MLDG', 'MASF', 'Fish', 'CSD', 'SagNet']:
+    elif args.model in ['IRM', 'VREx', 'GroupDRO', 'MixStyle', 'MLDG', 'MASF', 'Fish', 'CSD', 'SagNet']:
         model = train_dg_model(model, X_train, y_train, d_train, X_val, y_val, d_val,
                                epochs=epochs, batch_size=batch_size, domains_per_batch=8, patience=patience)
 
