@@ -353,7 +353,7 @@ def main():
                     return 0.0
             return float(np.mean(scores)) if scores else 0.0
 
-        study = optuna.create_study(direction='maximize')
+        study = optuna.create_study(direction='maximize', sampler=optuna.samplers.TPESampler(seed=42))
         study.optimize(objective, n_trials=args.hpo_trials)
         print("Best HPO params:", study.best_params)
         return study.best_params
