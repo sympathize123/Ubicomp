@@ -10,7 +10,7 @@ import sys
 import time
 from pathlib import Path
 from src.data_loader import BenchmarkDataset
-from src.models import XGBoostWrapper, LightGBMWrapper, MLP, ResNet, TabNetWrapper, TabPFNWrapper, WidedeepWrapper, PytorchTabularWrapper, DeepCTRWrapper, train_torch_model, evaluate_model
+from src.models import XGBoostWrapper, LightGBMWrapper, MLP, ResNet, TabNetWrapper, TabPFNWrapper, WidedeepWrapper, DeepCTRWrapper, train_torch_model, evaluate_model
 from src.da_models import DANN, CDAN, DAN, DeepCORAL, MCC, ADDA, MCD, JAN, SHOT, CBST, CGDM, MCDInferenceWrapper, train_adversarial_da, train_mcd, train_dann, train_cdan, train_adda, train_jan, train_shot, train_cbst, train_deepcoral, train_mcc, train_dan, train_cgdm
 from src.domainbed_algos import ERM as DG_ERM, IRM, VREx, GroupDRO, MixStyle, MLDG, MASF, Fish, CSD, SagNet, train_dg_model
 from src.hparams_registry import get_hparams
@@ -64,7 +64,7 @@ def get_args():
     parser = argparse.ArgumentParser(description="Run Within-Dataset Benchmark")
     parser.add_argument('--dataset', type=str, required=True, choices=['D-1', 'D-2', 'D-3'])
     parser.add_argument('--label', type=str, default='stress_binary')
-    parser.add_argument('--model', type=str, required=True, choices=['XGB', 'LGB', 'MLP', 'ResNet', 'DANN', 'CDAN', 'DAN', 'DeepCORAL', 'MCC', 'ADDA', 'MCD', 'JAN', 'SHOT', 'CBST', 'CGDM', 'TabNet', 'TabPFN', 'SAINT', 'TabTransformer', 'FastFormer', 'Perceiver', 'NODE', 'DCN', 'IRM', 'VREx', 'GroupDRO', 'MixStyle', 'ERM_DG', 'MLDG', 'MASF', 'Fish', 'CSD', 'SagNet'])
+    parser.add_argument('--model', type=str, required=True, choices=['XGB', 'LGB', 'MLP', 'ResNet', 'DANN', 'CDAN', 'DAN', 'DeepCORAL', 'MCC', 'ADDA', 'MCD', 'JAN', 'SHOT', 'CBST', 'CGDM', 'TabNet', 'TabPFN', 'SAINT', 'TabTransformer', 'DCN', 'IRM', 'VREx', 'GroupDRO', 'MixStyle', 'ERM_DG', 'MLDG', 'MASF', 'Fish', 'CSD', 'SagNet'])
     parser.add_argument('--backbone', type=str, default='MLP', choices=['MLP', 'ResNet', 'Transformer'])
     parser.add_argument('--epochs', type=int, default=50)
     parser.add_argument('--batch_size', type=int, default=64)
@@ -134,21 +134,6 @@ def train_model(args, X_train, y_train, d_train, X_val, y_val, d_val,
                                 n_blocks=_n_blocks, dropout=_dropout,
                                 epochs=epochs, patience=patience, batch_size=batch_size,
                                 efficient_attention=use_efficient, **hparams)
-    elif args.model == 'FastFormer':
-        model = WidedeepWrapper(model_type='FastFormer', input_dim=hparams.get('input_dim', 32), n_heads=hparams.get('n_heads', 4),
-                                epochs=epochs, patience=patience, batch_size=batch_size, **hparams)
-    elif args.model == 'Perceiver':
-        model = WidedeepWrapper(model_type='Perceiver', input_dim=hparams.get('input_dim', 32),
-                                n_latents=hparams.get('n_latents', 32), latent_dim=hparams.get('latent_dim', 64),
-                                epochs=epochs, patience=patience, batch_size=batch_size, **hparams)
-    elif args.model == 'NODE':
-        if batch_size == 64 and 'batch_size' not in hparams:
-            batch_size = 24
-        _num_layers = hparams.pop('num_layers', 2)
-        _num_trees = hparams.pop('num_trees', 512)
-        _depth = hparams.pop('depth', 6)
-        model = PytorchTabularWrapper(model_type='NODE', num_layers=_num_layers, num_trees=_num_trees,
-                                      depth=_depth, batch_size=batch_size, epochs=epochs, patience=patience, **hparams)
     elif args.model == 'DCN':
         _dnn_hidden_units = hparams.pop('dnn_hidden_units', (256, 128))
         _dropout = hparams.pop('dropout', 0.1)
