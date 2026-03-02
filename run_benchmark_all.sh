@@ -1,12 +1,6 @@
 #!/bin/bash
 # Script to run full benchmark for all datasets and models
 
-# Datasets
-datasets=("D-3" "D-1" "D-2")
-
-# Labels
-labels=("angry" "stress_binary" "valence")
-
 # Models Categories
 # 1. Standard Baselines (Fixed Architecture)
 baselines=("XGB" "LGB" "MLP" "ResNet")
@@ -32,19 +26,22 @@ backbones=("MLP")
 
 echo "Starting Full Benchmark Run..."
 
-for dataset in "${datasets[@]}"; do
+# Per-dataset label lists (only labels with existing data files)
+declare -A dataset_labels
+dataset_labels["D-1"]="arousal disturbance valence"
+dataset_labels["D-2"]="arousal disturbance valence"
+dataset_labels["D-3"]="angry arousal disturbance happy valence"
+
+for dataset in "D-1" "D-2" "D-3"; do
+  read -ra labels <<< "${dataset_labels[$dataset]}"
   for label in "${labels[@]}"; do
-    
+
     # 1. Run Baselines
     for model in "${baselines[@]}"; do
         echo "------------------------------------------------"
         echo "Running Baseline: Dataset=$dataset, Label=$label, Model=$model"
         echo "------------------------------------------------"
-        use_eff=""
-        if [ "$model" == "SAINT" ] || [ "$model" == "TabTransformer" ]; then
-            use_eff="--efficient_attention"
-        fi
-        python3 execute_benchmark.py --dataset "$dataset" --label "$label" --model "$model" --hpo_trials 5 --hpo_mode nested $use_eff
+        python3 execute_benchmark.py --dataset "$dataset" --label "$label" --model "$model" --hpo_trials 5 --hpo_mode nested
     done
 
     # 2. Run Tabular DL
@@ -81,4 +78,3 @@ done
 
 echo "Benchmark Completed. Results saved to results/benchmark_results_da_hpo.csv"
 echo "Progress results saved to results/benchmark_results_da_hpo_progress.csv"
-echo "Timing results saved to results/timing_results_da_hpo.csv"
