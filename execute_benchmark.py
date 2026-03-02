@@ -5,7 +5,6 @@ import pandas as pd
 import numpy as np
 import torch
 import torch.nn as nn
-import time
 from pathlib import Path
 from src.data_loader import BenchmarkDataset
 from src.models import XGBoostWrapper, LightGBMWrapper, MLP, ResNet, TabNetWrapper, TabPFNWrapper, WidedeepWrapper, DeepCTRWrapper, train_torch_model, evaluate_model
@@ -19,12 +18,10 @@ os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'
 
 BASE_DATA_DIR = '/home/iclab/minseo/Ubicomp/data'
 
-TIMING_OUTPUT = 'results/timing_results_da_hpo.csv'
-
 PROGRESS_COLUMNS = [
     'Dataset', 'Label', 'Model', 'Backbone', 'Seed', 'Fold', 'Phase', 'Trial',
     'Train_Accuracy', 'Train_AUROC', 'Val_Accuracy', 'Val_AUROC',
-    'Test_Accuracy', 'Test_F1', 'Test_AUROC', 'Elapsed_Seconds', 'Hparams_JSON'
+    'Test_Accuracy', 'Test_F1', 'Test_AUROC', 'Hparams_JSON'
 ]
 
 def append_row(path, row, columns):
@@ -374,8 +371,6 @@ def main():
 
         for seed in seeds:
             print(f"\n--- Fold {fold_id + 1} | Seed {seed} ---")
-
-            start_time = time.time()
             X_val_train = entry["X_val"]
             y_val_train = entry["y_val"]
             if args.uda and args.model in DA_MODELS:
@@ -390,11 +385,7 @@ def main():
                 entry["X_train"].shape[1], 2, num_domains,
                 hparams=best_hparams, seed=seed, patience=args.patience, X_target=X_target,
             )
-            end_time = time.time()
-            total_time = end_time - start_time
-            time_per_epoch = total_time / args.epochs
 
-            print(f"Training completed in {total_time:.2f} seconds ({time_per_epoch:.2f} seconds/epoch)")
             print("Evaluating on Train, Validation and Test sets...")
 
             train_metrics = evaluate_model(model, entry["X_train"], entry["y_train"])
@@ -431,28 +422,11 @@ def main():
                 'Val_Accuracy': val_metrics.get('Accuracy'), 'Val_AUROC': val_metrics.get('AUROC'),
                 'Test_Accuracy': test_metrics.get('Accuracy'), 'Test_F1': test_metrics.get('F1'),
                 'Test_AUROC': test_metrics.get('AUROC'),
-                'Elapsed_Seconds': round(total_time, 2),
                 'Hparams_JSON': json.dumps(best_hparams, default=str)
             }
             append_row(progress_output_path, final_progress_row, PROGRESS_COLUMNS)
             print(f"Progress results saved to {progress_output_path}")
 
-            timing_results = {
-                'Dataset': args.dataset, 'Model': args.model,
-                'Backbone': args.backbone if args.model in DG_MODELS else 'N/A',
-                'Seed': seed, 'Fold': fold_id + 1,
-                'Total_Time_Seconds': round(total_time, 2),
-                'Time_Per_Epoch': round(time_per_epoch, 2),
-                'Epochs': args.epochs
-            }
-
-            if os.path.dirname(TIMING_OUTPUT):
-                os.makedirs(os.path.dirname(TIMING_OUTPUT), exist_ok=True)
-
-            timing_header = not os.path.exists(TIMING_OUTPUT)
-            df_timing = pd.DataFrame([timing_results])
-            df_timing.to_csv(TIMING_OUTPUT, mode='a', header=timing_header, index=False)
-            print(f"Timing results saved to {TIMING_OUTPUT}")
 
 
 if __name__ == "__main__":
