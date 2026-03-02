@@ -70,6 +70,8 @@ def get_args():
     parser.add_argument('--patience', type=int, default=20)
     parser.add_argument('--efficient_attention', action='store_true')
     parser.add_argument('--uda', action='store_true')
+    parser.add_argument('--max_folds', type=int, default=None, help='Limit number of folds (e.g. 1 for quick debug)')
+    parser.add_argument('--epochs_override', type=int, default=None, help='Override epochs for quick debug runs')
     return parser.parse_args()
 
 
@@ -87,7 +89,7 @@ def train_model(args, X_train, y_train, d_train, X_val, y_val, d_val,
     backbone = hparams.get('backbone', args.backbone)
     lr = hparams.get('lr', args.lr)
     batch_size = hparams.get('batch_size', args.batch_size)
-    epochs = args.epochs
+    epochs = args.epochs_override if args.epochs_override else args.epochs
     dropout = hparams.get('dropout', 0.3)
     hidden_dim = hparams.get('hidden_dim', 256)
     num_layers = hparams.get('num_layers', 3)
@@ -278,6 +280,9 @@ def main():
     for fold_id, (train_idx, test_idx) in enumerate(splitter.split(np.zeros_like(labels), labels, groups)):
         train_idx, val_idx = make_groupwise_val_split(train_idx, labels, groups, seed=split_seed + fold_id)
         fold_splits.append((fold_id, train_idx, val_idx, test_idx))
+
+    if args.max_folds is not None:
+        fold_splits = fold_splits[:args.max_folds]
 
     le = LabelEncoder()
     user_domain_ids = le.fit_transform(ds.users)
