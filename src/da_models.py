@@ -473,9 +473,9 @@ def train_cgdm(model, X_source, y_source, X_target, y_target=None,
                X_val=None, y_val=None,
                epochs=20, batch_size=64, lr=1e-4, weight_decay=5e-4, num_k=4, log_interval=100,
                device='cuda' if torch.cuda.is_available() else 'cpu'):
-    """
-    CGDM Training Loop (ported from DomainAdaptation/CGDM/train.py).
-    """
+    import copy
+    from tqdm import tqdm
+
     model = model.to(device)
 
     if y_target is None:
@@ -528,46 +528,43 @@ def train_cgdm(model, X_source, y_source, X_target, y_target=None,
         if val_loader is None:
             return None, None
         model.eval()
-        criterion = nn.CrossEntropyLoss()
-        all_probs = []
-        all_targets = []
+        all_probs, all_targets = [], []
         total_loss = 0.0
         with torch.no_grad():
             for xb, yb in val_loader:
-                xb = xb.to(device)
-                yb = yb.to(device)
+                xb, yb = xb.to(device), yb.to(device)
                 logits = model.predict(xb)
                 total_loss += criterion(logits, yb).item()
-                probs = torch.softmax(logits, dim=1).detach().cpu().numpy()
-                all_probs.append(probs)
-                all_targets.append(yb.detach().cpu().numpy())
+                all_probs.append(torch.softmax(logits, dim=1).cpu().numpy())
+                all_targets.append(yb.cpu().numpy())
         total_loss /= max(1, len(val_loader))
         all_probs = np.concatenate(all_probs, axis=0)
         all_targets = np.concatenate(all_targets, axis=0)
         try:
-            if all_probs.shape[1] == 2:
-                val_auroc = roc_auc_score(all_targets, all_probs[:, 1])
-            else:
-                val_auroc = roc_auc_score(all_targets, all_probs, multi_class='ovr')
+            val_auroc = roc_auc_score(all_targets, all_probs[:, 1]) if all_probs.shape[1] == 2 \
+                else roc_auc_score(all_targets, all_probs, multi_class='ovr')
         except Exception:
             val_auroc = 0.5
         return total_loss, val_auroc
 
-    for ep in range(epochs):
-        iter_source = iter(train_loader)
+    best_val_score = -float('inf')
+    best_model_state = None
+    mem_label = None
+
+    epoch_iterator = tqdm(range(epochs), desc="CGDM Training")
+    for ep in epoch_iterator:
         from itertools import cycle
+        iter_source = iter(train_loader)
         iter_target = cycle(test_loader)
         steps = len(train_loader)
 
         for batch_idx in range(steps - 1):
             if ep > start and batch_idx % 250 == 0:
-                print("Obtaining target label...")
+                epoch_iterator.write("Obtaining target label...")
                 mem_label = obtain_label(test_loader_eval, G, F1, F2, device)
                 mem_label = torch.from_numpy(mem_label).to(device)
 
-            G.train()
-            F1.train()
-            F2.train()
+            G.train(); F1.train(); F2.train()
 
             try:
                 data_s, label_s = next(iter_source)
@@ -585,91 +582,79 @@ def train_cgdm(model, X_source, y_source, X_target, y_target=None,
             data_all = torch.cat((data_s, data_t), 0)
             bs = len(label_s)
 
-            optimizer_g.zero_grad()
-            optimizer_f.zero_grad()
+            # Step A: train G, F1, F2 jointly
+            optimizer_g.zero_grad(); optimizer_f.zero_grad()
             output = G(data_all)
-            output1 = F1(output)
-            output2 = F2(output)
-            output_s1 = output1[:bs, :]
-            output_s2 = output2[:bs, :]
-            output_t1 = output1[bs:, :]
-            output_t2 = output2[bs:, :]
+            output1 = F1(output); output2 = F2(output)
+            output_s1, output_s2 = output1[:bs], output2[:bs]
+            output_t1, output_t2 = output1[bs:], output2[bs:]
             output_t1_s = F.softmax(output_t1, dim=1)
             output_t2_s = F.softmax(output_t2, dim=1)
 
             entropy_loss = Entropy(output_t1_s) + Entropy(output_t2_s)
-
-            if ep > start:
-                supervision_loss = Weighted_CrossEntropy(output_t1, pseudo_label_t) + Weighted_CrossEntropy(output_t2, pseudo_label_t)
-            else:
-                supervision_loss = 0
-
+            supervision_loss = (Weighted_CrossEntropy(output_t1, pseudo_label_t) +
+                                Weighted_CrossEntropy(output_t2, pseudo_label_t)) if ep > start else 0
             loss1 = criterion(output_s1, label_s)
             loss2 = criterion(output_s2, label_s)
             all_loss = loss1 + loss2 + 0.01 * entropy_loss + 0.01 * supervision_loss
             all_loss.backward()
-            optimizer_g.step()
-            optimizer_f.step()
+            optimizer_g.step(); optimizer_f.step()
 
-            optimizer_g.zero_grad()
-            optimizer_f.zero_grad()
+            # Step B: train F1, F2 to maximize discrepancy
+            optimizer_g.zero_grad(); optimizer_f.zero_grad()
             output = G(data_all)
-            output1 = F1(output)
-            output2 = F2(output)
-            output_s1 = output1[:bs, :]
-            output_s2 = output2[:bs, :]
-            output_t1 = output1[bs:, :]
-            output_t2 = output2[bs:, :]
+            output1 = F1(output); output2 = F2(output)
+            output_s1, output_s2 = output1[:bs], output2[:bs]
+            output_t1, output_t2 = output1[bs:], output2[bs:]
             output_t1_s = F.softmax(output_t1, dim=1)
             output_t2_s = F.softmax(output_t2, dim=1)
 
             loss1 = criterion(output_s1, label_s)
             loss2 = criterion(output_s2, label_s)
-
             entropy_loss = Entropy(output_t1_s) + Entropy(output_t2_s)
             loss_dis = discrepancy(output_t1, output_t2)
-
             all_loss = loss1 + loss2 - 1.0 * loss_dis + 0.01 * entropy_loss
             all_loss.backward()
             optimizer_f.step()
 
+            # Step C: train G to minimize discrepancy (num_k steps)
             for _ in range(num_k):
-                optimizer_g.zero_grad()
-                optimizer_f.zero_grad()
-
+                optimizer_g.zero_grad(); optimizer_f.zero_grad()
                 output = G(data_all)
-                output1 = F1(output)
-                output2 = F2(output)
-                output_s1 = output1[:bs, :]
-                output_s2 = output2[:bs, :]
-                output_t1 = output1[bs:, :]
-                output_t2 = output2[bs:, :]
+                output1 = F1(output); output2 = F2(output)
+                output_s1, output_s2 = output1[:bs], output2[:bs]
+                output_t1, output_t2 = output1[bs:], output2[bs:]
                 output_t1_s = F.softmax(output_t1, dim=1)
                 output_t2_s = F.softmax(output_t2, dim=1)
 
                 entropy_loss = Entropy(output_t1_s) + Entropy(output_t2_s)
                 loss_dis = discrepancy(output_t1, output_t2)
-
-                if ep > start:
-                    gmn_loss = gradient_discrepancy_loss_margin(output_s1, output_s2, label_s, output_t1, output_t2, pseudo_label_t, G, F1, F2)
-                else:
-                    gmn_loss = 0
+                gmn_loss = gradient_discrepancy_loss_margin(
+                    output_s1, output_s2, label_s, output_t1, output_t2, pseudo_label_t,
+                    G, F1, F2) if ep > start else 0
 
                 all_loss = 1.0 * loss_dis + 0.01 * entropy_loss + 0.01 * gmn_loss
                 all_loss.backward()
                 optimizer_g.step()
 
             if batch_idx % log_interval == 0:
-                print(
-                    'Train Ep: {} [{}/{} ({:.6f}%)]\\tLoss1: {:.6f}\\tLoss2: {:.6f}\\t CDD: {:.6f} Entropy: {:.6f} '.format(
-                        ep, batch_idx, steps, 100. * batch_idx / steps,
-                        loss1.item(), loss2.item(), loss_dis.item(), entropy_loss.item()))
+                epoch_iterator.write(
+                    f'Ep {ep} [{batch_idx}/{steps}] '
+                    f'Loss1: {loss1.item():.4f} Loss2: {loss2.item():.4f} '
+                    f'Dis: {loss_dis.item():.4f} Ent: {entropy_loss.item():.4f}')
 
         val_loss, val_auroc = _eval_val()
         if val_loss is not None:
-            print(f"Epoch {ep} Val Loss: {val_loss:.4f} Val AUC: {val_auroc:.4f}")
+            epoch_iterator.set_postfix({'Val Loss': f'{val_loss:.4f}', 'Val AUC': f'{val_auroc:.4f}'})
+            if val_auroc > best_val_score:
+                best_val_score = val_auroc
+                best_model_state = copy.deepcopy(model.state_dict())
+
+    if best_model_state is not None:
+        model.load_state_dict(best_model_state)
 
     return model
+
 
 class DeepCORAL(DAModel):
     def __init__(self, input_dim, num_classes=2, hparams=None):
