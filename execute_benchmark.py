@@ -11,7 +11,7 @@ import time
 from pathlib import Path
 from src.data_loader import BenchmarkDataset
 from src.models import XGBoostWrapper, LightGBMWrapper, MLP, ResNet, TabNetWrapper, TabPFNWrapper, WidedeepWrapper, PytorchTabularWrapper, DeepCTRWrapper, train_torch_model, evaluate_model
-from src.da_models import DANN, CDAN, DAN, DeepCORAL, MCC, ADDA, MCD, JAN, SHOT, CBST, CGDM, train_adversarial_da, train_mcd, train_dann, train_cdan, train_adda, train_jan, train_shot, train_cbst, train_deepcoral, train_mcc, train_dan, train_cgdm
+from src.da_models import DANN, CDAN, DAN, DeepCORAL, MCC, ADDA, MCD, JAN, SHOT, CBST, CGDM, MCDInferenceWrapper, train_adversarial_da, train_mcd, train_dann, train_cdan, train_adda, train_jan, train_shot, train_cbst, train_deepcoral, train_mcc, train_dan, train_cgdm
 from src.domainbed_algos import ERM as DG_ERM, IRM, VREx, GroupDRO, MixStyle, MLDG, MASF, Fish, CSD, SagNet, train_dg_model
 from src.hparams_registry import get_hparams
 from sklearn.model_selection import StratifiedGroupKFold, StratifiedShuffleSplit
@@ -58,42 +58,6 @@ def make_groupwise_val_split(train_idx, labels, groups, seed=42, max_splits=5):
         train_rel, val_rel = next(sss.split(dummy, train_labels))
     return train_idx[train_rel], train_idx[val_rel]
 
-
-class DANNInferenceWrapper(nn.Module):
-    def __init__(self, dann_model):
-        super().__init__()
-        self.model = dann_model
-
-    def forward(self, x):
-        return self.model.predict(x)
-
-
-class CDANInferenceWrapper(nn.Module):
-    def __init__(self, cdan_model):
-        super().__init__()
-        self.model = cdan_model
-
-    def forward(self, x):
-        return self.model.predict(x)
-
-
-class MCDInferenceWrapper(nn.Module):
-    def __init__(self, mcd_model):
-        super().__init__()
-        self.model = mcd_model
-
-    def forward(self, x):
-        o1, o2 = self.model(x)
-        return (o1 + o2) / 2.0
-
-
-class CGDMInferenceWrapper(nn.Module):
-    def __init__(self, cgdm_model):
-        super().__init__()
-        self.model = cgdm_model
-
-    def forward(self, x):
-        return self.model.predict(x)
 
 
 def get_args():
@@ -204,7 +168,6 @@ def train_model(args, X_train, y_train, d_train, X_val, y_val, d_val,
                             'hidden_dim': hidden_dim, 'num_layers': num_layers, 'num_blocks': num_blocks, 'nhead': nhead})
         model = train_dann(net, X_train, y_train, d_train, X_val, y_val, d_val,
                            epochs=epochs, batch_size=batch_size, patience=patience, X_target=X_target)
-        model = DANNInferenceWrapper(model)
     elif args.model == 'DAN':
         net = DAN(input_dim=input_dim, num_classes=2,
                   hparams={**hparams, 'lr': lr, 'backbone': backbone, 'dropout': dropout,
@@ -263,7 +226,6 @@ def train_model(args, X_train, y_train, d_train, X_val, y_val, d_val,
                             'hidden_dim': hidden_dim, 'num_layers': num_layers, 'num_blocks': num_blocks, 'nhead': nhead})
         model = train_cdan(net, X_train, y_train, d_train, X_val, y_val, d_val,
                            epochs=epochs, batch_size=batch_size, lr=lr, patience=patience, X_target=X_target)
-        model = CDANInferenceWrapper(model)
     elif args.model == 'DeepCORAL':
         net = DeepCORAL(input_dim=input_dim, num_classes=2,
                         hparams={**hparams, 'lr': lr, 'backbone': backbone, 'dropout': dropout,
@@ -284,7 +246,6 @@ def train_model(args, X_train, y_train, d_train, X_val, y_val, d_val,
                            X_val=X_val, y_val=y_val,
                            epochs=epochs, batch_size=batch_size, lr=lr,
                            weight_decay=hparams.get('weight_decay', 5e-4))
-        model = CGDMInferenceWrapper(model)
 
     if args.model in ['XGB', 'LGB', 'TabNet', 'TabPFN', 'SAINT', 'TabTransformer', 'FastFormer', 'Perceiver', 'NODE', 'DCN']:
         model.fit(X_train, y_train, X_val, y_val)

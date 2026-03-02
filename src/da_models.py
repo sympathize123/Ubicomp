@@ -118,7 +118,8 @@ def coral_loss(source, target):
 
 def train_deepcoral(model, X_train, y_train, d_train, X_val, y_val, d_val,
                     epochs=50, batch_size=64, lr=1e-3, patience=5,
-                    device='cuda' if torch.cuda.is_available() else 'cpu', X_target=None):
+                    device='cuda' if torch.cuda.is_available() else 'cpu', X_target=None,
+                    X_test=None, y_test=None):
     """
     DeepCORAL (TLL-style): L = L_cls(source) + lambda * CORAL(f_s, f_t).
     Requires unlabeled target samples (X_target).
@@ -210,6 +211,8 @@ def train_deepcoral(model, X_train, y_train, d_train, X_val, y_val, d_val,
         except:
             val_auroc = 0.5
 
+        test_acc, test_auroc = _evaluate_test(model, X_test, y_test, device)
+
         if val_auroc > best_val_score:
             best_val_score = val_auroc
             best_model_state = copy.deepcopy(model.state_dict())
@@ -220,7 +223,10 @@ def train_deepcoral(model, X_train, y_train, d_train, X_val, y_val, d_val,
                 epoch_iterator.write(f"Early stopping at epoch {epoch} (Best AUROC: {best_val_score:.4f})")
                 break
 
-        epoch_iterator.set_postfix({'Loss': f'{train_loss:.4f}', 'Val Loss': f'{val_loss:.4f}', 'Val AUC': f'{val_auroc:.4f}'})
+        postfix = {'Loss': f'{train_loss:.4f}', 'Val Loss': f'{val_loss:.4f}', 'Val AUC': f'{val_auroc:.4f}'}
+        if test_acc is not None:
+            postfix.update({'Test Acc': f'{test_acc:.4f}', 'Test AUC': f'{test_auroc:.4f}'})
+        epoch_iterator.set_postfix(postfix)
 
     if best_model_state:
         model.load_state_dict(best_model_state)
@@ -685,7 +691,8 @@ class DAN(DAModel):
 
 def train_standard(model, X_train, y_train, X_val, y_val,
                    epochs=50, batch_size=64, lr=1e-3, patience=5,
-                   device='cuda' if torch.cuda.is_available() else 'cpu'):
+                   device='cuda' if torch.cuda.is_available() else 'cpu',
+                   X_test=None, y_test=None):
     """
     Simple supervised training wrapper (used for fallback in DA methods).
     """
@@ -701,6 +708,8 @@ def train_standard(model, X_train, y_train, X_val, y_val,
         lr=lr,
         patience=patience,
         device=device,
+        X_test=X_test,
+        y_test=y_test,
     )
 
 def _infinite_iterator(loader):
@@ -758,9 +767,46 @@ def _evaluate_val(model, val_loader, device):
     return val_loss, val_auroc
 
 
+def _evaluate_test(model, X_test, y_test, device, batch_size=1024):
+    if X_test is None or y_test is None:
+        return None, None
+    model.eval()
+    test_dataset = torch.utils.data.TensorDataset(
+        torch.tensor(X_test, dtype=torch.float32),
+        torch.tensor(y_test, dtype=torch.long),
+    )
+    test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+    all_probs = []
+    all_targets = []
+    correct = 0
+    total = 0
+    with torch.no_grad():
+        for X_batch, y_batch in test_loader:
+            X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+            logits = model.predict(X_batch)
+            probs = torch.softmax(logits, dim=1)
+            preds = torch.argmax(probs, dim=1)
+            correct += (preds == y_batch).sum().item()
+            total += y_batch.size(0)
+            all_probs.append(probs.cpu().numpy())
+            all_targets.append(y_batch.cpu().numpy())
+    acc = correct / max(1, total)
+    all_probs = np.concatenate(all_probs, axis=0)
+    all_targets = np.concatenate(all_targets, axis=0)
+    try:
+        if all_probs.shape[1] == 2:
+            auroc = roc_auc_score(all_targets, all_probs[:, 1])
+        else:
+            auroc = roc_auc_score(all_targets, all_probs, multi_class='ovr', average='macro')
+    except Exception:
+        auroc = 0.5
+    return acc, auroc
+
+
 def train_dann(model, X_train, y_train, d_train, X_val, y_val, d_val,
                epochs=50, batch_size=64, lr=1e-3, patience=5,
-               device='cuda' if torch.cuda.is_available() else 'cpu', X_target=None):
+               device='cuda' if torch.cuda.is_available() else 'cpu', X_target=None,
+               X_test=None, y_test=None):
     """
     DANN (TLL-style): L = L_cls(source) + lambda * DomainAdversarialLoss(f_s, f_t).
     Requires unlabeled target samples (X_target).
@@ -828,6 +874,8 @@ def train_dann(model, X_train, y_train, d_train, X_val, y_val, d_val,
         train_loss /= max(1, len(train_loader))
         val_loss, val_auroc = _evaluate_val(model, val_loader, device)
 
+        test_acc, test_auroc = _evaluate_test(model, X_test, y_test, device)
+
         if val_auroc > best_val_score:
             best_val_score = val_auroc
             best_model_state = copy.deepcopy(model.state_dict())
@@ -838,7 +886,10 @@ def train_dann(model, X_train, y_train, d_train, X_val, y_val, d_val,
                 epoch_iterator.write(f"Early stopping at epoch {epoch} (Best AUROC: {best_val_score:.4f})")
                 break
 
-        epoch_iterator.set_postfix({'Loss': f'{train_loss:.4f}', 'Val Loss': f'{val_loss:.4f}', 'Val AUC': f'{val_auroc:.4f}'})
+        postfix = {'Loss': f'{train_loss:.4f}', 'Val Loss': f'{val_loss:.4f}', 'Val AUC': f'{val_auroc:.4f}'}
+        if test_acc is not None:
+            postfix.update({'Test Acc': f'{test_acc:.4f}', 'Test AUC': f'{test_auroc:.4f}'})
+        epoch_iterator.set_postfix(postfix)
 
     if best_model_state:
         model.load_state_dict(best_model_state)
@@ -848,7 +899,8 @@ def train_dann(model, X_train, y_train, d_train, X_val, y_val, d_val,
 
 def train_cdan(model, X_train, y_train, d_train, X_val, y_val, d_val,
                epochs=50, batch_size=64, lr=1e-3, patience=5,
-               device='cuda' if torch.cuda.is_available() else 'cpu', X_target=None):
+               device='cuda' if torch.cuda.is_available() else 'cpu', X_target=None,
+               X_test=None, y_test=None):
     """
     CDAN (TLL-style): L = L_cls(source) + lambda * ConditionalDomainAdversarialLoss(g_s, f_s, g_t, f_t).
     Requires unlabeled target samples (X_target).
@@ -929,6 +981,8 @@ def train_cdan(model, X_train, y_train, d_train, X_val, y_val, d_val,
         train_loss /= max(1, len(train_loader))
         val_loss, val_auroc = _evaluate_val(model, val_loader, device)
 
+        test_acc, test_auroc = _evaluate_test(model, X_test, y_test, device)
+
         if val_auroc > best_val_score:
             best_val_score = val_auroc
             best_model_state = copy.deepcopy(model.state_dict())
@@ -939,7 +993,10 @@ def train_cdan(model, X_train, y_train, d_train, X_val, y_val, d_val,
                 epoch_iterator.write(f"Early stopping at epoch {epoch} (Best AUROC: {best_val_score:.4f})")
                 break
 
-        epoch_iterator.set_postfix({'Loss': f'{train_loss:.4f}', 'Val Loss': f'{val_loss:.4f}', 'Val AUC': f'{val_auroc:.4f}'})
+        postfix = {'Loss': f'{train_loss:.4f}', 'Val Loss': f'{val_loss:.4f}', 'Val AUC': f'{val_auroc:.4f}'}
+        if test_acc is not None:
+            postfix.update({'Test Acc': f'{test_acc:.4f}', 'Test AUC': f'{test_auroc:.4f}'})
+        epoch_iterator.set_postfix(postfix)
 
     if best_model_state:
         model.load_state_dict(best_model_state)
@@ -949,22 +1006,26 @@ def train_cdan(model, X_train, y_train, d_train, X_val, y_val, d_val,
 
 def train_adversarial_da(model, X_train, y_train, d_train, X_val, y_val, d_val,
                          epochs=50, batch_size=64, lr=1e-3, patience=5,
-                         device='cuda' if torch.cuda.is_available() else 'cpu', X_target=None):
+                         device='cuda' if torch.cuda.is_available() else 'cpu', X_target=None,
+                         X_test=None, y_test=None):
     """
     Backward-compatible wrapper: dispatch to DANN/CDAN depending on model type.
     """
     if isinstance(model, CDAN):
         return train_cdan(model, X_train, y_train, d_train, X_val, y_val, d_val,
-                          epochs=epochs, batch_size=batch_size, lr=lr, patience=patience, device=device, X_target=X_target)
+                          epochs=epochs, batch_size=batch_size, lr=lr, patience=patience, device=device,
+                          X_target=X_target, X_test=X_test, y_test=y_test)
     if isinstance(model, DANN):
         return train_dann(model, X_train, y_train, d_train, X_val, y_val, d_val,
-                          epochs=epochs, batch_size=batch_size, lr=lr, patience=patience, device=device, X_target=X_target)
+                          epochs=epochs, batch_size=batch_size, lr=lr, patience=patience, device=device,
+                          X_target=X_target, X_test=X_test, y_test=y_test)
     raise ValueError("train_adversarial_da supports DANN or CDAN models only.")
 
 
 def train_mcc(model, X_train, y_train, d_train, X_val, y_val, d_val,
               epochs=50, batch_size=64, lr=1e-3, patience=5,
-              device='cuda' if torch.cuda.is_available() else 'cpu', X_target=None):
+              device='cuda' if torch.cuda.is_available() else 'cpu', X_target=None,
+              X_test=None, y_test=None):
     """
     MCC (TLL-style): L = L_cls(source) + mu * MCC(target_logits).
     Requires unlabeled target samples (X_target).
@@ -1015,6 +1076,8 @@ def train_mcc(model, X_train, y_train, d_train, X_val, y_val, d_val,
         train_loss /= max(1, len(train_loader))
         val_loss, val_auroc = _evaluate_val(model, val_loader, device)
 
+        test_acc, test_auroc = _evaluate_test(model, X_test, y_test, device)
+
         if val_auroc > best_val_score:
             best_val_score = val_auroc
             best_model_state = copy.deepcopy(model.state_dict())
@@ -1025,7 +1088,10 @@ def train_mcc(model, X_train, y_train, d_train, X_val, y_val, d_val,
                 epoch_iterator.write(f"Early stopping at epoch {epoch} (Best AUROC: {best_val_score:.4f})")
                 break
 
-        epoch_iterator.set_postfix({'Loss': f'{train_loss:.4f}', 'Val Loss': f'{val_loss:.4f}', 'Val AUC': f'{val_auroc:.4f}'})
+        postfix = {'Loss': f'{train_loss:.4f}', 'Val Loss': f'{val_loss:.4f}', 'Val AUC': f'{val_auroc:.4f}'}
+        if test_acc is not None:
+            postfix.update({'Test Acc': f'{test_acc:.4f}', 'Test AUC': f'{test_auroc:.4f}'})
+        epoch_iterator.set_postfix(postfix)
 
     if best_model_state:
         model.load_state_dict(best_model_state)
@@ -1034,7 +1100,8 @@ def train_mcc(model, X_train, y_train, d_train, X_val, y_val, d_val,
 
 def train_dan(model, X_train, y_train, d_train, X_val, y_val, d_val,
               epochs=50, batch_size=64, lr=1e-3, patience=5,
-              device='cuda' if torch.cuda.is_available() else 'cpu', X_target=None):
+              device='cuda' if torch.cuda.is_available() else 'cpu', X_target=None,
+              X_test=None, y_test=None):
     """
     DAN (TLL-style): L = L_cls(source) + lambda * MK-MMD(f_s, f_t).
     Requires unlabeled target samples (X_target).
@@ -1090,6 +1157,8 @@ def train_dan(model, X_train, y_train, d_train, X_val, y_val, d_val,
         train_loss /= max(1, len(train_loader))
         val_loss, val_auroc = _evaluate_val(model, val_loader, device)
 
+        test_acc, test_auroc = _evaluate_test(model, X_test, y_test, device)
+
         if val_auroc > best_val_score:
             best_val_score = val_auroc
             best_model_state = copy.deepcopy(model.state_dict())
@@ -1100,7 +1169,10 @@ def train_dan(model, X_train, y_train, d_train, X_val, y_val, d_val,
                 epoch_iterator.write(f"Early stopping at epoch {epoch} (Best AUROC: {best_val_score:.4f})")
                 break
 
-        epoch_iterator.set_postfix({'Loss': f'{train_loss:.4f}', 'Val Loss': f'{val_loss:.4f}', 'Val AUC': f'{val_auroc:.4f}'})
+        postfix = {'Loss': f'{train_loss:.4f}', 'Val Loss': f'{val_loss:.4f}', 'Val AUC': f'{val_auroc:.4f}'}
+        if test_acc is not None:
+            postfix.update({'Test Acc': f'{test_acc:.4f}', 'Test AUC': f'{test_auroc:.4f}'})
+        epoch_iterator.set_postfix(postfix)
 
     if best_model_state:
         model.load_state_dict(best_model_state)
@@ -1137,7 +1209,8 @@ class ADDA(nn.Module):
 
 def train_adda(model, X_train, y_train, d_train, X_val, y_val, d_val,
                epochs=50, batch_size=64, lr=1e-3, patience=5,
-               device='cuda' if torch.cuda.is_available() else 'cpu', X_target=None):
+               device='cuda' if torch.cuda.is_available() else 'cpu', X_target=None,
+               X_test=None, y_test=None):
     """
     ADDA training:
       1) Pretrain source encoder+classifier on labeled source.
@@ -1155,7 +1228,8 @@ def train_adda(model, X_train, y_train, d_train, X_val, y_val, d_val,
     # Phase 1: source pretraining
     model.source_model = train_torch_model(
         model.source_model, X_train, y_train, X_val, y_val,
-        epochs=epochs, batch_size=batch_size, lr=lr, patience=patience, device=device
+        epochs=epochs, batch_size=batch_size, lr=lr, patience=patience, device=device,
+        X_test=X_test, y_test=y_test
     )
 
     # Init target encoder from source
@@ -1237,6 +1311,8 @@ def train_adda(model, X_train, y_train, d_train, X_val, y_val, d_val,
         train_loss /= max(1, len(train_loader))
         val_loss, val_auroc = _evaluate_val(model, val_loader, device)
 
+        test_acc, test_auroc = _evaluate_test(model, X_test, y_test, device)
+
         if val_auroc > best_val_score:
             best_val_score = val_auroc
             best_model_state = copy.deepcopy(model.state_dict())
@@ -1247,7 +1323,10 @@ def train_adda(model, X_train, y_train, d_train, X_val, y_val, d_val,
                 epoch_iterator.write(f"Early stopping at epoch {epoch} (Best AUROC: {best_val_score:.4f})")
                 break
 
-        epoch_iterator.set_postfix({'Loss': f'{train_loss:.4f}', 'Val Loss': f'{val_loss:.4f}', 'Val AUC': f'{val_auroc:.4f}'})
+        postfix = {'Loss': f'{train_loss:.4f}', 'Val Loss': f'{val_loss:.4f}', 'Val AUC': f'{val_auroc:.4f}'}
+        if test_acc is not None:
+            postfix.update({'Test Acc': f'{test_acc:.4f}', 'Test AUC': f'{test_auroc:.4f}'})
+        epoch_iterator.set_postfix(postfix)
 
     if best_model_state:
         model.load_state_dict(best_model_state)
@@ -1281,9 +1360,20 @@ class MCD(DAModel):
         return o1, o2
 
 
+class MCDInferenceWrapper(nn.Module):
+    def __init__(self, mcd_model):
+        super().__init__()
+        self.model = mcd_model
+
+    def forward(self, x):
+        o1, o2 = self.model(x)
+        return (o1 + o2) / 2.0
+
+
 def train_mcd(model, X_train, y_train, d_train, X_val, y_val, d_val,
               epochs=50, batch_size=64, lr=1e-3, patience=5,
-              device='cuda' if torch.cuda.is_available() else 'cpu', X_target=None):
+              device='cuda' if torch.cuda.is_available() else 'cpu', X_target=None,
+              X_test=None, y_test=None):
     """
     MCD (TLL-style):
       A) Min CE on source (G, C1, C2)
@@ -1367,6 +1457,8 @@ def train_mcd(model, X_train, y_train, d_train, X_val, y_val, d_val,
         train_loss /= max(1, len(train_loader))
         val_loss, val_auroc = _evaluate_val(model, val_loader, device)
 
+        test_acc, test_auroc = _evaluate_test(model, X_test, y_test, device)
+
         if val_auroc > best_val_score:
             best_val_score = val_auroc
             best_model_state = copy.deepcopy(model.state_dict())
@@ -1377,7 +1469,10 @@ def train_mcd(model, X_train, y_train, d_train, X_val, y_val, d_val,
                 epoch_iterator.write(f"Early stopping at epoch {epoch} (Best AUROC: {best_val_score:.4f})")
                 break
 
-        epoch_iterator.set_postfix({'Loss': f'{train_loss:.4f}', 'Val Loss': f'{val_loss:.4f}', 'Val AUC': f'{val_auroc:.4f}'})
+        postfix = {'Loss': f'{train_loss:.4f}', 'Val Loss': f'{val_loss:.4f}', 'Val AUC': f'{val_auroc:.4f}'}
+        if test_acc is not None:
+            postfix.update({'Test Acc': f'{test_acc:.4f}', 'Test AUC': f'{test_auroc:.4f}'})
+        epoch_iterator.set_postfix(postfix)
 
     if best_model_state:
         model.load_state_dict(best_model_state)
@@ -1400,7 +1495,8 @@ class JAN(DAModel):
 
 def train_jan(model, X_train, y_train, d_train, X_val, y_val, d_val,
               epochs=50, batch_size=64, lr=1e-3, patience=5,
-              device='cuda' if torch.cuda.is_available() else 'cpu', X_target=None):
+              device='cuda' if torch.cuda.is_available() else 'cpu', X_target=None,
+              X_test=None, y_test=None):
     """
     JAN (TLL-style): L = L_cls(source) + lambda * JMMD((f_s, p_s), (f_t, p_t)).
     Requires unlabeled target samples (X_target).
@@ -1458,6 +1554,8 @@ def train_jan(model, X_train, y_train, d_train, X_val, y_val, d_val,
         train_loss /= max(1, len(train_loader))
         val_loss, val_auroc = _evaluate_val(model, val_loader, device)
 
+        test_acc, test_auroc = _evaluate_test(model, X_test, y_test, device)
+
         if val_auroc > best_val_score:
             best_val_score = val_auroc
             best_model_state = copy.deepcopy(model.state_dict())
@@ -1468,7 +1566,10 @@ def train_jan(model, X_train, y_train, d_train, X_val, y_val, d_val,
                 epoch_iterator.write(f"Early stopping at epoch {epoch} (Best AUROC: {best_val_score:.4f})")
                 break
 
-        epoch_iterator.set_postfix({'Loss': f'{train_loss:.4f}', 'Val Loss': f'{val_loss:.4f}', 'Val AUC': f'{val_auroc:.4f}'})
+        postfix = {'Loss': f'{train_loss:.4f}', 'Val Loss': f'{val_loss:.4f}', 'Val AUC': f'{val_auroc:.4f}'}
+        if test_acc is not None:
+            postfix.update({'Test Acc': f'{test_acc:.4f}', 'Test AUC': f'{test_auroc:.4f}'})
+        epoch_iterator.set_postfix(postfix)
 
     if best_model_state:
         model.load_state_dict(best_model_state)
@@ -1545,7 +1646,8 @@ def _shot_obtain_label(loader, model, num_classes, distance='cosine', threshold=
 
 def train_shot(model, X_train, y_train, d_train, X_val, y_val, d_val,
                epochs=50, batch_size=64, lr=1e-3, patience=5,
-               device='cuda' if torch.cuda.is_available() else 'cpu', X_target=None):
+               device='cuda' if torch.cuda.is_available() else 'cpu', X_target=None,
+               X_test=None, y_test=None):
     """
     SHOT (official-style):
       1) Train source model on labeled source.
@@ -1559,8 +1661,11 @@ def train_shot(model, X_train, y_train, d_train, X_val, y_val, d_val,
 
     # Phase 1: Source pretraining
     from src.models import train_torch_model
-    model = train_torch_model(model, X_train, y_train, X_val, y_val,
-                              epochs=epochs, batch_size=batch_size, lr=lr, patience=patience, device=device)
+    model = train_torch_model(
+        model, X_train, y_train, X_val, y_val,
+        epochs=epochs, batch_size=batch_size, lr=lr, patience=patience, device=device,
+        X_test=X_test, y_test=y_test
+    )
 
     # Freeze classifier
     for p in model.classifier.parameters():
@@ -1668,6 +1773,8 @@ def train_shot(model, X_train, y_train, d_train, X_val, y_val, d_val,
         train_loss /= max(1, len(target_loader))
         val_loss, val_auroc = _evaluate_val(model, val_loader, device)
 
+        test_acc, test_auroc = _evaluate_test(model, X_test, y_test, device)
+
         if val_auroc > best_val_score:
             best_val_score = val_auroc
             best_model_state = copy.deepcopy(model.state_dict())
@@ -1678,7 +1785,10 @@ def train_shot(model, X_train, y_train, d_train, X_val, y_val, d_val,
                 epoch_iterator.write(f"Early stopping at epoch {epoch} (Best AUROC: {best_val_score:.4f})")
                 break
 
-        epoch_iterator.set_postfix({'Loss': f'{train_loss:.4f}', 'Val Loss': f'{val_loss:.4f}', 'Val AUC': f'{val_auroc:.4f}'})
+        postfix = {'Loss': f'{train_loss:.4f}', 'Val Loss': f'{val_loss:.4f}', 'Val AUC': f'{val_auroc:.4f}'}
+        if test_acc is not None:
+            postfix.update({'Test Acc': f'{test_acc:.4f}', 'Test AUC': f'{test_auroc:.4f}'})
+        epoch_iterator.set_postfix(postfix)
 
     if best_model_state:
         model.load_state_dict(best_model_state)
@@ -1697,7 +1807,8 @@ class CBST(DAModel):
 
 def train_cbst(model, X_train, y_train, d_train, X_val, y_val, d_val,
                epochs=50, batch_size=64, lr=1e-3, patience=5,
-               device='cuda' if torch.cuda.is_available() else 'cpu', X_target=None):
+               device='cuda' if torch.cuda.is_available() else 'cpu', X_target=None,
+               X_test=None, y_test=None):
     """
     CBST (official-style):
       1) Train on source.
@@ -1724,7 +1835,8 @@ def train_cbst(model, X_train, y_train, d_train, X_val, y_val, d_val,
     # 1) Pretrain on source
     pretrain_epochs = model.hparams.get('cbst_pretrain_epochs', max(1, epochs // 2))
     from tqdm import tqdm
-    for epoch in tqdm(range(pretrain_epochs), desc="CBST Pretrain"):
+    epoch_iterator = tqdm(range(pretrain_epochs), desc="CBST Pretrain")
+    for epoch in epoch_iterator:
         model.train()
         for x, y in loader_s:
             optimizer.zero_grad()
@@ -1732,6 +1844,9 @@ def train_cbst(model, X_train, y_train, d_train, X_val, y_val, d_val,
             loss = criterion(logits, y)
             loss.backward()
             optimizer.step()
+        test_acc, test_auroc = _evaluate_test(model, X_test, y_test, device)
+        if test_acc is not None:
+            epoch_iterator.set_postfix({'Test Acc': f'{test_acc:.4f}', 'Test AUC': f'{test_auroc:.4f}'})
 
     # 2) Iterative self-training with class-balanced thresholds
     max_iter = model.hparams.get('cbst_max_iter', 5)
