@@ -585,6 +585,8 @@ def evaluate_model(model, X_test, y_test, device='cuda' if torch.cuda.is_availab
             if hasattr(model, 'predict'):
                 # DG/DA models (DGModel, DAModel subclasses) expose predict() not forward()
                 logits = model.predict(X_tensor)
+                if isinstance(logits, tuple):
+                    logits = logits[0]  # some models return (class_logits, domain_logits)
             else:
                 logits = model(X_tensor)
         probs = torch.softmax(logits, dim=1).cpu().numpy()
