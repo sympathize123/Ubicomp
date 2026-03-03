@@ -113,20 +113,20 @@ def get_hparams(algorithm, dataset, backbone='MLP'):
         hparams['batch_size'] = lambda trial: trial.suggest_categorical('batch_size', [64, 128, 256, 512, 1024])
 
     elif algorithm == 'TabTransformer':
-        hparams['input_dim'] = lambda trial: trial.suggest_categorical('input_dim', [16, 32, 64])
+        hparams['input_dim'] = lambda trial: trial.suggest_categorical('input_dim', [16, 32])
         hparams['n_heads'] = lambda trial: trial.suggest_categorical('n_heads', [2, 4, 8])
         hparams['n_blocks'] = lambda trial: trial.suggest_int('n_blocks', 1, 4)
         hparams['dropout'] = lambda trial: trial.suggest_float('dropout', 0.0, 0.3)
         hparams['lr'] = lambda trial: trial.suggest_float('lr', 1e-4, 1e-3, log=True)
         
     elif algorithm == 'SAINT':
-        hparams['input_dim'] = lambda trial: trial.suggest_categorical('input_dim', [16, 32, 64])
+        hparams['input_dim'] = lambda trial: trial.suggest_categorical('input_dim', [16, 32])
         hparams['n_heads'] = lambda trial: trial.suggest_categorical('n_heads', [2, 4, 8])
         hparams['n_blocks'] = lambda trial: trial.suggest_int('n_blocks', 1, 4)
         hparams['dropout'] = lambda trial: trial.suggest_float('dropout', 0.0, 0.3)
         hparams['lr'] = lambda trial: trial.suggest_float('lr', 1e-4, 1e-3, log=True)
     elif algorithm == 'FTTransformer':
-        hparams['input_dim'] = lambda trial: trial.suggest_categorical('input_dim', [16, 32, 64])
+        hparams['input_dim'] = lambda trial: trial.suggest_categorical('input_dim', [16, 32])
         hparams['n_heads'] = lambda trial: trial.suggest_categorical('n_heads', [2, 4, 8])
         hparams['n_blocks'] = lambda trial: trial.suggest_int('n_blocks', 1, 4)
         hparams['dropout'] = lambda trial: trial.suggest_float('dropout', 0.0, 0.3)
