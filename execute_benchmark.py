@@ -449,7 +449,6 @@ def main():
 
     # --- Final CSV: aggregate mean ± std across all folds ---
     if all_fold_results:
-        import numpy as np
         summary = {'Dataset': args.dataset, 'Label': args.label, 'Model': args.model,
                    'Backbone': args.backbone, 'N_Folds': len(all_fold_results)}
         for key in METRIC_KEYS:
