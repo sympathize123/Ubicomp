@@ -374,6 +374,11 @@ def main():
 
     seeds = [42]
 
+    # Collect per-fold results for final aggregation
+    METRIC_KEYS = ['Train_Accuracy', 'Train_AUROC', 'Val_Accuracy', 'Val_AUROC',
+                   'Test_Accuracy', 'Test_F1', 'Test_AUROC']
+    all_fold_results = []
+
     for entry in fold_data:
         fold_id = entry["fold_id"]
         print(f"\n=== Fold {fold_id + 1}/{group_folds} ===")
@@ -420,23 +425,15 @@ def main():
             print(f"  Val   AUROC: {val_metrics['AUROC']:.4f}, Acc: {val_metrics['Accuracy']:.4f}")
             print(f"  Test  AUROC: {test_metrics['AUROC']:.4f}, Acc: {test_metrics['Accuracy']:.4f}")
 
-            results = {
-                'Dataset': args.dataset, 'Label': args.label, 'Model': args.model,
-                'Backbone': args.backbone, 'Seed': seed, 'Fold': fold_id + 1,
+            fold_result = {
                 'Train_Accuracy': train_metrics['Accuracy'], 'Train_AUROC': train_metrics['AUROC'],
                 'Val_Accuracy': val_metrics['Accuracy'], 'Val_AUROC': val_metrics['AUROC'],
                 'Test_Accuracy': test_metrics['Accuracy'], 'Test_F1': test_metrics['F1'],
                 'Test_AUROC': test_metrics['AUROC']
             }
+            all_fold_results.append(fold_result)
 
-            if os.path.dirname(args.output):
-                os.makedirs(os.path.dirname(args.output), exist_ok=True)
-
-            header = not os.path.exists(args.output)
-            df_res = pd.DataFrame([results])
-            df_res.to_csv(args.output, mode='a', header=header, index=False)
-            print(f"Results saved to {args.output}")
-
+            # Progress CSV: per-fold immediate save (unchanged)
             final_progress_row = {
                 'Dataset': args.dataset, 'Label': args.label, 'Model': args.model,
                 'Backbone': args.backbone, 'Seed': seed, 'Fold': fold_id + 1,
@@ -449,6 +446,27 @@ def main():
             }
             append_row(progress_output_path, final_progress_row, PROGRESS_COLUMNS)
             print(f"Progress results saved to {progress_output_path}")
+
+    # --- Final CSV: aggregate mean ± std across all folds ---
+    if all_fold_results:
+        import numpy as np
+        summary = {'Dataset': args.dataset, 'Label': args.label, 'Model': args.model,
+                   'Backbone': args.backbone, 'N_Folds': len(all_fold_results)}
+        for key in METRIC_KEYS:
+            vals = [r[key] for r in all_fold_results]
+            summary[f'{key}_Mean'] = float(np.mean(vals))
+            summary[f'{key}_Std'] = float(np.std(vals))
+
+        if os.path.dirname(args.output):
+            os.makedirs(os.path.dirname(args.output), exist_ok=True)
+
+        header = not os.path.exists(args.output)
+        df_summary = pd.DataFrame([summary])
+        df_summary.to_csv(args.output, mode='a', header=header, index=False)
+        print(f"\n=== Summary (Mean ± Std over {len(all_fold_results)} folds) ===")
+        for key in METRIC_KEYS:
+            print(f"  {key}: {summary[f'{key}_Mean']:.4f} ± {summary[f'{key}_Std']:.4f}")
+        print(f"Summary saved to {args.output}")
 
 
 
