@@ -1,3 +1,14 @@
+"""
+Quick health check for model training pipelines.
+
+Runs a minimal 1-epoch benchmark per model on a small config to verify that:
+- the model can be instantiated,
+- training/evaluation runs end-to-end,
+- UDA models work when `--uda` is enabled.
+
+Intended for fast sanity checks before long tmux runs.
+"""
+
 import subprocess
 import sys
 import os
@@ -16,6 +27,7 @@ MODELS = [
 DA_MODELS = ['DANN', 'CDAN', 'DAN', 'DeepCORAL', 'MCC', 'ADDA', 'MCD', 'JAN', 'SHOT', 'CBST', 'CGDM']
 
 def run_verification():
+    """Run a short 1-epoch verification for all supported models and report failures."""
     failed_models = []
     passed_models = []
     
@@ -41,11 +53,6 @@ def run_verification():
             if model == 'TabTransformer':
                 # User expects "Linear Attention" for TabTransformer -> Enable efficient_attention
                 cmd.append("--efficient_attention")
-            
-            if model == 'NODE':
-                # Dataset size 12929 % 24 = 17. Batch size 24 is safe and faster.
-                cmd.append("--batch_size")
-                cmd.append("24")
                 
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
             

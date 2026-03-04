@@ -139,7 +139,6 @@ def get_hparams(algorithm, dataset, backbone='MLP'):
     elif algorithm == 'AutoInt':
         hparams['dropout'] = lambda trial: trial.suggest_float('dropout', 0.0, 0.3)
         hparams['att_layer_num'] = lambda trial: trial.suggest_int('att_layer_num', 1, 4)
-        hparams['att_embedding_dim'] = lambda trial: trial.suggest_categorical('att_embedding_dim', [32, 64])
         hparams['att_head_num'] = lambda trial: trial.suggest_categorical('att_head_num', [2, 4, 8])
 
     # 4. Tree-based (XGB/LGB)

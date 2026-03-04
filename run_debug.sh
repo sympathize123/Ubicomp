@@ -3,8 +3,8 @@
 # Usage: bash run_debug.sh [dataset] [label]
 # Defaults: dataset=D-3, label=stress_binary
 
-DATASET="${1:-D-3}"
-LABEL="${2:-stress_binary}"
+DATASET="${1:-D-1}"
+LABEL="${2:-arousal}"
 DEBUG_FLAGS="--hpo_trials 1 --hpo_mode fold1 --max_folds 1 --epochs_override 3"
 
 echo "=== DEBUG RUN: dataset=$DATASET label=$LABEL ==="

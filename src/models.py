@@ -326,21 +326,57 @@ class DeepCTRWrapper(BaseEstimator, ClassifierMixin):
         self.kwargs = kwargs
         self.model = None
         self.feature_columns = None
+        self.feature_names = None
+        self._autoint_bin_edges = None
+
+    def _fit_autoint_input(self, X, feature_names, n_bins):
+        from deepctr_torch.inputs import SparseFeat
+        bin_edges = []
+        model_input = {}
+        feature_columns = []
+
+        for i, name in enumerate(feature_names):
+            col = X[:, i].astype(np.float32)
+            qs = np.linspace(0.0, 1.0, n_bins + 1)
+            edges = np.quantile(col, qs)
+            edges = np.unique(edges)
+            if edges.size <= 1:
+                edges = np.array([edges[0], edges[0] + 1.0], dtype=np.float32)
+            binned = np.digitize(col, edges[1:-1], right=False).astype(np.int64)
+            vocab_size = int(max(2, edges.size))
+            feature_columns.append(SparseFeat(name, vocabulary_size=vocab_size, embedding_dim=8))
+            model_input[name] = binned
+            bin_edges.append(edges)
+
+        self._autoint_bin_edges = bin_edges
+        return feature_columns, model_input
+
+    def _transform_autoint_input(self, X, feature_names):
+        model_input = {}
+        for i, name in enumerate(feature_names):
+            col = X[:, i].astype(np.float32)
+            edges = self._autoint_bin_edges[i]
+            model_input[name] = np.digitize(col, edges[1:-1], right=False).astype(np.int64)
+        return model_input
 
     def fit(self, X, y, X_val=None, y_val=None):
         from deepctr_torch.inputs import DenseFeat
         from deepctr_torch.callbacks import EarlyStopping
 
         feature_names = [f"feat_{i}" for i in range(X.shape[1])]
-        self.feature_columns = [DenseFeat(name, 1) for name in feature_names]
-        train_model_input = {name: X[:, i] for i, name in enumerate(feature_names)}
+        self.feature_names = feature_names
+        train_model_input = None
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
         if self.model_type == 'DCN':
             from deepctr_torch.models import DCN
+            self.feature_columns = [DenseFeat(name, 1) for name in feature_names]
+            train_model_input = {name: X[:, i] for i, name in enumerate(feature_names)}
             self.model = DCN(self.feature_columns, self.feature_columns, task='binary', device=device, **self.kwargs)
         elif self.model_type == 'AutoInt':
             from deepctr_torch.models import AutoInt
+            n_bins = int(self.kwargs.pop('autoint_bins', 16))
+            self.feature_columns, train_model_input = self._fit_autoint_input(X, feature_names, n_bins=n_bins)
             self.model = AutoInt(self.feature_columns, self.feature_columns, task='binary', device=device, **self.kwargs)
             
         self.model.compile("adam", "binary_crossentropy", metrics=['binary_crossentropy', 'auc'])
@@ -348,7 +384,10 @@ class DeepCTRWrapper(BaseEstimator, ClassifierMixin):
         val_data = None
         callbacks = []
         if X_val is not None:
-             val_model_input = {name: X_val[:, i] for i, name in enumerate(feature_names)}
+             if self.model_type == 'AutoInt':
+                 val_model_input = self._transform_autoint_input(X_val, feature_names)
+             else:
+                 val_model_input = {name: X_val[:, i] for i, name in enumerate(feature_names)}
              val_data = (val_model_input, y_val)
              # Add EarlyStopping
              # Fix: DCN failed with AttributeError: 'DCN' object has no attribute 'get_weights'
@@ -361,14 +400,20 @@ class DeepCTRWrapper(BaseEstimator, ClassifierMixin):
         return self
 
     def predict(self, X):
-        feature_names = [f"feat_{i}" for i in range(X.shape[1])]
-        test_model_input = {name: X[:, i] for i, name in enumerate(feature_names)}
+        feature_names = self.feature_names or [f"feat_{i}" for i in range(X.shape[1])]
+        if self.model_type == 'AutoInt':
+            test_model_input = self._transform_autoint_input(X, feature_names)
+        else:
+            test_model_input = {name: X[:, i] for i, name in enumerate(feature_names)}
         pred_ans = self.model.predict(test_model_input, batch_size=self.batch_size)
         return np.where(pred_ans > 0.5, 1, 0).astype(int).flatten()
 
     def predict_proba(self, X):
-        feature_names = [f"feat_{i}" for i in range(X.shape[1])]
-        test_model_input = {name: X[:, i] for i, name in enumerate(feature_names)}
+        feature_names = self.feature_names or [f"feat_{i}" for i in range(X.shape[1])]
+        if self.model_type == 'AutoInt':
+            test_model_input = self._transform_autoint_input(X, feature_names)
+        else:
+            test_model_input = {name: X[:, i] for i, name in enumerate(feature_names)}
         pred_prob = self.model.predict(test_model_input, batch_size=self.batch_size)
         # Construct [p0, p1]
         return np.hstack([1-pred_prob, pred_prob])

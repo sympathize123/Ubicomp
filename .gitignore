@@ -20,6 +20,10 @@ myenv/
 
 # Dataset artifacts
 results/
+results_final/
+saved_models/
+lightning_logs/
+.pt_tmp/
 selected_users_dataset/
 *.pkl
 *.npy

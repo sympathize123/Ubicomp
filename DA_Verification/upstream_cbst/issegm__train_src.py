@@ -23,6 +23,10 @@ from util.lr_scheduler import FixedScheduler, LinearScheduler, PolyScheduler
 from data_src import FileIter, make_divisible, parse_split_file
 
 
+
+
+
+
 def parse_split_file_test(dataset, split, data_root=''):
     split_filename = 'issegm/data_list/{}/{}.lst'.format(dataset, split)
     image_list = []

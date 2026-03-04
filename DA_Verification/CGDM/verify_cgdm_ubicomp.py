@@ -7,12 +7,13 @@ import torch
 import matplotlib.pyplot as plt
 from sklearn.manifold import TSNE
 from sklearn.model_selection import train_test_split
+from src.da_models import DANN, train_dann  # noqa: E402
+
 
 # Ensure Ubicomp root is on path
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
-from src.da_models import DANN, train_dann  # noqa: E402
 
 
 def generate_source_target_data(

@@ -68,32 +68,42 @@ class ResNetBlock(nn.Module):
 class TransformerFeaturizer(nn.Module):
     def __init__(self, input_dim, hidden_dim=128, output_dim=128, num_layers=2, nhead=4, dropout=0.1):
         super(TransformerFeaturizer, self).__init__()
-        # Simple projection to hidden_dim then transformer encoder
-        self.embedding = nn.Linear(input_dim, hidden_dim)
+        # Feature-token transformer: each feature becomes a token.
+        # NOTE: This is standard full attention via nn.TransformerEncoder.
+        # Linear attention is NOT implemented here.
+        # Embed each scalar feature to hidden_dim and add a learned feature-id embedding.
+        self.input_dim = input_dim
+        self.feature_embed = nn.Linear(1, hidden_dim)
+        self.feature_id_embed = nn.Embedding(input_dim, hidden_dim)
         
-        encoder_layer = nn.TransformerEncoderLayer(d_model=hidden_dim, nhead=nhead, dim_feedforward=hidden_dim*2, dropout=dropout, batch_first=True)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=hidden_dim,
+            nhead=nhead,
+            dim_feedforward=hidden_dim * 2,
+            dropout=dropout,
+            batch_first=True,
+        )
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         
         self.output_layer = nn.Linear(hidden_dim, output_dim)
         self.output_dim = output_dim
 
     def forward(self, x):
-        # x is (batch, input_dim). Transformer expects (batch, seq_len, d_model) or similar.
-        # For tabular, this "Transformer" usually treats features as tokens OR simply processes the embedding vector.
-        # If we treat the whole input vector as one token (seq_len=1)? That's barely a transformer.
-        # FT-Transformer treats each feature as a token.
-        # BUT that requires knowing categorical vs continuous and embedding them separately.
-        # Since our input is already preprocessed/normalized float vectors, a full column-wise transformer is complex to retrofit without schema.
-        # HERE: We will implement a "Row Transformer" or simply an MLP-Mixer style or just apply Self-Attention on the expanded feature dimension?
-        # A simple approximation for "Backbone" request on numerical data: 
-        # Project to D, reshaped to (Batch, 1, D) -> Transformer -> (Batch, 1, D) -> Flatten
-        # This is essentially just self-attention on the latent representation.
+        # x: (batch, input_dim)
+        if x.dim() != 2:
+            raise ValueError(f"Expected input of shape (batch, features), got {tuple(x.shape)}")
+        if x.shape[1] != self.input_dim:
+            raise ValueError(f"Expected {self.input_dim} features, got {x.shape[1]}")
+
+        # Tokenize features: (B, F) -> (B, F, 1) -> (B, F, H)
+        tokens = self.feature_embed(x.unsqueeze(-1))
+
+        # Add learned feature-id embeddings to encode feature identity
+        feat_idx = torch.arange(self.input_dim, device=x.device)
+        tokens = tokens + self.feature_id_embed(feat_idx).unsqueeze(0)
+
+        # Self-attention across features
+        out = self.encoder(tokens)  # (B, F, H)
+        out = out.mean(dim=1)       # Pool over features -> (B, H)
         
-        x_emb = self.embedding(x) # (Batch, hidden_dim)
-        x_emb = x_emb.unsqueeze(1) # (Batch, 1, hidden_dim)
-        
-        out = self.encoder(x_emb) # (Batch, 1, hidden_dim)
-        out = out.squeeze(1) # (Batch, hidden_dim)
-        
-        out = self.output_layer(out)
-        return out
+        return self.output_layer(out)

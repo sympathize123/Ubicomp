@@ -14,6 +14,8 @@ from torch.utils.data import DataLoader, TensorDataset
 from src.backbones import MLPFeaturizer, ResNetFeaturizer, TransformerFeaturizer
 
 
+
+
 class FeatureClassifier(nn.Module):
     def __init__(self, featurizer, classifier):
         super().__init__()
@@ -762,7 +764,8 @@ class MASF(nn.Module):
 
     def _triplet_semihard_loss(self, embeddings, labels, margin):
         if embeddings.size(0) < 2:
-            return torch.tensor(0.0, device=embeddings.device)
+            # Keep autograd graph connected even when no valid triplets exist.
+            return embeddings.sum() * 0.0
 
         dist = torch.cdist(embeddings, embeddings, p=2)
         labels = labels.view(-1)
@@ -789,7 +792,8 @@ class MASF(nn.Module):
             loss_vals.append(F.relu(pos_dist_val - neg_dist_val + margin))
 
         if not loss_vals:
-            return torch.tensor(0.0, device=embeddings.device)
+            # Keep autograd graph connected even when no valid triplets exist.
+            return embeddings.sum() * 0.0
 
         return torch.stack(loss_vals).mean()
 
@@ -885,8 +889,9 @@ class MASF(nn.Module):
             label_group,
             margin=self.hparams.get('masf_margin', 1.0)
         )
-        metric_loss_metric.backward()
-        self.metric_optimizer.step()
+        if metric_loss_metric.requires_grad:
+            metric_loss_metric.backward()
+            self.metric_optimizer.step()
 
         return {
             'loss': (source_loss + meta_loss).item(),
@@ -962,7 +967,7 @@ def train_dg_model(model, X_train, y_train, d_train, X_val, y_val, d_val,
         y_d = torch.tensor(y_train[mask], dtype=torch.long)
         dataset = TensorDataset(X_d, y_d)
         domain_datasets.append(dataset)
-        loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=True)
+        loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=False)
         domain_loaders.append(iter(loader))
 
     X_val_t = torch.tensor(X_val, dtype=torch.float32).to(device)
@@ -996,7 +1001,7 @@ def train_dg_model(model, X_train, y_train, d_train, X_val, y_val, d_val,
                     batch = next(loader)
                 except StopIteration:
                     domain_loaders[d_idx] = iter(
-                        DataLoader(domain_datasets[d_idx], batch_size=batch_size, shuffle=True, drop_last=True)
+                        DataLoader(domain_datasets[d_idx], batch_size=batch_size, shuffle=True, drop_last=False)
                     )
                     batch = next(domain_loaders[d_idx])
 

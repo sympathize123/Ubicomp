@@ -418,11 +418,6 @@ def obtain_label(loader, netE, netC1, netC2, device):
         if has_labels:
             acc = np.sum(pred_label == label_np) / len(all_fea)
 
-    if has_labels:
-        log_str = 'Only source accuracy = {:.2f}% -> After the clustering = {:.2f}%'.format(accuracy * 100, acc * 100)
-        print(log_str + '\n')
-    else:
-        print("Target labels unavailable/constant; skipping accuracy report.\n")
     return pred_label.astype('int')
 
 
@@ -472,6 +467,7 @@ def gradient_discrepancy_loss_margin(p_s1, p_s2, s_y, p_t1, p_t2, t_y, netE, net
 def train_cgdm(model, X_source, y_source, X_target, y_target=None,
                X_val=None, y_val=None,
                epochs=20, batch_size=64, lr=1e-4, weight_decay=5e-4, num_k=4, log_interval=100,
+               patience=20,
                device='cuda' if torch.cuda.is_available() else 'cpu'):
     import copy
     from tqdm import tqdm
@@ -549,6 +545,7 @@ def train_cgdm(model, X_source, y_source, X_target, y_target=None,
 
     best_val_score = -float('inf')
     best_model_state = None
+    patience_counter = 0
     mem_label = None
 
     epoch_iterator = tqdm(range(epochs), desc="CGDM Training")
@@ -559,8 +556,7 @@ def train_cgdm(model, X_source, y_source, X_target, y_target=None,
         steps = len(train_loader)
 
         for batch_idx in range(steps - 1):
-            if ep > start and batch_idx % 250 == 0:
-                epoch_iterator.write("Obtaining target label...")
+            if ep > start and (ep % 3 == 0) and batch_idx == 0:
                 mem_label = obtain_label(test_loader_eval, G, F1, F2, device)
                 mem_label = torch.from_numpy(mem_label).to(device)
 
@@ -637,18 +633,18 @@ def train_cgdm(model, X_source, y_source, X_target, y_target=None,
                 all_loss.backward()
                 optimizer_g.step()
 
-            if batch_idx % log_interval == 0:
-                epoch_iterator.write(
-                    f'Ep {ep} [{batch_idx}/{steps}] '
-                    f'Loss1: {loss1.item():.4f} Loss2: {loss2.item():.4f} '
-                    f'Dis: {loss_dis.item():.4f} Ent: {entropy_loss.item():.4f}')
-
         val_loss, val_auroc = _eval_val()
         if val_loss is not None:
             epoch_iterator.set_postfix({'Val Loss': f'{val_loss:.4f}', 'Val AUC': f'{val_auroc:.4f}'})
             if val_auroc > best_val_score:
                 best_val_score = val_auroc
                 best_model_state = copy.deepcopy(model.state_dict())
+                patience_counter = 0
+            else:
+                patience_counter += 1
+                if patience_counter >= patience:
+                    epoch_iterator.write(f"Early stopping at epoch {ep}")
+                    break
 
     if best_model_state is not None:
         model.load_state_dict(best_model_state)

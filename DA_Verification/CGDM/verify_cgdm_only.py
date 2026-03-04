@@ -11,12 +11,13 @@ from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
 from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader, TensorDataset
+from src.da_models import CGDM, DAModel, train_cgdm  # noqa: E402
+
 
 # Ensure Ubicomp root is on path
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
-from src.da_models import CGDM, DAModel, train_cgdm  # noqa: E402
 
 
 def generate_source_target_data(

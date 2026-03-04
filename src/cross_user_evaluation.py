@@ -3,7 +3,6 @@
 Cross-user model evaluation with OTDD distance correlation analysis.
 Usage: python cross_user_evaluation.py [train_user] [distance_matrix_path] [model_dataset_tag]
 """
-
 import sys
 import numpy as np
 import pandas as pd
@@ -12,6 +11,8 @@ from pathlib import Path
 from sklearn.metrics import accuracy_score, average_precision_score, roc_auc_score
 
 from utility import load_selected_dataset, load_user_model_bundle
+
+
 
 
 def _load_baseline_metrics(dataset_tag: str, results_dir: str = 'selected_users_dataset/results') -> pd.DataFrame:

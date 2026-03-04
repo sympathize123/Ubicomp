@@ -6,7 +6,7 @@
 baselines=("XGB" "LGB" "MLP" "ResNet")
 
 # 2. Tabular DL (Fixed Architecture)
-tabular_dl=("TabNet" "TabPFN" "SAINT" "TabTransformer" "FTTransformer" "DCN" "AutoInt")
+tabular_dl=("TabNet" "SAINT" "TabTransformer" "FTTransformer" "DCN" "AutoInt")
 
 # 3. Domain Generalization & Adaptation (Backbone Agnostic)
 dg_da_models=(

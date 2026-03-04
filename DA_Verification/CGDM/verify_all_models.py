@@ -10,11 +10,8 @@ import matplotlib.pyplot as plt
 from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
 from sklearn.model_selection import train_test_split
-
-# Ensure Ubicomp root is on path
-ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(ROOT))
-
+from sklearn.metrics import roc_auc_score
+from tqdm import tqdm
 from src.da_models import (
     DAModel,
     DANN,
@@ -53,6 +50,12 @@ from src.domainbed_algos import (
     CSD,
     SagNet,
 )
+
+
+# Ensure Ubicomp root is on path
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT))
+
 
 
 def generate_source_target_data(
@@ -255,7 +258,7 @@ def predict_logits(model, x, device):
     return logits
 
 
-def target_accuracy(model, x_target, y_target, device):
+def target_metrics(model, x_target, y_target, device):
     model.eval()
     with torch.no_grad():
         x_t = torch.tensor(x_target, dtype=torch.float32, device=device)
@@ -263,7 +266,16 @@ def target_accuracy(model, x_target, y_target, device):
         logits = predict_logits(model, x_t, device)
         preds = torch.argmax(logits, dim=1)
         acc = (preds == y_t).float().mean().item()
-    return acc
+        probs = torch.softmax(logits, dim=1).detach().cpu().numpy()
+        y_np = y_t.detach().cpu().numpy()
+    try:
+        if probs.shape[1] == 2:
+            auroc = roc_auc_score(y_np, probs[:, 1])
+        else:
+            auroc = roc_auc_score(y_np, probs, multi_class="ovr", average="macro")
+    except Exception:
+        auroc = float("nan")
+    return acc, auroc
 
 
 def train_dg(model, X_train, y_train, d_train, epochs, batch_size, domains_per_batch, device, seed):
@@ -369,62 +381,56 @@ def main():
         "dropout": 0.3,
     }
 
-    # Baseline: MLP (source supervised)
-    baseline_model = DAModel(input_dim=num_dims, num_classes=num_classes, hparams=hparams)
-    print("\n=== Baseline MLP ===")
-    start = perf_counter()
-    baseline_trained = train_standard(
-        baseline_model,
-        x_train,
-        y_train,
-        x_val,
-        y_val,
-        epochs=args.epochs,
-        batch_size=args.batch_size,
-        lr=1e-4,
-        patience=args.epochs,
-        device=device,
-    )
-    elapsed = perf_counter() - start
-    acc = target_accuracy(baseline_trained, x_target, y_target, device)
-    plot_tsne_model(baseline_trained, x_source, x_target, out_dir / "tsne_mlp.jpg", device, perplexity=args.perplexity, max_points_per_domain=args.max_tsne, seed=args.seed)
-    results.append({
-        "name": "MLP",
-        "family": "Baseline",
-        "target_acc": acc,
-        "seconds": round(elapsed, 2),
-    })
-
     da_algorithms = [
         ("DANN", DANN(input_dim=num_dims, num_classes=num_classes, num_domains=2, hparams=hparams), lambda m: train_dann(
-            m, x_train, y_train, d_train, x_val, y_val, d_val, epochs=args.epochs, batch_size=args.batch_size, lr=1e-4, patience=args.epochs, device=device, X_target=x_target
+            m, x_train, y_train, d_train, x_val, y_val, d_val,
+            epochs=args.epochs, batch_size=args.batch_size, lr=1e-4, patience=args.epochs,
+            device=device, X_target=x_target, X_test=x_target, y_test=y_target
         )),
         ("CDAN", CDAN(input_dim=num_dims, num_classes=num_classes, num_domains=2, hparams=hparams), lambda m: train_adversarial_da(
-            m, x_train, y_train, d_train, x_val, y_val, d_val, epochs=args.epochs, batch_size=args.batch_size, lr=1e-4, patience=args.epochs, device=device, X_target=x_target
+            m, x_train, y_train, d_train, x_val, y_val, d_val,
+            epochs=args.epochs, batch_size=args.batch_size, lr=1e-4, patience=args.epochs,
+            device=device, X_target=x_target, X_test=x_target, y_test=y_target
         )),
         ("DAN", DAN(input_dim=num_dims, num_classes=num_classes, hparams=hparams), lambda m: train_dan(
-            m, x_train, y_train, d_train, x_val, y_val, d_val, epochs=args.epochs, batch_size=args.batch_size, lr=1e-4, patience=args.epochs, device=device, X_target=x_target
+            m, x_train, y_train, d_train, x_val, y_val, d_val,
+            epochs=args.epochs, batch_size=args.batch_size, lr=1e-4, patience=args.epochs,
+            device=device, X_target=x_target, X_test=x_target, y_test=y_target
         )),
         ("MCC", MCC(input_dim=num_dims, num_classes=num_classes, hparams={"mcc_temp": 2.0, **hparams}), lambda m: train_mcc(
-            m, x_train, y_train, d_train, x_val, y_val, d_val, epochs=args.epochs, batch_size=args.batch_size, lr=1e-4, patience=args.epochs, device=device, X_target=x_target
+            m, x_train, y_train, d_train, x_val, y_val, d_val,
+            epochs=args.epochs, batch_size=args.batch_size, lr=1e-4, patience=args.epochs,
+            device=device, X_target=x_target, X_test=x_target, y_test=y_target
         )),
         ("DeepCORAL", DeepCORAL(input_dim=num_dims, num_classes=num_classes, hparams=hparams), lambda m: train_deepcoral(
-            m, x_train, y_train, d_train, x_val, y_val, d_val, epochs=args.epochs, batch_size=args.batch_size, lr=1e-4, patience=args.epochs, device=device, X_target=x_target
+            m, x_train, y_train, d_train, x_val, y_val, d_val,
+            epochs=args.epochs, batch_size=args.batch_size, lr=1e-4, patience=args.epochs,
+            device=device, X_target=x_target, X_test=x_target, y_test=y_target
         )),
         ("ADDA", ADDA(input_dim=num_dims, num_classes=num_classes, hparams=hparams), lambda m: train_adda(
-            m, x_train, y_train, d_train, x_val, y_val, d_val, epochs=args.epochs, batch_size=args.batch_size, lr=1e-4, patience=args.epochs, device=device, X_target=x_target
+            m, x_train, y_train, d_train, x_val, y_val, d_val,
+            epochs=args.epochs, batch_size=args.batch_size, lr=1e-4, patience=args.epochs,
+            device=device, X_target=x_target, X_test=x_target, y_test=y_target
         )),
         ("JAN", JAN(input_dim=num_dims, num_classes=num_classes, hparams=hparams), lambda m: train_jan(
-            m, x_train, y_train, d_train, x_val, y_val, d_val, epochs=args.epochs, batch_size=args.batch_size, lr=1e-4, patience=args.epochs, device=device, X_target=x_target
+            m, x_train, y_train, d_train, x_val, y_val, d_val,
+            epochs=args.epochs, batch_size=args.batch_size, lr=1e-4, patience=args.epochs,
+            device=device, X_target=x_target, X_test=x_target, y_test=y_target
         )),
         ("MCD", MCD(input_dim=num_dims, num_classes=num_classes, hparams=hparams), lambda m: train_mcd(
-            m, x_train, y_train, d_train, x_val, y_val, d_val, epochs=args.epochs, batch_size=args.batch_size, lr=1e-4, patience=args.epochs, device=device, X_target=x_target
+            m, x_train, y_train, d_train, x_val, y_val, d_val,
+            epochs=args.epochs, batch_size=args.batch_size, lr=1e-4, patience=args.epochs,
+            device=device, X_target=x_target, X_test=x_target, y_test=y_target
         )),
         ("SHOT", SHOT(input_dim=num_dims, num_classes=num_classes, hparams=hparams), lambda m: train_shot(
-            m, x_train, y_train, d_train, x_val, y_val, d_val, epochs=args.epochs, batch_size=args.batch_size, lr=1e-4, patience=args.epochs, device=device, X_target=x_target
+            m, x_train, y_train, d_train, x_val, y_val, d_val,
+            epochs=args.epochs, batch_size=args.batch_size, lr=1e-4, patience=args.epochs,
+            device=device, X_target=x_target, X_test=x_target, y_test=y_target
         )),
         ("CBST", CBST(input_dim=num_dims, num_classes=num_classes, hparams=hparams), lambda m: train_cbst(
-            m, x_train, y_train, d_train, x_val, y_val, d_val, epochs=args.epochs, batch_size=args.batch_size, lr=1e-4, patience=args.epochs, device=device, X_target=x_target
+            m, x_train, y_train, d_train, x_val, y_val, d_val,
+            epochs=args.epochs, batch_size=args.batch_size, lr=1e-4, patience=args.epochs,
+            device=device, X_target=x_target, X_test=x_target, y_test=y_target
         )),
         ("CGDM", CGDM(input_dim=num_dims, num_classes=num_classes), lambda m: train_cgdm(
             m, x_train, y_train, x_target, y_target=y_target, X_val=x_val, y_val=y_val,
@@ -432,20 +438,7 @@ def main():
         )),
     ]
 
-    for name, model, train_fn in da_algorithms:
-        print(f"\n=== DA {name} ===")
-        start = perf_counter()
-        trained = train_fn(model)
-        elapsed = perf_counter() - start
-        acc = target_accuracy(trained, x_target, y_target, device)
-        plot_tsne_model(trained, x_source, x_target, out_dir / f"tsne_{name.lower()}.jpg", device, perplexity=args.perplexity, max_points_per_domain=args.max_tsne, seed=args.seed)
-        results.append({
-            "name": name,
-            "family": "DA",
-            "target_acc": acc,
-            "seconds": round(elapsed, 2),
-        })
-
+    dg_algorithms = []
     if not args.skip_dg:
         # DG models: create synthetic domains on source
         rng = np.random.default_rng(args.seed)
@@ -467,6 +460,58 @@ def main():
             ("SagNet", SagNet(input_dim=num_dims, num_classes=num_classes, hparams={"lr": 1e-4, **hparams})),
         ]
 
+    total_models = 1 + len(da_algorithms) + len(dg_algorithms)
+    pbar = tqdm(total=total_models, desc="Models", ncols=120)
+
+    # Baseline: MLP (source supervised)
+    baseline_model = DAModel(input_dim=num_dims, num_classes=num_classes, hparams=hparams)
+    print("\n=== Baseline MLP ===")
+    start = perf_counter()
+    baseline_trained = train_standard(
+        baseline_model,
+        x_train,
+        y_train,
+        x_val,
+        y_val,
+        epochs=args.epochs,
+        batch_size=args.batch_size,
+        lr=1e-4,
+        patience=args.epochs,
+        device=device,
+        X_test=x_target,
+        y_test=y_target,
+    )
+    elapsed = perf_counter() - start
+    acc, auroc = target_metrics(baseline_trained, x_target, y_target, device)
+    plot_tsne_model(baseline_trained, x_source, x_target, out_dir / "tsne_mlp.jpg", device, perplexity=args.perplexity, max_points_per_domain=args.max_tsne, seed=args.seed)
+    results.append({
+        "name": "MLP",
+        "family": "Baseline",
+        "target_acc": acc,
+        "target_auroc": auroc,
+        "seconds": round(elapsed, 2),
+    })
+    pbar.set_postfix({"model": "MLP", "acc": f"{acc:.4f}", "auroc": f"{auroc:.4f}"})
+    pbar.update(1)
+
+    for name, model, train_fn in da_algorithms:
+        print(f"\n=== DA {name} ===")
+        start = perf_counter()
+        trained = train_fn(model)
+        elapsed = perf_counter() - start
+        acc, auroc = target_metrics(trained, x_target, y_target, device)
+        plot_tsne_model(trained, x_source, x_target, out_dir / f"tsne_{name.lower()}.jpg", device, perplexity=args.perplexity, max_points_per_domain=args.max_tsne, seed=args.seed)
+        results.append({
+            "name": name,
+            "family": "DA",
+            "target_acc": acc,
+            "target_auroc": auroc,
+            "seconds": round(elapsed, 2),
+        })
+        pbar.set_postfix({"model": name, "acc": f"{acc:.4f}", "auroc": f"{auroc:.4f}"})
+        pbar.update(1)
+
+    if not args.skip_dg:
         for name, model in dg_algorithms:
             print(f"\n=== DG {name} ===")
             start = perf_counter()
@@ -482,14 +527,19 @@ def main():
                 seed=args.seed,
             )
             elapsed = perf_counter() - start
-            acc = target_accuracy(trained, x_target, y_target, device)
+            acc, auroc = target_metrics(trained, x_target, y_target, device)
             plot_tsne_model(trained, x_source, x_target, out_dir / f"tsne_{name.lower()}.jpg", device, perplexity=args.perplexity, max_points_per_domain=args.max_tsne, seed=args.seed)
             results.append({
                 "name": name,
                 "family": "DG",
                 "target_acc": acc,
+                "target_auroc": auroc,
                 "seconds": round(elapsed, 2),
             })
+            pbar.set_postfix({"model": name, "acc": f"{acc:.4f}", "auroc": f"{auroc:.4f}"})
+            pbar.update(1)
+
+    pbar.close()
 
     # Save results
     results_path = out_dir / "metrics.json"

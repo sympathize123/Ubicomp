@@ -11,6 +11,7 @@ from tllib.modules.grl import WarmStartGradientReverseLayer
 from tllib.modules.classifier import Classifier as ClassifierBase
 from tllib.utils.metric import binary_accuracy, accuracy
 
+
 __all__ = ['DomainAdversarialLoss']
 
 

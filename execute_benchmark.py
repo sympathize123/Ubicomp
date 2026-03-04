@@ -152,6 +152,8 @@ def train_model(args, X_train, y_train, d_train, X_val, y_val, d_val,
                                dnn_dropout=_dropout, batch_size=batch_size, epochs=epochs, patience=patience, **hparams)
     elif args.model == 'AutoInt':
         _dropout = hparams.pop('dropout', 0.1)
+        # deepctr_torch AutoInt does not support att_embedding_dim in this environment.
+        hparams.pop('att_embedding_dim', None)
         model = DeepCTRWrapper(model_type='AutoInt', dnn_dropout=_dropout,
                                batch_size=batch_size, epochs=epochs, patience=patience, **hparams)
     elif args.model == 'MLP':
@@ -245,6 +247,7 @@ def train_model(args, X_train, y_train, d_train, X_val, y_val, d_val,
         model = train_cgdm(net, X_train, y_train, X_target,
                            X_val=X_val, y_val=y_val,
                            epochs=epochs, batch_size=batch_size, lr=lr,
+                           patience=patience,
                            weight_decay=hparams.get('weight_decay', 5e-4))
 
     if args.model in ['XGB', 'LGB', 'TabNet', 'TabPFN', 'SAINT', 'TabTransformer', 'FTTransformer', 'DCN', 'AutoInt']:
@@ -402,7 +405,6 @@ def main():
             X_val_train = entry["X_val"]
             y_val_train = entry["y_val"]
             if args.uda and args.model in DA_MODELS:
-                print("UDA selection: using target(test) set for early stopping (test-leakage, as requested).")
                 X_val_train = entry["X_test"]
                 y_val_train = entry["y_test"]
 
