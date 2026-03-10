@@ -28,9 +28,8 @@ class XGBoostWrapper(BaseEstimator, ClassifierMixin):
     def __init__(self, n_jobs=-1, patience=20, **kwargs):
         self.patience = patience
         # Force CPU by default to avoid CUDA errors in some environments.
-        # Users can still override by passing tree_method/predictor explicitly.
+        # Users can still override by passing tree_method explicitly.
         kwargs.setdefault("tree_method", "hist")
-        kwargs.setdefault("predictor", "cpu_predictor")
         # XGBoost 2.0+ requires early_stopping_rounds in constructor
         # use_label_encoder is deprecated/removed in 3.0+
         self.model = xgb.XGBClassifier(eval_metric='auc', n_jobs=n_jobs, early_stopping_rounds=patience, **kwargs)
