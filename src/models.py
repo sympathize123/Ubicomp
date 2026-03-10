@@ -5,8 +5,6 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
 import xgboost as xgb
 import lightgbm as lgb
-from pytorch_tabnet.tab_model import TabNetClassifier
-from tabpfn import TabPFNClassifier
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -55,7 +53,7 @@ class LightGBMWrapper(BaseEstimator, ClassifierMixin):
     def fit(self, X, y, X_val=None, y_val=None):
         eval_set = [(X_val, y_val)] if X_val is not None else None
         callbacks = [lgb.early_stopping(self.patience, verbose=True)] if eval_set else None
-        self.model.fit(X, y, eval_set=eval_set, eval_metric='auc', callbacks=callbacks)
+        self.model.fit(X.values, y, eval_set=eval_set, eval_metric='auc', callbacks=callbacks)
         return self
 
     def predict(self, X):
@@ -93,48 +91,6 @@ class TabNetWrapper(BaseEstimator, ClassifierMixin):
         return self.model.predict(X)
 
     def predict_proba(self, X):
-        return self.model.predict_proba(X)
-
-class TabPFNWrapper(BaseEstimator, ClassifierMixin):
-    def __init__(self, seed=None, subsample_seed=None, **kwargs):
-        # TabPFNClassifier does not accept seed in __init__
-        self.subsample_seed = subsample_seed
-        self.model = TabPFNClassifier(device='cuda' if torch.cuda.is_available() else 'cpu', **kwargs)
-
-    def fit(self, X, y, X_val=None, y_val=None):
-        from tabpfn import TabPFNClassifier
-        # TabPFN doesn't use validation set for early stopping, it's a PFN.
-        
-        # Use specific seed for subsampling if provided, otherwise global numpy state
-        rng = np.random.RandomState(self.subsample_seed) if self.subsample_seed is not None else np.random
-        
-        if X.shape[0] > 2048:
-             # print(f"TabPFN Warning: Input size {X.shape[0]} > 2048. Subsampling to 2048 for feasibility.")
-             indices = rng.choice(X.shape[0], 2048, replace=False)
-             X = X[indices]
-             y = y[indices]
-        
-        # TabPFN feature limit check
-        if X.shape[1] > 100:
-             # print(f"TabPFN Warning: Feature count {X.shape[1]} > 100. Subsampling to 100 features.")
-             vars = np.var(X, axis=0)
-             top_indices = np.argsort(vars)[-100:]
-             X = X[:, top_indices]
-             self.feature_indices = top_indices
-        else:
-             self.feature_indices = None
-             
-        self.model.fit(X, y)
-        return self
-
-    def predict(self, X):
-        if hasattr(self, 'feature_indices') and self.feature_indices is not None:
-             X = X[:, self.feature_indices]
-        return self.model.predict(X)
-
-    def predict_proba(self, X):
-        if hasattr(self, 'feature_indices') and self.feature_indices is not None:
-             X = X[:, self.feature_indices]
         return self.model.predict_proba(X)
 
 # --- Wrappers for Advanced Tabular DL ---

@@ -138,15 +138,13 @@ We model our protocol after these accepted NeurIPS/ICLR benchmarks:
     - **NODE** (Neural Oblivious Decision Ensembles)
     - **SAINT** (Self-Attention and Intersample Attention)
     - **FT-Transformer** (Feature Tokenizer + Transformer)
-- [ ] **Foundation Models**:
-    - **TabPFN** (Prior-Data Fitted Network): A transformer pre-trained on synthetic datasets, acting as a foundation model for tabular data.
 - **Action**: Integrate these into `src/models.py` wrappers.
 
 ### Phase 5: Large-Scale Benchmarking
 - **Goal**: Run full factorial experiments (Grid Search or fixed hyperparams).
 - **Matrix**:
     - Datasets: D-1, D-2, D-3
-    - Models: All DG/DA list + Tabular DL + Foundation Models
+    - Models: All DG/DA list + Tabular DL
     - Backbones: MLP, ResNet, Transformer
     - Seeds: 3-5 runs
 - **Action**: Use `run_benchmark_all.sh` (needs update) to execute batch jobs.
@@ -158,4 +156,3 @@ We model our protocol after these accepted NeurIPS/ICLR benchmarks:
 ---
 **Legacy Plan (Archived)**
 *Previous sections regarding XGBoost pretraining and basic pipeline setup are superseded by the current `src/` based architecture.*
-
