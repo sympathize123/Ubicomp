@@ -555,11 +555,13 @@ def train_cgdm(model, X_source, y_source, X_target, y_target=None,
         iter_target = cycle(test_loader)
         steps = len(train_loader)
 
-        for batch_idx in range(steps - 1):
-            if ep > start and (ep % 3 == 0) and batch_idx == 0:
-                mem_label = obtain_label(test_loader_eval, G, F1, F2, device)
-                mem_label = torch.from_numpy(mem_label).to(device)
+        # Pseudo labels are required when ep > start.
+        # Ensure we bootstrap once before first use, then refresh every 3 epochs.
+        if ep > start and (mem_label is None or ep % 3 == 0):
+            mem_label = obtain_label(test_loader_eval, G, F1, F2, device)
+            mem_label = torch.from_numpy(mem_label).to(device)
 
+        for batch_idx in range(steps - 1):
             G.train(); F1.train(); F2.train()
 
             try:
