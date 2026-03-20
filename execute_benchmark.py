@@ -264,7 +264,16 @@ def main():
 
     print(f"Loading {args.dataset} (Label: {args.label})...")
 
-    if args.dataset == 'D-1':
+    if args.label == "stress_binary":
+        if args.dataset == 'D-1':
+            dataset_path = os.path.join(BASE_DATA_DIR, "stress_binary_personal-full_D-1.pkl")
+        elif args.dataset == 'D-2':
+            dataset_path = os.path.join(BASE_DATA_DIR, "stress_binary_personal-full_D-2.pkl")
+        elif args.dataset == 'D-3':
+            dataset_path = os.path.join(BASE_DATA_DIR, "stress_binary_personal-full_D-3.pkl")
+        else:
+            raise ValueError("Unknown dataset")
+    elif args.dataset == 'D-1':
         dataset_path = os.path.join(BASE_DATA_DIR, f"{args.label}_personal-full_D#2.pkl")
     elif args.dataset == 'D-2':
         dataset_path = os.path.join(BASE_DATA_DIR, f"{args.label}_personal-full_D#3.pkl")
