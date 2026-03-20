@@ -238,8 +238,9 @@ def _build_cross_dataset_splits(aligned: Dict[str, Dict], train_datasets: List[s
     for ds in train_datasets:
         X_train_parts.append(aligned[ds]['X'])
         y_train_parts.append(aligned[ds]['y'])
-        u_train_parts.append(aligned[ds]['users'])
+        # Prefix user IDs with dataset name to avoid collisions across datasets
         users = aligned[ds]['users']
+        u_train_parts.append(np.array([f'{ds}:{u}' for u in users], dtype=object))
         groups = np.array([f'{ds}:{u}' for u in users], dtype=object)
         g_train_parts.append(groups)
 
@@ -259,7 +260,7 @@ def _build_cross_dataset_splits(aligned: Dict[str, Dict], train_datasets: List[s
     # Per-user normalization on test dataset (no train samples — uses own stats)
     X_te_raw = aligned[test_dataset]['X']
     y_te = aligned[test_dataset]['y']
-    u_te = aligned[test_dataset]['users']
+    u_te = np.array([f'{test_dataset}:{u}' for u in aligned[test_dataset]['users']], dtype=object)
     train_mask_te = np.zeros(len(u_te), dtype=bool)  # all False: test users normalize by themselves
     X_te = _normalize_per_user(X_te_raw, u_te, train_mask_te)
 
@@ -339,14 +340,17 @@ def _run_experiment(args, aligned: Dict[str, Dict], common_features: List[str], 
         val_ratio=args.val_ratio,
     )
 
-    # Enable UDA automatically for DA models unless disabled
+    # Enable UDA automatically for DA models unless disabled.
+    # Use a local copy so we don't mutate the shared args object across experiments.
+    import copy
+    exp_args = copy.copy(args)
     use_uda = args.uda or (args.model in DA_MODELS and not args.disable_auto_uda)
-    args.uda = bool(use_uda)
+    exp_args.uda = bool(use_uda)
 
     # During HPO, do NOT pass the test set as X_target — that leaks test distribution into hparam selection.
     # DA models adapt to unlabeled target data; for HPO we pass None so adaptation is skipped or uses val.
     best_hparams = _run_hpo(
-        args=args,
+        args=exp_args,
         train_dataset_key=train_datasets[0],
         X_tr=X_tr,
         y_tr=y_tr,
@@ -359,10 +363,10 @@ def _run_experiment(args, aligned: Dict[str, Dict], common_features: List[str], 
     )
 
     # Use test set as X_target only for final model training (after HPO is done)
-    X_target = X_te if args.uda and args.model in DA_MODELS else None
+    X_target = X_te if exp_args.uda and args.model in DA_MODELS else None
 
     model = train_model(
-        args=args,
+        args=exp_args,
         X_train=X_tr,
         y_train=y_tr,
         d_train=d_tr,
