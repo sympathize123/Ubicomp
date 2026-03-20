@@ -8,6 +8,7 @@
 set -euo pipefail
 
 PROGRESS_CSV="results/benchmark_results_da_hpo_progress.csv"
+SUMMARY_CSV="results/benchmark_results_da_hpo.csv"
 REQUIRED_FOLDS=5
 
 # DA models (require --uda)
@@ -37,11 +38,11 @@ is_excluded() {
 
 is_done() {
     local dataset="$1" label="$2" model="$3" backbone="$4"
-    if [ ! -f "$PROGRESS_CSV" ]; then
-        return 1
-    fi
-    local folds
-    folds=$(python3 - "$PROGRESS_CSV" "$dataset" "$label" "$model" "$backbone" <<'PY'
+    local folds_progress=0
+    local folds_summary=0
+
+    if [ -f "$PROGRESS_CSV" ]; then
+        folds_progress=$(python3 - "$PROGRESS_CSV" "$dataset" "$label" "$model" "$backbone" <<'PY'
 import csv, sys
 path, dataset, label, model, backbone = sys.argv[1:]
 count = 0
@@ -55,7 +56,30 @@ with open(path, newline='') as f:
 print(count)
 PY
 )
-    [ "${folds:-0}" -ge "$REQUIRED_FOLDS" ]
+    fi
+
+    # Summary CSV has one row per completed combo (N_Folds should be 5 when done).
+    if [ -f "$SUMMARY_CSV" ]; then
+        folds_summary=$(python3 - "$SUMMARY_CSV" "$dataset" "$label" "$model" "$backbone" <<'PY'
+import csv, sys
+path, dataset, label, model, backbone = sys.argv[1:]
+best = 0
+with open(path, newline='') as f:
+    for row in csv.DictReader(f):
+        if (row.get('Dataset') == dataset and row.get('Label') == label and
+            row.get('Model') == model and row.get('Backbone') == backbone):
+            try:
+                n_folds = int(float(row.get('N_Folds', '0') or 0))
+            except Exception:
+                n_folds = 0
+            if n_folds > best:
+                best = n_folds
+print(best)
+PY
+)
+    fi
+
+    [ "${folds_progress:-0}" -ge "$REQUIRED_FOLDS" ] || [ "${folds_summary:-0}" -ge "$REQUIRED_FOLDS" ]
 }
 
 run_model() {
@@ -106,9 +130,23 @@ for model in "IRM" "VREx" "GroupDRO" "MixStyle" "MLDG" "MASF" "Fish" "CSD" "SagN
 done
 
 # ============================================================
+# 2-1) D-1 / stress_binary — ALL models
+# ============================================================
+for model in "XGB" "LGB" "MLP" "ResNet"; do
+    run_model "D-1" "stress_binary" "$model"
+done
+for model in "TabNet" "SAINT" "TabTransformer" "FTTransformer" "DCN"; do
+    run_model "D-1" "stress_binary" "$model"
+done
+for model in "IRM" "VREx" "GroupDRO" "MixStyle" "MLDG" "MASF" "Fish" "CSD" "SagNet" \
+             "DANN" "CDAN" "DAN" "DeepCORAL" "MCC" "ADDA" "MCD" "JAN" "SHOT" "CBST" "CGDM"; do
+    run_model "D-1" "stress_binary" "$model" "MLP"
+done
+
+# ============================================================
 # 3) D-2 — ALL labels × ALL models
 # ============================================================
-for label in "arousal" "disturbance" "valence"; do
+for label in "arousal" "disturbance" "stress_binary" "valence"; do
     for model in "XGB" "LGB" "MLP" "ResNet"; do
         run_model "D-2" "$label" "$model"
     done
@@ -124,7 +162,7 @@ done
 # ============================================================
 # 4) D-3 — ALL labels × ALL models
 # ============================================================
-for label in "angry" "arousal" "disturbance" "happy" "valence"; do
+for label in "angry" "anxious" "arousal" "cheerful" "content" "depressed" "disturbance" "happy" "relaxed" "sad" "stress_binary" "valence"; do
     for model in "XGB" "LGB" "MLP" "ResNet"; do
         run_model "D-3" "$label" "$model"
     done
