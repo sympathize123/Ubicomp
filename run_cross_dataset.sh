@@ -22,15 +22,16 @@ RUN_SETTING="${3:-all}"
 HPO_TRIALS="${4:-5}"
 
 COMMON_LABELS=("arousal" "disturbance" "valence")
-
 ALL_MODELS=(
   "XGB" "LGB" "MLP" "ResNet"
-  "DANN" "CDAN" "DAN" "DeepCORAL" "MCC" "ADDA" "MCD" "JAN" "SHOT" "CBST" "CGDM"
-  "TabNet" "SAINT" "TabTransformer" "FTTransformer" "DCN" "AutoInt"
+  "DANN" "CDAN" "DAN" "DeepCORAL" "MCC" "ADDA" "MCD" "JAN" "SHOT" "CBST" 
+  #"CGDM"
+  "TabNet" 
+  #"SAINT" 
+  #"TabTransformer" "FTTransformer" "DCN"
   "IRM" "VREx" "GroupDRO" "MixStyle" "ERM_DG" "MLDG" "MASF" "Fish" "CSD" "SagNet"
 )
-
-ALL_BACKBONES=("MLP")
+ALL_BACKBONES=("MLP" "ResNet" "Transformer")
 BACKBONE_AWARE_MODELS=(
   "DANN" "CDAN" "DAN" "DeepCORAL" "MCC" "ADDA" "MCD" "JAN" "SHOT" "CBST" "CGDM"
   "IRM" "VREx" "GroupDRO" "MixStyle" "ERM_DG" "MLDG" "MASF" "Fish" "CSD" "SagNet"
@@ -39,10 +40,15 @@ BACKBONE_AWARE_MODELS=(
 is_backbone_aware() {
   local model="$1"
   for m in "${BACKBONE_AWARE_MODELS[@]}"; do
-    if [[ "$m" == "$model" ]]; then
-      return 0
-    fi
+    [[ "$m" == "$model" ]] && return 0
   done
+  return 1
+}
+
+is_finished() {
+  local label="$1" model="$2" bb="$3"
+  local output_file="results/cross_dataset_${label}_${model}_${bb}_${RUN_SETTING}.csv"
+  [[ -f "$output_file" ]] && return 0
   return 1
 }
 
@@ -55,16 +61,22 @@ fi
 mkdir -p results
 
 for label in "${COMMON_LABELS[@]}"; do
+  feature_report="results/cross_dataset_feature_report_${label}.csv"
+  if [[ -f "$feature_report" ]]; then
+    echo "[SKIP ANALYZE] label=${label} — feature report already exists"
+    continue
+  fi
   echo "========================================="
   echo "[ANALYZE] label=${label}"
   echo "========================================="
   python3 execute_cross_dataset.py \
     --label "${label}" \
     --mode analyze \
-    --feature_report "results/cross_dataset_feature_report_${label}.csv"
+    --feature_report "$feature_report"
 done
 
 TOTAL_JOBS=0
+SKIPPED_JOBS=0
 for model in "${MODELS_TO_RUN[@]}"; do
   if [[ "$BACKBONE" == "ALL" ]]; then
     if is_backbone_aware "$model"; then
@@ -75,8 +87,19 @@ for model in "${MODELS_TO_RUN[@]}"; do
   else
     backbones=("$BACKBONE")
   fi
-  TOTAL_JOBS=$((TOTAL_JOBS + ${#backbones[@]} * ${#COMMON_LABELS[@]}))
+  for bb in "${backbones[@]}"; do
+    for label in "${COMMON_LABELS[@]}"; do
+      TOTAL_JOBS=$((TOTAL_JOBS + 1))
+      if is_finished "$label" "$model" "$bb"; then
+        SKIPPED_JOBS=$((SKIPPED_JOBS + 1))
+      fi
+    done
+  done
 done
+
+echo "========================================="
+echo "[INFO] Total jobs: ${TOTAL_JOBS} | Already finished (will skip): ${SKIPPED_JOBS} | To run: $((TOTAL_JOBS - SKIPPED_JOBS))"
+echo "========================================="
 
 JOB_IDX=0
 for model in "${MODELS_TO_RUN[@]}"; do
@@ -93,6 +116,12 @@ for model in "${MODELS_TO_RUN[@]}"; do
   for bb in "${backbones[@]}"; do
     for label in "${COMMON_LABELS[@]}"; do
       JOB_IDX=$((JOB_IDX + 1))
+
+      if is_finished "$label" "$model" "$bb"; then
+        echo "[SKIP ${JOB_IDX}/${TOTAL_JOBS}] label=${label}, model=${model}, backbone=${bb} — output already exists"
+        continue
+      fi
+
       echo "========================================="
       echo "[RUN ${JOB_IDX}/${TOTAL_JOBS}] label=${label}, model=${model}, backbone=${bb}, setting=${RUN_SETTING}"
       echo "========================================="

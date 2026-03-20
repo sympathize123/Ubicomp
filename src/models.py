@@ -3,7 +3,6 @@ import pandas as pd
 from sklearn.base import BaseEstimator, ClassifierMixin
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
-import xgboost as xgb
 import lightgbm as lgb
 import torch
 import torch.nn as nn
@@ -24,6 +23,7 @@ from tqdm import tqdm
 
 class XGBoostWrapper(BaseEstimator, ClassifierMixin):
     def __init__(self, n_jobs=-1, patience=20, **kwargs):
+        import xgboost as xgb
         self.patience = patience
         # Force CPU by default to avoid CUDA errors in some environments.
         # Users can still override by passing tree_method explicitly.
@@ -52,7 +52,7 @@ class LightGBMWrapper(BaseEstimator, ClassifierMixin):
     def fit(self, X, y, X_val=None, y_val=None):
         eval_set = [(X_val, y_val)] if X_val is not None else None
         callbacks = [lgb.early_stopping(self.patience, verbose=True)] if eval_set else None
-        self.model.fit(X.values, y, eval_set=eval_set, eval_metric='auc', callbacks=callbacks)
+        self.model.fit(X, y, eval_set=eval_set, eval_metric='auc', callbacks=callbacks)
         return self
 
     def predict(self, X):

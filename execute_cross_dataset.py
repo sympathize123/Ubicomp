@@ -188,6 +188,7 @@ def _select_common_features(bundles: Dict[str, Dict], common_features: List[str]
 
 
 def _standardize_by_train(X_train: np.ndarray, X_val: np.ndarray, X_test: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Global standardization using train statistics. Applied after per-user normalization in _build_cross_dataset_splits."""
     mean = np.mean(X_train, axis=0)
     std = np.std(X_train, axis=0)
     std[std < 1e-6] = 1.0
@@ -206,6 +207,25 @@ def _standardize_by_train(X_train: np.ndarray, X_val: np.ndarray, X_test: np.nda
     return X_train_n, X_val_n, X_test_n
 
 
+def _normalize_per_user(X: np.ndarray, users: np.ndarray, train_mask: np.ndarray) -> np.ndarray:
+    """Per-user z-score normalization: compute mean/std from each user's train samples,
+    apply to all of that user's samples. Consistent with BenchmarkDataset.normalize_features()."""
+    X_out = X.copy()
+    for user in np.unique(users):
+        u_mask = users == user
+        u_train_mask = u_mask & train_mask
+        if u_train_mask.any():
+            mean = X[u_train_mask].mean(axis=0)
+            std = X[u_train_mask].std(axis=0)
+        else:
+            # No train samples for this user (test-only dataset): normalize by own stats
+            mean = X[u_mask].mean(axis=0)
+            std = X[u_mask].std(axis=0)
+        std[std < 1e-6] = 1.0
+        X_out[u_mask] = (X[u_mask] - mean) / std
+    return X_out.astype(np.float32)
+
+
 def _make_stratified_split(y: np.ndarray, seed: int, val_ratio: float) -> Tuple[np.ndarray, np.ndarray]:
     indices = np.arange(len(y))
     if len(np.unique(y)) < 2:
@@ -221,20 +241,35 @@ def _make_stratified_split(y: np.ndarray, seed: int, val_ratio: float) -> Tuple[
 
 
 def _build_cross_dataset_splits(aligned: Dict[str, Dict], train_datasets: List[str], test_dataset: str, seed: int, val_ratio: float):
-    X_train_parts, y_train_parts, g_train_parts = [], [], []
+    X_train_parts, y_train_parts, u_train_parts, g_train_parts = [], [], [], []
 
     for ds in train_datasets:
         X_train_parts.append(aligned[ds]['X'])
         y_train_parts.append(aligned[ds]['y'])
+        u_train_parts.append(aligned[ds]['users'])
         users = aligned[ds]['users']
         groups = np.array([f'{ds}:{u}' for u in users], dtype=object)
         g_train_parts.append(groups)
 
     X_src = np.concatenate(X_train_parts, axis=0)
     y_src = np.concatenate(y_train_parts, axis=0)
+    u_src = np.concatenate(u_train_parts, axis=0)
     g_src = np.concatenate(g_train_parts, axis=0)
 
+    # Per-user normalization on source data (train mask covers all source samples for initial norm,
+    # then val split is carved out; users entirely in val use their own mean/std)
     tr_idx, va_idx = _make_stratified_split(y_src, seed=seed, val_ratio=val_ratio)
+    train_mask_src = np.zeros(len(y_src), dtype=bool)
+    train_mask_src[tr_idx] = True
+
+    X_src = _normalize_per_user(X_src, u_src, train_mask_src)
+
+    # Per-user normalization on test dataset (no train samples — uses own stats)
+    X_te_raw = aligned[test_dataset]['X']
+    y_te = aligned[test_dataset]['y']
+    u_te = aligned[test_dataset]['users']
+    train_mask_te = np.zeros(len(u_te), dtype=bool)  # all False: test users normalize by themselves
+    X_te = _normalize_per_user(X_te_raw, u_te, train_mask_te)
 
     X_tr = X_src[tr_idx]
     y_tr = y_src[tr_idx]
@@ -244,9 +279,7 @@ def _build_cross_dataset_splits(aligned: Dict[str, Dict], train_datasets: List[s
     y_va = y_src[va_idx]
     g_va = g_src[va_idx]
 
-    X_te = aligned[test_dataset]['X']
-    y_te = aligned[test_dataset]['y']
-
+    # Global clipping based on train stats only (after per-user norm)
     X_tr, X_va, X_te = _standardize_by_train(X_tr, X_va, X_te)
 
     le = LabelEncoder()
@@ -318,7 +351,8 @@ def _run_experiment(args, aligned: Dict[str, Dict], common_features: List[str], 
     use_uda = args.uda or (args.model in DA_MODELS and not args.disable_auto_uda)
     args.uda = bool(use_uda)
 
-    X_target = X_te if args.uda and args.model in DA_MODELS else None
+    # During HPO, do NOT pass the test set as X_target — that leaks test distribution into hparam selection.
+    # DA models adapt to unlabeled target data; for HPO we pass None so adaptation is skipped or uses val.
     best_hparams = _run_hpo(
         args=args,
         train_dataset_key=train_datasets[0],
@@ -328,9 +362,12 @@ def _run_experiment(args, aligned: Dict[str, Dict], common_features: List[str], 
         X_va=X_va,
         y_va=y_va,
         d_va=d_va,
-        X_target=X_target,
+        X_target=None,
         num_domains=num_domains,
     )
+
+    # Use test set as X_target only for final model training (after HPO is done)
+    X_target = X_te if args.uda and args.model in DA_MODELS else None
 
     model = train_model(
         args=args,
