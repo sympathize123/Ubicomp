@@ -187,24 +187,16 @@ def _select_common_features(bundles: Dict[str, Dict], common_features: List[str]
     return out
 
 
-def _standardize_by_train(X_train: np.ndarray, X_val: np.ndarray, X_test: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Global standardization using train statistics. Applied after per-user normalization in _build_cross_dataset_splits."""
-    mean = np.mean(X_train, axis=0)
-    std = np.std(X_train, axis=0)
-    std[std < 1e-6] = 1.0
-
-    X_train_n = (X_train - mean) / std
-    X_val_n = (X_val - mean) / std
-    X_test_n = (X_test - mean) / std
-
-    # Robust clipping by train stats only
-    clip = np.percentile(np.abs(X_train_n.reshape(-1)), 99.9)
-    clip = max(10.0, float(clip))
-
-    X_train_n = np.clip(X_train_n, -clip, clip).astype(np.float32)
-    X_val_n = np.clip(X_val_n, -clip, clip).astype(np.float32)
-    X_test_n = np.clip(X_test_n, -clip, clip).astype(np.float32)
-    return X_train_n, X_val_n, X_test_n
+def _clip_by_train(X_train: np.ndarray, X_val: np.ndarray, X_test: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Clip outliers using the 99.9th percentile of absolute train values.
+    Per-user normalization has already been applied — no further z-scoring here."""
+    clip = float(np.percentile(np.abs(X_train.reshape(-1)), 99.9))
+    clip = max(10.0, clip)
+    return (
+        np.clip(X_train, -clip, clip).astype(np.float32),
+        np.clip(X_val,   -clip, clip).astype(np.float32),
+        np.clip(X_test,  -clip, clip).astype(np.float32),
+    )
 
 
 def _normalize_per_user(X: np.ndarray, users: np.ndarray, train_mask: np.ndarray) -> np.ndarray:
@@ -279,8 +271,8 @@ def _build_cross_dataset_splits(aligned: Dict[str, Dict], train_datasets: List[s
     y_va = y_src[va_idx]
     g_va = g_src[va_idx]
 
-    # Global clipping based on train stats only (after per-user norm)
-    X_tr, X_va, X_te = _standardize_by_train(X_tr, X_va, X_te)
+    # Clip outliers based on train stats only (per-user norm already applied above)
+    X_tr, X_va, X_te = _clip_by_train(X_tr, X_va, X_te)
 
     le = LabelEncoder()
     le.fit(g_src)
@@ -362,7 +354,7 @@ def _run_experiment(args, aligned: Dict[str, Dict], common_features: List[str], 
         X_va=X_va,
         y_va=y_va,
         d_va=d_va,
-        X_target=None,
+        X_target=None,  # No test leakage during HPO
         num_domains=num_domains,
     )
 
