@@ -15,7 +15,7 @@ echo "=== DEBUG RUN (resume): dataset=$DATASET label=$LABEL ==="
 echo "Progress CSV: $PROGRESS_CSV (required folds per model: $REQUIRED_FOLDS)"
 
 baselines=("XGB" "LGB" "MLP" "ResNet")
-tabular_dl=("TabNet" "TabPFN" "SAINT" "TabTransformer" "FTTransformer" "DCN" "AutoInt")
+tabular_dl=("TabNet" "SAINT" "TabTransformer" "FTTransformer" "DCN" "AutoInt")
 dg_models=("IRM" "VREx" "GroupDRO" "MixStyle" "MLDG" "MASF" "Fish" "CSD" "SagNet")
 da_models=("DANN" "CDAN" "DAN" "DeepCORAL" "MCC" "ADDA" "MCD" "JAN" "SHOT" "CBST" "CGDM")
 

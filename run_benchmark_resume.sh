@@ -1,7 +1,7 @@
 #!/bin/bash
 # Resume benchmark from progress CSV.
 # Last crash point (from tmux log): D-1 / disturbance / AutoInt.
-# AutoInt, TabPFN are excluded (OOM/instability).
+# AutoInt is excluded (OOM/instability).
 # This script skips combos that already have >= 5 completed folds in:
 # results/benchmark_results_da_hpo_progress.csv
 
@@ -13,7 +13,7 @@ REQUIRED_FOLDS=5
 
 # DA models (require --uda)
 da_models=("DANN" "CDAN" "DAN" "DeepCORAL" "MCC" "ADDA" "MCD" "JAN" "SHOT" "CBST" "CGDM")
-excluded_models=("AutoInt" "TabPFN")
+excluded_models=("AutoInt")
 
 is_da() {
     local m="$1"

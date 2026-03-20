@@ -18,7 +18,6 @@ It is synchronized with the high-level roadmap in `PLANNING.md`.
     - [x] SAINT
     - [x] NODE
     - [x] DCN-v2 (DeepCTR)
-    - [x] TabPFN (Foundation Model)
 - [x] Register Models in `execute_benchmark.py`
 
 ### Domain Generalization (DG)

@@ -256,12 +256,6 @@ elif args.model == 'MyDAModel':
 
 ## Model Limitations & Best Practices
 
-### TabPFN (Tabular Prior-Data Fitted Network)
-**Limitations:**
-- **Dataset Size:** TabPFN is designed for small to medium-sized datasets. It has a hard limit on input size (typically 2048 samples) and feature count (100 features).
-- **Subsampling:** For datasets larger than these limits, the model requires subsampling. This can lead to significant information loss and suboptimal performance on large-scale datasets (like D-3 with >20k samples).
-- **Recommendation:** Avoid using TabPFN for large-scale benchmarks (>5k samples, >100 features) unless investigating few-shot performance or specific subsampling strategies.
-
 ### Tabular Deep Learning Models (SAINT, TabTransformer, etc.)
 - Ensure hyperparameters match the specific implementation (e.g., `pytorch-widedeep`).
 - Use `n_jobs` for data loading carefully to avoid CPU bottlenecks.

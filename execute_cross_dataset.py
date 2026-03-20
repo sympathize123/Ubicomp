@@ -19,12 +19,14 @@ from typing import Dict, List, Tuple
 import numpy as np
 import pandas as pd
 import torch
+from sklearn.model_selection import StratifiedShuffleSplit
 from sklearn.preprocessing import LabelEncoder
 
-from execute_benchmark import make_groupwise_val_split, train_model
+from execute_benchmark import train_model
+from src.hparams_registry import get_hparams
 from src.models import evaluate_model
 
-BASE_DATA_DIR = '/home/iclab/minseo/Ubicomp/data'
+BASE_DATA_DIR = str((Path(__file__).resolve().parent / 'data').resolve())
 COMMON_LABELS = ['arousal', 'disturbance', 'valence']
 DATASET_PATH_TMPL = {
     'D-1': '{label}_personal-full_D#2.pkl',
@@ -34,10 +36,11 @@ DATASET_PATH_TMPL = {
 DA_MODELS = ['DANN', 'CDAN', 'DAN', 'DeepCORAL', 'MCC', 'ADDA', 'MCD', 'JAN', 'SHOT', 'CBST', 'CGDM']
 
 RESULT_COLUMNS = [
-    'Setting', 'Label', 'Model', 'Backbone', 'Train_Datasets', 'Test_Dataset',
+    'Setting', 'Label', 'Model', 'Backbone', 'Seed', 'Val_Ratio', 'HPO_Trials',
+    'Train_Datasets', 'Test_Dataset',
     'Common_Features', 'Train_Samples', 'Val_Samples', 'Test_Samples',
     'Train_Accuracy', 'Train_AUROC', 'Val_Accuracy', 'Val_AUROC',
-    'Test_Accuracy', 'Test_F1', 'Test_AUROC'
+    'Test_Accuracy', 'Test_F1', 'Test_AUROC', 'Hparams_JSON'
 ]
 
 
@@ -203,7 +206,21 @@ def _standardize_by_train(X_train: np.ndarray, X_val: np.ndarray, X_test: np.nda
     return X_train_n, X_val_n, X_test_n
 
 
-def _build_cross_dataset_splits(aligned: Dict[str, Dict], train_datasets: List[str], test_dataset: str, seed: int):
+def _make_stratified_split(y: np.ndarray, seed: int, val_ratio: float) -> Tuple[np.ndarray, np.ndarray]:
+    indices = np.arange(len(y))
+    if len(np.unique(y)) < 2:
+        rng = np.random.default_rng(seed)
+        shuffled = rng.permutation(indices)
+        split_at = max(1, int(round(len(indices) * (1.0 - val_ratio))))
+        split_at = min(split_at, len(indices) - 1)
+        return shuffled[:split_at], shuffled[split_at:]
+
+    splitter = StratifiedShuffleSplit(n_splits=1, test_size=val_ratio, random_state=seed)
+    train_idx, val_idx = next(splitter.split(np.zeros(len(y)), y))
+    return train_idx, val_idx
+
+
+def _build_cross_dataset_splits(aligned: Dict[str, Dict], train_datasets: List[str], test_dataset: str, seed: int, val_ratio: float):
     X_train_parts, y_train_parts, g_train_parts = [], [], []
 
     for ds in train_datasets:
@@ -217,8 +234,7 @@ def _build_cross_dataset_splits(aligned: Dict[str, Dict], train_datasets: List[s
     y_src = np.concatenate(y_train_parts, axis=0)
     g_src = np.concatenate(g_train_parts, axis=0)
 
-    source_idx = np.arange(len(y_src))
-    tr_idx, va_idx = make_groupwise_val_split(source_idx, y_src, g_src, seed=seed)
+    tr_idx, va_idx = _make_stratified_split(y_src, seed=seed, val_ratio=val_ratio)
 
     X_tr = X_src[tr_idx]
     y_tr = y_src[tr_idx]
@@ -242,12 +258,60 @@ def _build_cross_dataset_splits(aligned: Dict[str, Dict], train_datasets: List[s
     return X_tr, y_tr, d_tr, X_va, y_va, d_va, X_te, y_te, num_domains
 
 
+def _sample_hparams(args, train_dataset_key: str, trial):
+    search_space = get_hparams(args.model, train_dataset_key, backbone=args.backbone)
+    sampled = {}
+    for key, value in search_space.items():
+        sampled[key] = value(trial) if callable(value) else value
+    return sampled
+
+
+def _run_hpo(args, train_dataset_key: str, X_tr, y_tr, d_tr, X_va, y_va, d_va, X_target, num_domains):
+    if args.hpo_trials <= 0:
+        return {}
+
+    import optuna
+
+    print(f'  Running HPO on source train/val split only: trials={args.hpo_trials}')
+
+    def objective(trial):
+        trial_hparams = _sample_hparams(args, train_dataset_key, trial)
+        try:
+            model = train_model(
+                args=args,
+                X_train=X_tr,
+                y_train=y_tr,
+                d_train=d_tr,
+                X_val=X_va,
+                y_val=y_va,
+                d_val=d_va,
+                input_dim=X_tr.shape[1],
+                num_classes=2,
+                num_domains=num_domains,
+                hparams=trial_hparams,
+                seed=args.seed,
+                patience=args.patience,
+                X_target=X_target,
+            )
+            val_metrics = evaluate_model(model, X_va, y_va)
+            return float(val_metrics['AUROC'])
+        except Exception as exc:
+            print(f'  HPO trial failed: {exc}')
+            return 0.0
+
+    study = optuna.create_study(direction='maximize', sampler=optuna.samplers.TPESampler(seed=args.seed))
+    study.optimize(objective, n_trials=args.hpo_trials)
+    print(f'  Best HPO params: {study.best_params}')
+    return study.best_params
+
+
 def _run_experiment(args, aligned: Dict[str, Dict], common_features: List[str], label: str, train_datasets: List[str], test_dataset: str):
     X_tr, y_tr, d_tr, X_va, y_va, d_va, X_te, y_te, num_domains = _build_cross_dataset_splits(
         aligned=aligned,
         train_datasets=train_datasets,
         test_dataset=test_dataset,
         seed=args.seed,
+        val_ratio=args.val_ratio,
     )
 
     # Enable UDA automatically for DA models unless disabled
@@ -255,6 +319,18 @@ def _run_experiment(args, aligned: Dict[str, Dict], common_features: List[str], 
     args.uda = bool(use_uda)
 
     X_target = X_te if args.uda and args.model in DA_MODELS else None
+    best_hparams = _run_hpo(
+        args=args,
+        train_dataset_key=train_datasets[0],
+        X_tr=X_tr,
+        y_tr=y_tr,
+        d_tr=d_tr,
+        X_va=X_va,
+        y_va=y_va,
+        d_va=d_va,
+        X_target=X_target,
+        num_domains=num_domains,
+    )
 
     model = train_model(
         args=args,
@@ -267,7 +343,7 @@ def _run_experiment(args, aligned: Dict[str, Dict], common_features: List[str], 
         input_dim=X_tr.shape[1],
         num_classes=2,
         num_domains=num_domains,
-        hparams={},
+        hparams=best_hparams,
         seed=args.seed,
         patience=args.patience,
         X_target=X_target,
@@ -283,6 +359,9 @@ def _run_experiment(args, aligned: Dict[str, Dict], common_features: List[str], 
         'Label': label,
         'Model': args.model,
         'Backbone': args.backbone,
+        'Seed': args.seed,
+        'Val_Ratio': args.val_ratio,
+        'HPO_Trials': args.hpo_trials,
         'Train_Datasets': '+'.join(train_datasets),
         'Test_Dataset': test_dataset,
         'Common_Features': len(common_features),
@@ -296,6 +375,7 @@ def _run_experiment(args, aligned: Dict[str, Dict], common_features: List[str], 
         'Test_Accuracy': test_metrics['Accuracy'],
         'Test_F1': test_metrics['F1'],
         'Test_AUROC': test_metrics['AUROC'],
+        'Hparams_JSON': json.dumps(best_hparams, default=str),
     }
 
 
@@ -321,7 +401,7 @@ def get_args():
     parser.add_argument('--label', type=str, default='arousal', choices=COMMON_LABELS)
     parser.add_argument('--model', type=str, default='XGB',
                         choices=['XGB', 'LGB', 'MLP', 'ResNet', 'DANN', 'CDAN', 'DAN', 'DeepCORAL', 'MCC',
-                                 'ADDA', 'MCD', 'JAN', 'SHOT', 'CBST', 'CGDM', 'TabNet', 'TabPFN', 'SAINT',
+                                 'ADDA', 'MCD', 'JAN', 'SHOT', 'CBST', 'CGDM', 'TabNet', 'SAINT',
                                  'TabTransformer', 'FTTransformer', 'DCN', 'AutoInt', 'IRM', 'VREx', 'GroupDRO',
                                  'MixStyle', 'ERM_DG', 'MLDG', 'MASF', 'Fish', 'CSD', 'SagNet'])
     parser.add_argument('--backbone', type=str, default='MLP', choices=['MLP', 'ResNet', 'Transformer'])
@@ -334,6 +414,8 @@ def get_args():
     parser.add_argument('--disable_auto_uda', action='store_true',
                         help='If set, do not auto-enable UDA for DA models')
     parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--val_ratio', type=float, default=0.2,
+                        help='Source-only validation ratio for a single stratified split')
 
     parser.add_argument('--mode', type=str, default='both', choices=['analyze', 'run', 'both'])
     parser.add_argument('--run_setting', type=str, default='all', choices=['all', 'two_to_one', 'one_to_one'])
@@ -342,9 +424,10 @@ def get_args():
     parser.add_argument('--output', type=str, default='results/cross_dataset_results.csv')
     parser.add_argument('--feature_report', type=str, default='results/cross_dataset_feature_report.csv')
 
-    # Kept for compatibility with execute_benchmark.train_model signature
-    parser.add_argument('--hpo_trials', type=int, default=0)
-    parser.add_argument('--hpo_mode', type=str, default='fold1')
+    parser.add_argument('--hpo_trials', type=int, default=5,
+                        help='Optuna trials on the source train/val split only')
+    parser.add_argument('--hpo_mode', type=str, default='single_split',
+                        help='Compatibility arg; cross-dataset uses a single source split')
     parser.add_argument('--max_folds', type=int, default=None)
     parser.add_argument('--epochs_override', type=int, default=None)
 
@@ -392,7 +475,10 @@ def main():
             plans = plans[:max(0, args.limit_experiments)]
 
         rows = []
-        print(f'\nRunning {len(plans)} cross-dataset experiments with {len(common_features)} common features...')
+        print(
+            f'\nRunning {len(plans)} cross-dataset experiments with {len(common_features)} common features '
+            f'(val_ratio={args.val_ratio}, hpo_trials={args.hpo_trials})...'
+        )
         for i, (train_ds, test_ds) in enumerate(plans, start=1):
             print(f'[{i}/{len(plans)}] Train={"+".join(train_ds)} -> Test={test_ds}')
             row = _run_experiment(args, aligned, common_features, args.label, train_ds, test_ds)
