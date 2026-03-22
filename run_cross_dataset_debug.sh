@@ -98,7 +98,6 @@ for label in "${LABELS[@]}"; do
     done
 
     for model in "${da_models[@]}"; do
-        # DA models auto-enable UDA in execute_cross_dataset.py unless explicitly disabled.
         run_model "$label" "$model"
     done
 done
