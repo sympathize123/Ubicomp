@@ -340,17 +340,13 @@ def _run_experiment(args, aligned: Dict[str, Dict], common_features: List[str], 
         val_ratio=args.val_ratio,
     )
 
-    # Enable UDA automatically for DA models unless disabled.
-    # Use a local copy so we don't mutate the shared args object across experiments.
-    import copy
-    exp_args = copy.copy(args)
+    # Enable UDA automatically for DA models unless disabled
     use_uda = args.uda or (args.model in DA_MODELS and not args.disable_auto_uda)
-    exp_args.uda = bool(use_uda)
+    args.uda = bool(use_uda)
 
-    # During HPO, do NOT pass the test set as X_target — that leaks test distribution into hparam selection.
-    # DA models adapt to unlabeled target data; for HPO we pass None so adaptation is skipped or uses val.
+    X_target = X_te if args.uda and args.model in DA_MODELS else None
     best_hparams = _run_hpo(
-        args=exp_args,
+        args=args,
         train_dataset_key=train_datasets[0],
         X_tr=X_tr,
         y_tr=y_tr,
@@ -362,11 +358,8 @@ def _run_experiment(args, aligned: Dict[str, Dict], common_features: List[str], 
         num_domains=num_domains,
     )
 
-    # Use test set as X_target only for final model training (after HPO is done)
-    X_target = X_te if exp_args.uda and args.model in DA_MODELS else None
-
     model = train_model(
-        args=exp_args,
+        args=args,
         X_train=X_tr,
         y_train=y_tr,
         d_train=d_tr,
