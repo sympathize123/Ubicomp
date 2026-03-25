@@ -21,15 +21,15 @@ BACKBONE="${2:-MLP}"
 RUN_SETTING="${3:-all}"
 HPO_TRIALS="${4:-5}"
 
-COMMON_LABELS=("arousal" "disturbance" "valence")
+COMMON_LABELS=("stress_binary") #"arousal" "disturbance" "valence"
 ALL_MODELS=(
   "XGB" "LGB" "MLP" "ResNet"
-  "DANN" "CDAN" "DAN" "DeepCORAL" "MCC" "ADDA" "MCD" "JAN" "SHOT" "CBST" 
+  #"DANN" "CDAN" "DAN" "DeepCORAL" "MCC" "ADDA" "MCD" "JAN" "SHOT" "CBST" 
   #"CGDM"
-  "TabNet" 
+  #"TabNet" 
   #"SAINT" 
   #"TabTransformer" "FTTransformer" "DCN"
-  "IRM" "VREx" "GroupDRO" "MixStyle" "ERM_DG" "MLDG" "MASF" "Fish" "CSD" "SagNet"
+  #"IRM" "VREx" "GroupDRO" "MixStyle" "ERM_DG" "MLDG" "Fish" "CSD" "SagNet" "MASF" 
 )
 ALL_BACKBONES=("MLP" "ResNet" "Transformer")
 BACKBONE_AWARE_MODELS=(

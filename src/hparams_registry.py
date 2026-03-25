@@ -19,8 +19,8 @@ def get_hparams(algorithm, dataset, backbone='MLP'):
         hparams['lr'] = lambda trial: trial.suggest_float('lr', 1e-5, 1e-2, log=True)
         hparams['weight_decay'] = lambda trial: trial.suggest_float('weight_decay', 1e-6, 1e-3, log=True)
         hparams['batch_size'] = lambda trial: trial.suggest_categorical('batch_size', [32, 64, 128])
-        if algorithm in ['DANN', 'CDAN', 'DAN', 'DeepCORAL', 'MCC', 'ADDA', 'MCD', 'JAN', 'SHOT', 'CBST', 'CGDM']:
-            hparams['batch_size'] = lambda trial: trial.suggest_categorical('batch_size', [64])
+        if algorithm in ['MLP', 'ResNet', 'ERM_DG', 'DANN', 'CDAN', 'DAN', 'DeepCORAL', 'MCC', 'ADDA', 'MCD', 'JAN', 'SHOT', 'CBST', 'CGDM']:
+            hparams['batch_size'] = lambda trial: trial.suggest_categorical('batch_size', [32, 64, 128, 256, 512])
         hparams['dropout'] = lambda trial: trial.suggest_float('dropout', 0.0, 0.5)
         
         # Architecture Search (Backbone-specific)
@@ -65,7 +65,9 @@ def get_hparams(algorithm, dataset, backbone='MLP'):
         hparams['lr'] = lambda trial: trial.suggest_float('lr', 1e-5, 1e-2, log=True)
         hparams['weight_decay'] = lambda trial: trial.suggest_float('weight_decay', 1e-6, 1e-3, log=True)
         hparams['batch_size'] = lambda trial: trial.suggest_categorical('batch_size', [32, 64]) # Smaller batch for DG usually
-        
+        if algorithm in ['GroupDRO', 'MixStyle', 'MLDG', 'Fish', 'CSD', 'SagNet']:
+            hparams['batch_size'] = lambda trial: trial.suggest_categorical('batch_size', [32, 64, 128, 256, 512])
+
         if algorithm == 'IRM':
             hparams['irm_lambda'] = lambda trial: trial.suggest_float('irm_lambda', 1e-1, 1e4, log=True)
             hparams['irm_penalty_anneal_iters'] = lambda trial: trial.suggest_int('irm_penalty_anneal_iters', 0, 50)

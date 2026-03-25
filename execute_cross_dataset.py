@@ -13,6 +13,7 @@ import argparse
 import json
 import os
 import pickle
+import warnings
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -27,12 +28,8 @@ from src.hparams_registry import get_hparams
 from src.models import evaluate_model
 
 BASE_DATA_DIR = str((Path(__file__).resolve().parent / 'data').resolve())
-COMMON_LABELS = ['arousal', 'disturbance', 'valence']
-DATASET_PATH_TMPL = {
-    'D-1': '{label}_personal-full_D#2.pkl',
-    'D-2': '{label}_personal-full_D#3.pkl',
-    'D-3': '{label}_personal-full.pkl',
-}
+COMMON_LABELS = ['arousal', 'disturbance', 'valence', 'stress_binary']
+
 DA_MODELS = ['DANN', 'CDAN', 'DAN', 'DeepCORAL', 'MCC', 'ADDA', 'MCD', 'JAN', 'SHOT', 'CBST', 'CGDM']
 
 RESULT_COLUMNS = [
@@ -74,7 +71,24 @@ def canonicalize_feature_name(name: str) -> str:
 
 
 def _dataset_path(dataset: str, label: str) -> str:
-    return os.path.join(BASE_DATA_DIR, DATASET_PATH_TMPL[dataset].format(label=label))
+    if label == "stress_binary":
+        if dataset == 'D-1':
+            dataset_path = os.path.join(BASE_DATA_DIR, "stress_binary_personal-full_D-1.pkl")
+        elif dataset == 'D-2':
+            dataset_path = os.path.join(BASE_DATA_DIR, "stress_binary_personal-full_D-2.pkl")
+        elif dataset == 'D-3':
+            dataset_path = os.path.join(BASE_DATA_DIR, "stress_binary_personal-full_D-3.pkl")
+        else:
+            raise ValueError("Unknown dataset")
+    elif dataset == 'D-1':
+        dataset_path = os.path.join(BASE_DATA_DIR, f"{label}_personal-full_D#2.pkl")
+    elif dataset == 'D-2':
+        dataset_path = os.path.join(BASE_DATA_DIR, f"{label}_personal-full_D#3.pkl")
+    elif dataset == 'D-3':
+        dataset_path = os.path.join(BASE_DATA_DIR, f"{label}_personal-full.pkl")
+    else:
+        raise ValueError("Unknown dataset")
+    return dataset_path
 
 
 def _load_dataset_raw(dataset: str, label: str) -> Dict[str, np.ndarray]:
@@ -83,7 +97,13 @@ def _load_dataset_raw(dataset: str, label: str) -> Dict[str, np.ndarray]:
         raise FileNotFoundError(f'Missing dataset file: {path}')
 
     with open(path, 'rb') as f:
-        data = pickle.load(f)
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                'ignore',
+                message=r'numpy\.core\.numeric is deprecated',
+                category=DeprecationWarning,
+            )
+            data = pickle.load(f)
 
     if not (isinstance(data, (tuple, list)) and len(data) >= 5):
         raise ValueError(f'Unexpected pickle format: {path}')
@@ -188,8 +208,7 @@ def _select_common_features(bundles: Dict[str, Dict], common_features: List[str]
 
 
 def _clip_by_train(X_train: np.ndarray, X_val: np.ndarray, X_test: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Clip outliers using the 99.9th percentile of absolute train values.
-    Per-user normalization has already been applied — no further z-scoring here."""
+    """Clip outliers using the 99.9th percentile of absolute train values."""
     clip = float(np.percentile(np.abs(X_train.reshape(-1)), 99.9))
     clip = max(10.0, clip)
     return (
@@ -201,7 +220,7 @@ def _clip_by_train(X_train: np.ndarray, X_val: np.ndarray, X_test: np.ndarray) -
 
 def _normalize_per_user(X: np.ndarray, users: np.ndarray, train_mask: np.ndarray) -> np.ndarray:
     """Per-user z-score normalization: compute mean/std from each user's train samples,
-    apply to all of that user's samples. Consistent with BenchmarkDataset.normalize_features()."""
+    apply to all of that user's samples."""
     X_out = X.copy()
     for user in np.unique(users):
         u_mask = users == user
