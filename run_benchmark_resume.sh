@@ -40,40 +40,53 @@ is_done() {
     local dataset="$1" label="$2" model="$3" backbone="$4"
     local folds_progress=0
     local folds_summary=0
+    local require_backbone=0
+
+    if is_da "$model" || [[ "$model" == "IRM" || "$model" == "VREx" || "$model" == "GroupDRO" || "$model" == "MixStyle" || "$model" == "MLDG" || "$model" == "MASF" || "$model" == "Fish" || "$model" == "CSD" || "$model" == "SagNet" ]]; then
+        require_backbone=1
+    fi
 
     if [ -f "$PROGRESS_CSV" ]; then
-        folds_progress=$(python3 - "$PROGRESS_CSV" "$dataset" "$label" "$model" "$backbone" <<'PY'
+        folds_progress=$(python3 - "$PROGRESS_CSV" "$dataset" "$label" "$model" "$backbone" "$require_backbone" <<'PY'
 import csv, sys
-path, dataset, label, model, backbone = sys.argv[1:]
-count = 0
+path, dataset, label, model, backbone, require_backbone = sys.argv[1:]
+require_backbone = int(require_backbone)
+folds = set()
 with open(path, newline='') as f:
     for row in csv.DictReader(f):
         if row.get('Phase') != 'final':
             continue
-        if (row.get('Dataset') == dataset and row.get('Label') == label and
-            row.get('Model') == model and row.get('Backbone') == backbone):
-            count += 1
-print(count)
+        if not (row.get('Dataset') == dataset and row.get('Label') == label and row.get('Model') == model):
+            continue
+        if require_backbone and row.get('Backbone') != backbone:
+            continue
+        fold = (row.get('Fold') or '').strip()
+        if fold:
+            folds.add(fold)
+print(len(folds))
 PY
 )
     fi
 
     # Summary CSV has one row per completed combo (N_Folds should be 5 when done).
     if [ -f "$SUMMARY_CSV" ]; then
-        folds_summary=$(python3 - "$SUMMARY_CSV" "$dataset" "$label" "$model" "$backbone" <<'PY'
+        folds_summary=$(python3 - "$SUMMARY_CSV" "$dataset" "$label" "$model" "$backbone" "$require_backbone" <<'PY'
 import csv, sys
-path, dataset, label, model, backbone = sys.argv[1:]
+path, dataset, label, model, backbone, require_backbone = sys.argv[1:]
+require_backbone = int(require_backbone)
 best = 0
 with open(path, newline='') as f:
     for row in csv.DictReader(f):
-        if (row.get('Dataset') == dataset and row.get('Label') == label and
-            row.get('Model') == model and row.get('Backbone') == backbone):
-            try:
-                n_folds = int(float(row.get('N_Folds', '0') or 0))
-            except Exception:
-                n_folds = 0
-            if n_folds > best:
-                best = n_folds
+        if not (row.get('Dataset') == dataset and row.get('Label') == label and row.get('Model') == model):
+            continue
+        if require_backbone and row.get('Backbone') != backbone:
+            continue
+        try:
+            n_folds = int(float(row.get('N_Folds', '0') or 0))
+        except Exception:
+            n_folds = 0
+        if n_folds > best:
+            best = n_folds
 print(best)
 PY
 )
@@ -109,7 +122,13 @@ run_model() {
 # ============================================================
 # AutoInt excluded
 
-# D-1 / disturbance — all DG/DA
+# D-1 / disturbance — ALL models
+for model in "XGB" "LGB" "MLP" "ResNet"; do
+    run_model "D-1" "disturbance" "$model"
+done
+for model in "TabNet" "SAINT" "TabTransformer" "FTTransformer" "DCN"; do
+    run_model "D-1" "disturbance" "$model"
+done
 for model in "IRM" "VREx" "GroupDRO" "MixStyle" "MLDG" "MASF" "Fish" "CSD" "SagNet" \
              "DANN" "CDAN" "DAN" "DeepCORAL" "MCC" "ADDA" "MCD" "JAN" "SHOT" "CBST" "CGDM"; do
     run_model "D-1" "disturbance" "$model" "MLP"

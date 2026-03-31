@@ -50,9 +50,14 @@ class LightGBMWrapper(BaseEstimator, ClassifierMixin):
         self.model = lgb.LGBMClassifier(n_jobs=n_jobs, **kwargs)
 
     def fit(self, X, y, X_val=None, y_val=None):
-        eval_set = [(X_val, y_val)] if X_val is not None else None
+        X_train = X.values if hasattr(X, "values") else X
+        y_train = y.values if hasattr(y, "values") else y
+        X_valid = X_val.values if (X_val is not None and hasattr(X_val, "values")) else X_val
+        y_valid = y_val.values if (y_val is not None and hasattr(y_val, "values")) else y_val
+
+        eval_set = [(X_valid, y_valid)] if X_valid is not None else None
         callbacks = [lgb.early_stopping(self.patience, verbose=True)] if eval_set else None
-        self.model.fit(X, y, eval_set=eval_set, eval_metric='auc', callbacks=callbacks)
+        self.model.fit(X_train, y_train, eval_set=eval_set, eval_metric='auc', callbacks=callbacks)
         return self
 
     def predict(self, X):
@@ -133,87 +138,158 @@ class WidedeepWrapper(BaseEstimator, ClassifierMixin):
 
         # Define Model
         if self.model_type == 'SAINT':
+            saint_params = self.kwargs.copy()
+            _TRAIN_KEYS = {'lr', 'weight_decay', 'batch_size', 'mlp_dropout', 'num_layers', 'hidden_dim', 'transformer_dropout'}
+            for k in _TRAIN_KEYS:
+                saint_params.pop(k, None)
+            if 'dropout' in saint_params:
+                dropout_val = saint_params.pop('dropout')
+                saint_params.setdefault('attn_dropout', dropout_val)
+                saint_params.setdefault('ff_dropout', dropout_val)
             if self.efficient_attention:
-                print("[INFO] efficient_attention=True: Swapping SAINT -> FastFormer (Additive Attention O(N)) for efficiency.")
-                from pytorch_widedeep.models import TabFastFormer
-                ff_params = self.kwargs.copy()
-                _TRAIN_KEYS = {'lr', 'weight_decay', 'batch_size', 'mlp_dropout', 'num_layers', 'hidden_dim'}
-                for k in _TRAIN_KEYS: ff_params.pop(k, None)
-                if 'dropout' in ff_params:
-                    dropout_val = ff_params.pop('dropout')
-                    ff_params.setdefault('attn_dropout', dropout_val)
-                    ff_params.setdefault('ff_dropout', dropout_val)
-                ff_params.setdefault('input_dim', 32)
-                ff_params.setdefault('n_heads', 4)
-                deeptabular = TabFastFormer(column_idx=self.preprocessor.column_idx, continuous_cols=self.col_names,
-                                            embed_continuous_method='standard', **ff_params)
-            else:
-                saint_params = self.kwargs.copy()
-                _TRAIN_KEYS = {'lr', 'weight_decay', 'batch_size', 'mlp_dropout', 'num_layers', 'hidden_dim', 'transformer_dropout'}
-                for k in _TRAIN_KEYS: saint_params.pop(k, None)
-                if 'dropout' in saint_params:
-                    dropout_val = saint_params.pop('dropout')
-                    saint_params.setdefault('attn_dropout', dropout_val)
-                    saint_params.setdefault('ff_dropout', dropout_val)
-                deeptabular = SAINT(column_idx=self.preprocessor.column_idx, continuous_cols=self.col_names,
-                                    **saint_params)
+                print("[INFO] SAINT: enabling linear-attention path for SAINT encoder blocks.")
+                import einops
+                import pytorch_widedeep.models.tabular.transformers.saint as saint_mod
+                from pytorch_widedeep.models.tabular.transformers._attention_layers import AddNorm, FeedForward, MultiHeadedAttention
+
+                if not getattr(saint_mod, "_ubicomp_linear_saint_patch", False):
+                    class EfficientSaintEncoder(nn.Module):
+                        def __init__(
+                            self,
+                            input_dim: int,
+                            n_heads: int,
+                            use_bias: bool,
+                            attn_dropout: float,
+                            ff_dropout: float,
+                            ff_factor: int,
+                            activation: str,
+                            n_feat: int,
+                        ):
+                            super().__init__()
+                            self.n_feat = n_feat
+
+                            self.col_attn = MultiHeadedAttention(
+                                input_dim,
+                                n_heads,
+                                use_bias,
+                                attn_dropout,
+                                None,
+                                True,   # use_linear_attention
+                                False,  # use_flash_attention
+                            )
+                            self.col_attn_ff = FeedForward(input_dim, ff_dropout, ff_factor, activation)
+                            self.col_attn_addnorm = AddNorm(input_dim, attn_dropout)
+                            self.col_attn_ff_addnorm = AddNorm(input_dim, ff_dropout)
+
+                            # Row attention over samples per feature token (keeps SAINT row-attention intent,
+                            # avoids flattening n_feat * input_dim into huge projection matrices).
+                            self.row_attn = MultiHeadedAttention(
+                                input_dim,
+                                n_heads,
+                                use_bias,
+                                attn_dropout,
+                                None,
+                                True,   # use_linear_attention
+                                False,  # use_flash_attention
+                            )
+                            self.row_attn_ff = FeedForward(input_dim, ff_dropout, ff_factor, activation)
+                            self.row_attn_addnorm = AddNorm(input_dim, attn_dropout)
+                            self.row_attn_ff_addnorm = AddNorm(input_dim, ff_dropout)
+
+                        def forward(self, X):
+                            x = self.col_attn_addnorm(X, self.col_attn)
+                            x = self.col_attn_ff_addnorm(x, self.col_attn_ff)
+                            x = einops.rearrange(x, "b n d -> n b d")
+                            x = self.row_attn_addnorm(x, self.row_attn)
+                            x = self.row_attn_ff_addnorm(x, self.row_attn_ff)
+                            x = einops.rearrange(x, "n b d -> b n d")
+                            return x
+
+                    saint_mod.SaintEncoder = EfficientSaintEncoder
+                    saint_mod._ubicomp_linear_saint_patch = True
+
+            deeptabular = SAINT(column_idx=self.preprocessor.column_idx, continuous_cols=self.col_names,
+                                **saint_params)
 
         elif self.model_type == 'TabTransformer':
+            tt_params = self.kwargs.copy()
+            _TRAIN_KEYS = {'lr', 'weight_decay', 'batch_size', 'mlp_dropout', 'num_layers', 'hidden_dim',
+                           'transformer_dropout', 'miscellaneous_dropout'}
+            for k in _TRAIN_KEYS:
+                tt_params.pop(k, None)
+            if 'dropout' in tt_params:
+                dropout_val = tt_params.pop('dropout')
+                tt_params.setdefault('attn_dropout', dropout_val)
+                tt_params.setdefault('ff_dropout', dropout_val)
+            tt_params.setdefault('input_dim', 32)
+            tt_params.setdefault('n_heads', 4)
+            tt_params.setdefault('n_blocks', 2)
+            tt_params['use_linear_attention'] = bool(self.efficient_attention)
             if self.efficient_attention:
-                print("[INFO] efficient_attention=True: Swapping TabTransformer -> FastFormer (Additive Attention O(N)) for efficiency.")
-                from pytorch_widedeep.models import TabFastFormer
-                ff_params = self.kwargs.copy()
-                _TRAIN_KEYS = {'lr', 'weight_decay', 'batch_size', 'mlp_dropout', 'num_layers', 'hidden_dim'}
-                for k in _TRAIN_KEYS: ff_params.pop(k, None)
-                if 'dropout' in ff_params:
-                    dropout_val = ff_params.pop('dropout')
-                    ff_params.setdefault('attn_dropout', dropout_val)
-                    ff_params.setdefault('ff_dropout', dropout_val)
-                ff_params.setdefault('input_dim', 32)
-                ff_params.setdefault('n_heads', 4)
-                deeptabular = TabFastFormer(column_idx=self.preprocessor.column_idx, continuous_cols=self.col_names,
-                                            embed_continuous_method='standard', **ff_params)
-            else:
-                tt_params = self.kwargs.copy()
-                _TRAIN_KEYS = {'lr', 'weight_decay', 'batch_size', 'mlp_dropout', 'num_layers', 'hidden_dim',
-                               'transformer_dropout', 'miscellaneous_dropout'}
-                for k in _TRAIN_KEYS: tt_params.pop(k, None)
-                if 'dropout' in tt_params:
-                    dropout_val = tt_params.pop('dropout')
-                    tt_params.setdefault('attn_dropout', dropout_val)
-                    tt_params.setdefault('ff_dropout', dropout_val)
-                tt_params.setdefault('input_dim', 32)
-                tt_params.setdefault('n_heads', 4)
-                tt_params.setdefault('n_blocks', 2)
-                deeptabular = TabTransformer(column_idx=self.preprocessor.column_idx, continuous_cols=self.col_names,
-                                             embed_continuous_method='standard', **tt_params)
+                print("[INFO] TabTransformer: use_linear_attention=True (architecture preserved).")
+            deeptabular = TabTransformer(column_idx=self.preprocessor.column_idx, continuous_cols=self.col_names,
+                                         embed_continuous_method='standard', **tt_params)
+
         elif self.model_type == 'FTTransformer':
+            from pytorch_widedeep.models import FTTransformer
+            ft_params = self.kwargs.copy()
             _TRAIN_KEYS = {'lr', 'weight_decay', 'batch_size', 'mlp_dropout', 'num_layers', 'hidden_dim'}
+            for k in _TRAIN_KEYS:
+                ft_params.pop(k, None)
+            if 'dropout' in ft_params:
+                dropout_val = ft_params.pop('dropout')
+                ft_params.setdefault('attn_dropout', dropout_val)
+                ft_params.setdefault('ff_dropout', dropout_val)
+            ft_params.setdefault('input_dim', 32)
+            ft_params.setdefault('n_heads', 4)
             if self.efficient_attention:
-                print("[INFO] efficient_attention=True: Swapping FTTransformer -> FastFormer (Additive Attention O(N)) for efficiency.")
-                from pytorch_widedeep.models import TabFastFormer
-                ff_params = self.kwargs.copy()
-                for k in _TRAIN_KEYS: ff_params.pop(k, None)
-                if 'dropout' in ff_params:
-                    dropout_val = ff_params.pop('dropout')
-                    ff_params.setdefault('attn_dropout', dropout_val)
-                    ff_params.setdefault('ff_dropout', dropout_val)
-                ff_params.setdefault('input_dim', 32)
-                ff_params.setdefault('n_heads', 4)
-                deeptabular = TabFastFormer(column_idx=self.preprocessor.column_idx, continuous_cols=self.col_names,
-                                            embed_continuous_method='standard', **ff_params)
-            else:
-                from pytorch_widedeep.models import FTTransformer
-                ft_params = self.kwargs.copy()
-                for k in _TRAIN_KEYS: ft_params.pop(k, None)
-                if 'dropout' in ft_params:
-                    dropout_val = ft_params.pop('dropout')
-                    ft_params.setdefault('attn_dropout', dropout_val)
-                    ft_params.setdefault('ff_dropout', dropout_val)
-                ft_params.setdefault('input_dim', 32)
-                ft_params.setdefault('n_heads', 4)
-                deeptabular = FTTransformer(column_idx=self.preprocessor.column_idx, continuous_cols=self.col_names,
-                                            embed_continuous_method='standard', **ft_params)
+                print("[INFO] FTTransformer: enabling kernel linear-attention path in FT encoder blocks.")
+                import pytorch_widedeep.models.tabular.transformers.ft_transformer as ft_mod
+                from pytorch_widedeep.models.tabular.transformers._attention_layers import NormAdd, FeedForward, MultiHeadedAttention
+
+                if not getattr(ft_mod, "_ubicomp_linear_ft_patch", False):
+                    class EfficientFTTransformerEncoder(nn.Module):
+                        def __init__(
+                            self,
+                            input_dim: int,
+                            n_feats: int,
+                            n_heads: int,
+                            use_bias: bool,
+                            attn_dropout: float,
+                            ff_dropout: float,
+                            ff_factor: float,
+                            kv_compression_factor: float,
+                            kv_sharing: bool,
+                            activation: str,
+                            first_block: bool,
+                        ):
+                            super().__init__()
+                            self.first_block = first_block
+                            self.attn = MultiHeadedAttention(
+                                input_dim,
+                                n_heads,
+                                use_bias,
+                                attn_dropout,
+                                None,
+                                True,   # use_linear_attention
+                                False,  # use_flash_attention
+                            )
+                            self.ff = FeedForward(input_dim, ff_dropout, ff_factor, activation)
+                            self.attn_normadd = NormAdd(input_dim, attn_dropout)
+                            self.ff_normadd = NormAdd(input_dim, ff_dropout)
+
+                        def forward(self, X):
+                            if self.first_block:
+                                x = X + self.attn(X)
+                            else:
+                                x = self.attn_normadd(X, self.attn)
+                            return self.ff_normadd(x, self.ff)
+
+                    ft_mod.FTTransformerEncoder = EfficientFTTransformerEncoder
+                    ft_mod._ubicomp_linear_ft_patch = True
+
+            deeptabular = FTTransformer(column_idx=self.preprocessor.column_idx, continuous_cols=self.col_names,
+                                        embed_continuous_method='standard', **ft_params)
             
         model = WideDeep(deeptabular=deeptabular)
         

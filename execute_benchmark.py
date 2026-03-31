@@ -1,6 +1,7 @@
 import os
 import argparse
 import json
+from typing import Dict, Tuple
 import pandas as pd
 import numpy as np
 import torch
@@ -54,12 +55,95 @@ def make_groupwise_val_split(train_idx, labels, groups, seed=42, max_splits=5):
     return train_idx[train_rel], train_idx[val_rel]
 
 
+def make_temporal_global_split(
+    labels: np.ndarray,
+    users: np.ndarray,
+    timestamps: np.ndarray,
+    train_ratio: float = 0.6,
+    val_ratio: float = 0.2,
+    drop_days: int = 30,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Dict[str, int]]:
+    labels = np.asarray(labels)
+    users = np.asarray(users)
+    ts = pd.to_datetime(pd.Series(timestamps), utc=True, errors='coerce')
+    if ts.isna().any():
+        bad = int(ts.isna().sum())
+        raise ValueError(f"Temporal split failed: {bad} timestamps could not be parsed.")
+
+    train_indices = []
+    val_indices = []
+    test_indices = []
+
+    unique_users = np.unique(users)
+    all_classes = np.unique(labels)
+    min_required_classes = min(2, len(all_classes))
+    reason_counts: Dict[str, int] = {
+        "kept_users": 0,
+        "dropped_insufficient_samples": 0,
+        "dropped_insufficient_label_diversity": 0,
+    }
+
+    for user in unique_users:
+        user_idx = np.where(users == user)[0]
+        if user_idx.size == 0:
+            continue
+
+        user_ts = ts.iloc[user_idx]
+        order = np.argsort(user_ts.astype('int64').to_numpy())
+        user_idx_sorted = user_idx[order]
+        user_ts_sorted = user_ts.iloc[order]
+
+        start_time = user_ts_sorted.iloc[0]
+        cutoff_time = start_time + pd.Timedelta(days=drop_days)
+        within_cutoff = (user_ts_sorted <= cutoff_time).to_numpy()
+        user_idx_window = user_idx_sorted[within_cutoff]
+
+        n = user_idx_window.size
+        n_train = int(n * train_ratio)
+        n_val = int(n * val_ratio)
+        n_test = n - n_train - n_val
+
+        if n_train < 1 or n_val < 1 or n_test < 1:
+            reason_counts["dropped_insufficient_samples"] += 1
+            continue
+
+        tr = user_idx_window[:n_train]
+        va = user_idx_window[n_train:n_train + n_val]
+        te = user_idx_window[n_train + n_val:]
+
+        if (
+            np.unique(labels[tr]).size < min_required_classes
+            or np.unique(labels[va]).size < min_required_classes
+            or np.unique(labels[te]).size < min_required_classes
+        ):
+            reason_counts["dropped_insufficient_label_diversity"] += 1
+            continue
+
+        train_indices.extend(tr.tolist())
+        val_indices.extend(va.tolist())
+        test_indices.extend(te.tolist())
+        reason_counts["kept_users"] += 1
+
+    if len(train_indices) == 0 or len(val_indices) == 0 or len(test_indices) == 0:
+        raise ValueError(
+            "Temporal split produced empty train/val/test after user filtering. "
+            "Try adjusting drop window or label constraints."
+        )
+
+    return (
+        np.asarray(train_indices, dtype=int),
+        np.asarray(val_indices, dtype=int),
+        np.asarray(test_indices, dtype=int),
+        reason_counts,
+    )
+
+
 
 def get_args():
     parser = argparse.ArgumentParser(description="Run Within-Dataset Benchmark")
     parser.add_argument('--dataset', type=str, required=True, choices=['D-1', 'D-2', 'D-3'])
     parser.add_argument('--label', type=str, default='stress_binary')
-    parser.add_argument('--model', type=str, required=True, choices=['XGB', 'LGB', 'MLP', 'ResNet', 'DANN', 'CDAN', 'DAN', 'DeepCORAL', 'MCC', 'ADDA', 'MCD', 'JAN', 'SHOT', 'CBST', 'CGDM', 'TabNet', 'SAINT', 'TabTransformer', 'FTTransformer', 'DCN', 'AutoInt', 'IRM', 'VREx', 'GroupDRO', 'MixStyle', 'ERM_DG', 'MLDG', 'MASF', 'Fish', 'CSD', 'SagNet'])
+    parser.add_argument('--model', type=str, required=True, choices=['XGB', 'LGB', 'MLP', 'ResNet', 'DANN', 'CDAN', 'DAN', 'DeepCORAL', 'MCC', 'ADDA', 'MCD', 'JAN', 'SHOT', 'CBST', 'CGDM', 'TabNet', 'SAINT', 'TabTransformer', 'FTTransformer', 'TFTransformer', 'TF-transformer', 'DCN', 'AutoInt', 'IRM', 'VREx', 'GroupDRO', 'MixStyle', 'ERM_DG', 'MLDG', 'MASF', 'Fish', 'CSD', 'SagNet'])
     parser.add_argument('--backbone', type=str, default='MLP', choices=['MLP', 'ResNet', 'Transformer'])
     parser.add_argument('--epochs', type=int, default=50)
     parser.add_argument('--batch_size', type=int, default=64)
@@ -72,6 +156,16 @@ def get_args():
     parser.add_argument('--uda', action='store_true')
     parser.add_argument('--max_folds', type=int, default=None, help='Limit number of folds (e.g. 1 for quick debug)')
     parser.add_argument('--epochs_override', type=int, default=None, help='Override epochs for quick debug runs')
+    parser.add_argument(
+        '--split_strategy',
+        type=str,
+        default='group_kfold',
+        choices=['group_kfold', 'temporal'],
+        help='Data split strategy: existing StratifiedGroupKFold or per-user temporal split baseline',
+    )
+    parser.add_argument('--temporal_train_ratio', type=float, default=0.6)
+    parser.add_argument('--temporal_val_ratio', type=float, default=0.2)
+    parser.add_argument('--temporal_drop_days', type=int, default=30)
     return parser.parse_args()
 
 
@@ -115,34 +209,37 @@ def train_model(args, X_train, y_train, d_train, X_val, y_val, d_val,
                               gamma=hparams.get('gamma', 1.3), lambda_sparse=hparams.get('lambda_sparse', 1e-3),
                               batch_size=batch_size, epochs=epochs, patience=patience)
     elif args.model == 'SAINT':
-        _input_dim = hparams.pop('input_dim', 32)
-        _n_heads = hparams.pop('n_heads', 4)
-        _n_blocks = hparams.pop('n_blocks', 2)
-        _dropout = hparams.pop('dropout', 0.1)
-        hparams.pop('lr', None)  # lr passed separately via WideTrainer
+        saint_hparams = dict(hparams)
+        _input_dim = saint_hparams.pop('input_dim', 32)
+        _n_heads = saint_hparams.pop('n_heads', 4)
+        _n_blocks = saint_hparams.pop('n_blocks', 2)
+        _dropout = saint_hparams.pop('dropout', 0.1)
+        saint_hparams.pop('lr', None)  # lr passed separately via WideTrainer
         model = WidedeepWrapper(model_type='SAINT', input_dim=_input_dim, n_heads=_n_heads,
                                 n_blocks=_n_blocks, dropout=_dropout, mlp_dropout=_dropout,
                                 epochs=epochs, patience=patience, batch_size=batch_size,
-                                efficient_attention=args.efficient_attention, **hparams)
+                                efficient_attention=args.efficient_attention, **saint_hparams)
     elif args.model == 'TabTransformer':
-        use_efficient = True if not args.efficient_attention else args.efficient_attention
-        _input_dim = hparams.pop('input_dim', 32)
-        _n_heads = hparams.pop('n_heads', 4)
-        _n_blocks = hparams.pop('n_blocks', 2)
-        _dropout = hparams.pop('dropout', 0.1)
+        tt_hparams = dict(hparams)
+        use_efficient = args.efficient_attention
+        _input_dim = tt_hparams.pop('input_dim', 32)
+        _n_heads = tt_hparams.pop('n_heads', 4)
+        _n_blocks = tt_hparams.pop('n_blocks', 2)
+        _dropout = tt_hparams.pop('dropout', 0.1)
         model = WidedeepWrapper(model_type='TabTransformer', input_dim=_input_dim, n_heads=_n_heads,
                                 n_blocks=_n_blocks, dropout=_dropout,
                                 epochs=epochs, patience=patience, batch_size=batch_size,
-                                efficient_attention=use_efficient, **hparams)
+                                efficient_attention=use_efficient, **tt_hparams)
     elif args.model == 'FTTransformer':
-        _input_dim = hparams.pop('input_dim', 32)
-        _n_heads = hparams.pop('n_heads', 4)
-        _n_blocks = hparams.pop('n_blocks', 2)
-        _dropout = hparams.pop('dropout', 0.1)
+        ft_hparams = dict(hparams)
+        _input_dim = ft_hparams.pop('input_dim', 32)
+        _n_heads = ft_hparams.pop('n_heads', 4)
+        _n_blocks = ft_hparams.pop('n_blocks', 2)
+        _dropout = ft_hparams.pop('dropout', 0.1)
         model = WidedeepWrapper(model_type='FTTransformer', input_dim=_input_dim, n_heads=_n_heads,
                                 n_blocks=_n_blocks, dropout=_dropout,
                                 epochs=epochs, patience=patience, batch_size=batch_size,
-                                efficient_attention=args.efficient_attention, **hparams)
+                                efficient_attention=args.efficient_attention, **ft_hparams)
     elif args.model == 'DCN':
         _dnn_hidden_units = hparams.pop('dnn_hidden_units', (256, 128))
         _dropout = hparams.pop('dropout', 0.1)
@@ -259,6 +356,14 @@ def train_model(args, X_train, y_train, d_train, X_val, y_val, d_val,
 
 def main():
     args = get_args()
+    if args.model in ('TFTransformer', 'TF-transformer'):
+        args.model = 'FTTransformer'
+    if args.split_strategy == 'temporal':
+        if args.temporal_train_ratio <= 0 or args.temporal_val_ratio <= 0:
+            raise ValueError("Temporal ratios must be > 0.")
+        if args.temporal_train_ratio + args.temporal_val_ratio >= 1.0:
+            raise ValueError("Temporal train_ratio + val_ratio must be < 1.0.")
+
     output_path = Path(args.output)
     progress_output_path = output_path.with_name(output_path.stem + "_progress.csv")
 
@@ -284,17 +389,35 @@ def main():
 
     ds = BenchmarkDataset(args.dataset, dataset_path)
 
-    group_folds = 5
     split_seed = 42
     labels = ds.y
     groups = ds.users
     X_raw = ds.X.copy()
-    splitter = StratifiedGroupKFold(n_splits=group_folds, shuffle=True, random_state=split_seed)
 
     fold_splits = []
-    for fold_id, (train_idx, test_idx) in enumerate(splitter.split(np.zeros_like(labels), labels, groups)):
-        train_idx, val_idx = make_groupwise_val_split(train_idx, labels, groups, seed=split_seed + fold_id)
-        fold_splits.append((fold_id, train_idx, val_idx, test_idx))
+    if args.split_strategy == 'group_kfold':
+        group_folds = 5
+        splitter = StratifiedGroupKFold(n_splits=group_folds, shuffle=True, random_state=split_seed)
+        for fold_id, (train_idx, test_idx) in enumerate(splitter.split(np.zeros_like(labels), labels, groups)):
+            train_idx, val_idx = make_groupwise_val_split(train_idx, labels, groups, seed=split_seed + fold_id)
+            fold_splits.append((fold_id, train_idx, val_idx, test_idx))
+    else:
+        group_folds = 1
+        train_idx, val_idx, test_idx, reason_counts = make_temporal_global_split(
+            labels=labels,
+            users=groups,
+            timestamps=ds.timestamps,
+            train_ratio=args.temporal_train_ratio,
+            val_ratio=args.temporal_val_ratio,
+            drop_days=args.temporal_drop_days,
+        )
+        print(
+            "Temporal split stats: "
+            f"kept_users={reason_counts['kept_users']}, "
+            f"dropped_insufficient_samples={reason_counts['dropped_insufficient_samples']}, "
+            f"dropped_insufficient_label_diversity={reason_counts['dropped_insufficient_label_diversity']}"
+        )
+        fold_splits.append((0, train_idx, val_idx, test_idx))
 
     if args.max_folds is not None:
         fold_splits = fold_splits[:args.max_folds]
