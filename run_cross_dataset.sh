@@ -25,11 +25,10 @@ COMMON_LABELS=("arousal" "disturbance" "valence" "stress_binary") #"arousal" "di
 ALL_MODELS=(
   "XGB" "LGB" "MLP" "ResNet"
   "DANN" "CDAN" "DAN" "DeepCORAL" "MCC" "ADDA" "MCD" "JAN" "SHOT" "CBST" 
-  "CGDM"
   "TabNet" 
-  "SAINT" 
-  "TabTransformer" "FTTransformer" "DCN"
+  "TabTransformer" "FTTransformer" "SAINT" "DCN"
   "IRM" "VREx" "GroupDRO" "MixStyle" "ERM_DG" "MLDG" "Fish" "CSD" "SagNet" "MASF" 
+  "CGDM"
 )
 ALL_BACKBONES=("MLP" "ResNet" "Transformer")
 BACKBONE_AWARE_MODELS=(
@@ -131,6 +130,7 @@ for model in "${MODELS_TO_RUN[@]}"; do
         --run_setting "${RUN_SETTING}" \
         --model "${model}" \
         --backbone "${bb}" \
+        --efficient_attention \
         --hpo_trials "${HPO_TRIALS}" \
         --output "results/cross_dataset_${label}_${model}_${bb}_${RUN_SETTING}.csv"
     done

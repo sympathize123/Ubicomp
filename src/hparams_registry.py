@@ -19,7 +19,7 @@ def get_hparams(algorithm, dataset, backbone='MLP'):
         hparams['lr'] = lambda trial: trial.suggest_float('lr', 1e-5, 1e-2, log=True)
         hparams['weight_decay'] = lambda trial: trial.suggest_float('weight_decay', 1e-6, 1e-3, log=True)
         hparams['batch_size'] = lambda trial: trial.suggest_categorical('batch_size', [32, 64, 128])
-        if algorithm in ['MLP', 'ResNet', 'ERM_DG', 'DANN', 'CDAN', 'DAN', 'DeepCORAL', 'MCC', 'ADDA', 'MCD', 'JAN', 'SHOT', 'CBST', 'CGDM']:
+        if algorithm in ['MLP', 'ResNet', 'ERM_DG', 'DANN', 'CDAN', 'DAN', 'DeepCORAL', 'MCC', 'ADDA', 'MCD', 'JAN', 'SHOT', 'CBST']:
             hparams['batch_size'] = lambda trial: trial.suggest_categorical('batch_size', [32, 64, 128, 256, 512])
         hparams['dropout'] = lambda trial: trial.suggest_float('dropout', 0.0, 0.5)
         
@@ -139,6 +139,7 @@ def get_hparams(algorithm, dataset, backbone='MLP'):
     elif algorithm == 'DCN':
         hparams['dnn_hidden_units'] = lambda trial: trial.suggest_categorical('dnn_hidden_units', [(128, 128), (256, 128), (256, 256)])
         hparams['dropout'] = lambda trial: trial.suggest_float('dropout', 0.0, 0.5)
+        #hparams['epochs'] = lambda trial: trial.suggest_categorical('epochs', [30])
 
     elif algorithm == 'AutoInt':
         hparams['dropout'] = lambda trial: trial.suggest_float('dropout', 0.0, 0.3)

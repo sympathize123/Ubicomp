@@ -702,6 +702,7 @@ def _infinite_iterator(loader):
 
 
 def _build_loaders(X_train, y_train, X_val, y_val, X_target, batch_size):
+    pin = torch.cuda.is_available()
     train_dataset = torch.utils.data.TensorDataset(
         torch.tensor(X_train, dtype=torch.float32),
         torch.tensor(y_train, dtype=torch.long)
@@ -710,15 +711,15 @@ def _build_loaders(X_train, y_train, X_val, y_val, X_target, batch_size):
         torch.tensor(X_val, dtype=torch.float32),
         torch.tensor(y_val, dtype=torch.long)
     )
-    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
-    val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=True, pin_memory=pin, num_workers=4, persistent_workers=True)
+    val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=batch_size, shuffle=False, pin_memory=pin, num_workers=2, persistent_workers=True)
 
     target_loader = None
     if X_target is not None:
         target_dataset = torch.utils.data.TensorDataset(
             torch.tensor(X_target, dtype=torch.float32)
         )
-        target_loader = torch.utils.data.DataLoader(target_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
+        target_loader = torch.utils.data.DataLoader(target_dataset, batch_size=batch_size, shuffle=True, drop_last=True, pin_memory=pin, num_workers=2, persistent_workers=True)
 
     return train_loader, val_loader, target_loader
 
@@ -1259,9 +1260,9 @@ def train_adda(model, X_train, y_train, d_train, X_val, y_val, d_val,
         train_loss = 0.0
 
         for X_s, _ in train_loader:
-            X_s = X_s.to(device)
+            X_s = X_s.to(device, non_blocking=True)
             X_t, = next(target_iter)
-            X_t = X_t.to(device)
+            X_t = X_t.to(device, non_blocking=True)
 
             # 1) Train discriminator
             with torch.no_grad():

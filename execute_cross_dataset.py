@@ -229,7 +229,6 @@ def _normalize_per_user(X: np.ndarray, users: np.ndarray, train_mask: np.ndarray
             mean = X[u_train_mask].mean(axis=0)
             std = X[u_train_mask].std(axis=0)
         else:
-            # No train samples for this user (test-only dataset): normalize by own stats
             mean = X[u_mask].mean(axis=0)
             std = X[u_mask].std(axis=0)
         std[std < 1e-6] = 1.0

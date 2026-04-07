@@ -394,9 +394,11 @@ class DeepCTRWrapper(BaseEstimator, ClassifierMixin):
         from deepctr_torch.inputs import DenseFeat
         from deepctr_torch.callbacks import EarlyStopping
 
-        feature_names = [f"feat_{i}" for i in range(X.shape[1])]
+        # feature_names = [f"feat_{i}" for i in range(X.shape[1])]
+        # self.feature_names = feature_names
+        feature_names = [DenseFeat('dense_input', X.shape[1])]
         self.feature_names = feature_names
-        train_model_input = None
+        train_model_input = {'dense_input': X}
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
         if self.model_type == 'DCN':
@@ -517,8 +519,9 @@ def train_torch_model(model, X_train, y_train, X_val, y_val,
     train_dataset = TensorDataset(torch.tensor(X_train, dtype=torch.float32), torch.tensor(y_train, dtype=torch.long))
     val_dataset = TensorDataset(torch.tensor(X_val, dtype=torch.float32), torch.tensor(y_val, dtype=torch.long))
     
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+    pin = torch.cuda.is_available()
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=True, pin_memory=pin, num_workers=4, persistent_workers=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, pin_memory=pin, num_workers=2, persistent_workers=True)
     
     criterion = nn.CrossEntropyLoss()
     
