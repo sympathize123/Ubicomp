@@ -76,8 +76,9 @@ def _get_probs(model, X: np.ndarray) -> np.ndarray:
     return model.predict_proba(X)
 
 
-def _metrics(y: np.ndarray, probs: np.ndarray) -> Dict[str, float]:
+def evaluate_extended(model, X: np.ndarray, y: np.ndarray) -> Dict[str, float]:
     from sklearn.metrics import accuracy_score, f1_score, roc_auc_score, precision_score, recall_score
+    probs = _get_probs(model, X)
     preds = np.argmax(probs, axis=1)
     try:
         auroc = float(roc_auc_score(y, probs[:, 1]))
@@ -92,17 +93,6 @@ def _metrics(y: np.ndarray, probs: np.ndarray) -> Dict[str, float]:
     }
 
 
-def evaluate_extended(model, X: np.ndarray, y: np.ndarray) -> Dict[str, float]:
-    return _metrics(y, _get_probs(model, X))
-
-
-@contextmanager
-def _timer(store: Dict, key: str):
-    t0 = time.perf_counter()
-    yield
-    store[key] = round(time.perf_counter() - t0, 3)
-
-
 def _json_default(obj):
     if isinstance(obj, np.integer):
         return int(obj)
@@ -114,8 +104,8 @@ def _json_default(obj):
 
 
 def _flat_summary(r: Dict) -> Dict:
-    m = r.get("metrics", {})
-    s = r.get("setting", {})
+    m  = r.get("metrics", {})
+    s  = r.get("setting", {})
     rt = r.get("runtime", {})
     tr = r.get("training", {})
     return {
@@ -133,12 +123,12 @@ def _flat_summary(r: Dict) -> Dict:
         "seed":              s.get("seed"),
         "hpo_best_auroc":    r.get("hpo", {}).get("best_value"),
         "train_auroc":       m.get("train", {}).get("auroc"),
-        "val_auroc":         m.get("val", {}).get("auroc"),
-        "test_auroc":        m.get("test", {}).get("auroc"),
-        "test_f1":           m.get("test", {}).get("f1"),
-        "test_accuracy":     m.get("test", {}).get("accuracy"),
-        "test_precision":    m.get("test", {}).get("precision"),
-        "test_recall":       m.get("test", {}).get("recall"),
+        "val_auroc":         m.get("val",   {}).get("auroc"),
+        "test_auroc":        m.get("test",  {}).get("auroc"),
+        "test_f1":           m.get("test",  {}).get("f1"),
+        "test_accuracy":     m.get("test",  {}).get("accuracy"),
+        "test_precision":    m.get("test",  {}).get("precision"),
+        "test_recall":       m.get("test",  {}).get("recall"),
         "best_epoch":        tr.get("best_epoch"),
         "early_stopped":     tr.get("early_stopped"),
         "hpo_wall_s":        rt.get("hpo_wall_s"),
@@ -155,15 +145,15 @@ class BenchmarkLogger:
     One instance per fold (cross-user) or per train→test pair (cross-dataset).
 
     Writes:
-      <output_dir>/records/<experiment_id>.json   full record
-      <output_dir>/summary.jsonl                  summary
+      <output_dir>/<experiment_id>.json    full structured record
+      <output_dir>/../summary.jsonl        flat one-liner per experiment (appended)
     """
 
     def __init__(self, output_dir: str, benchmark_type: str):
         assert benchmark_type in ("cross_user", "cross_dataset")
         self._dir = Path(output_dir)
         self._dir.mkdir(parents=True, exist_ok=True)
-        self._summary_path = self._dir / "summary.jsonl"
+        self._summary_path = self._dir.parent / "summary.jsonl"
         self._type = benchmark_type
         self._t0 = time.perf_counter()
         self._wall: Dict[str, float] = {}
@@ -177,21 +167,17 @@ class BenchmarkLogger:
             "hpo": {},
             "training": {},
             "metrics": {},
-            "runtime": {**_device_info(), "hpo_wall_s": None, "train_wall_s": None,
-                        "eval_wall_s": None, "total_wall_s": None,
-                        "peak_gpu_memory_mb": None, "peak_cpu_memory_mb": None},
+            "runtime": {
+                **_device_info(),
+                "hpo_wall_s": None, "train_wall_s": None,
+                "eval_wall_s": None, "total_wall_s": None,
+                "peak_gpu_memory_mb": None, "peak_cpu_memory_mb": None,
+            },
         }
         if _TORCH and torch.cuda.is_available():
             torch.cuda.reset_peak_memory_stats()
 
     def set_setting(self, **kwargs):
-        """
-        Cross-user keys: dataset, label, model, backbone, seed, fold_id, n_folds,
-                         val_ratio, hpo_trials, hpo_mode, max_epochs, patience
-        Cross-dataset keys: label, model, backbone, seed, val_ratio, hpo_trials,
-                            max_epochs, patience, train_datasets, test_dataset,
-                            setting_type, n_common_features, common_feature_list
-        """
         ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
         if self._type == "cross_user":
             eid = (f"{kwargs.get('model')}_{kwargs.get('dataset')}"
@@ -227,20 +213,23 @@ class BenchmarkLogger:
 
     @contextmanager
     def time_hpo(self):
-        with _timer(self._wall, "hpo"):
-            yield
+        t0 = time.perf_counter()
+        yield
+        self._wall["hpo"] = round(time.perf_counter() - t0, 3)
         self._rec["runtime"]["hpo_wall_s"] = self._wall["hpo"]
 
     @contextmanager
     def time_train(self):
-        with _timer(self._wall, "train"):
-            yield
+        t0 = time.perf_counter()
+        yield
+        self._wall["train"] = round(time.perf_counter() - t0, 3)
         self._rec["runtime"]["train_wall_s"] = self._wall["train"]
 
     @contextmanager
     def time_eval(self):
-        with _timer(self._wall, "eval"):
-            yield
+        t0 = time.perf_counter()
+        yield
+        self._wall["eval"] = round(time.perf_counter() - t0, 3)
         self._rec["runtime"]["eval_wall_s"] = self._wall["eval"]
 
     def record_hpo(self, study, best_params: Dict):
@@ -290,27 +279,16 @@ class BenchmarkLogger:
             "epoch_history": info.get("epoch_history", []),
         }
 
-    def record_metrics(self, model,
-                       X_tr: np.ndarray, y_tr: np.ndarray,
-                       X_va: np.ndarray, y_va: np.ndarray,
-                       X_te: np.ndarray, y_te: np.ndarray):
-        self._rec["metrics"] = {
-            "train": _metrics(y_tr, _get_probs(model, X_tr)),
-            "val":   _metrics(y_va, _get_probs(model, X_va)),
-            "test":  _metrics(y_te, _get_probs(model, X_te)),
-        }
+    def record_metrics(self, train_m: Dict, val_m: Dict, test_m: Dict):
+        self._rec["metrics"] = {"train": train_m, "val": val_m, "test": test_m}
 
     def finalize(self) -> Dict:
         self._rec["runtime"]["total_wall_s"] = round(time.perf_counter() - self._t0, 3)
         self._rec["runtime"]["peak_gpu_memory_mb"] = _peak_gpu_mb()
         self._rec["runtime"]["peak_cpu_memory_mb"] = _peak_cpu_mb()
-
         eid = self._rec["experiment_id"] or "unknown"
-        record_path = self._dir / f"{eid}.json"
-        with open(record_path, "w") as f:
+        with open(self._dir / f"{eid}.json", "w") as f:
             json.dump(self._rec, f, indent=2, default=_json_default)
-
         with open(self._summary_path, "a") as f:
             f.write(json.dumps(_flat_summary(self._rec), default=_json_default) + "\n")
-
         return self._rec
