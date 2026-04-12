@@ -14,6 +14,7 @@ from src.domainbed_algos import ERM as DG_ERM, IRM, VREx, GroupDRO, MixStyle, ML
 from src.hparams_registry import get_hparams
 from sklearn.model_selection import StratifiedGroupKFold, StratifiedShuffleSplit
 from sklearn.preprocessing import LabelEncoder
+from benchmark_logger import BenchmarkLogger, evaluate_extended
 
 os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'
 
@@ -21,8 +22,16 @@ BASE_DATA_DIR = str((Path(__file__).resolve().parent / 'data').resolve())
 
 PROGRESS_COLUMNS = [
     'Dataset', 'Label', 'Model', 'Backbone', 'Seed', 'Fold', 'Phase', 'Trial',
-    'Train_Accuracy', 'Train_AUROC', 'Val_Accuracy', 'Val_AUROC',
-    'Test_Accuracy', 'Test_F1', 'Test_AUROC', 'Hparams_JSON'
+    'Train_Accuracy', 'Train_AUROC', 'Train_F1', 'Train_Precision', 'Train_Recall',
+    'Val_Accuracy', 'Val_AUROC', 'Val_F1', 'Val_Precision', 'Val_Recall',
+    'Test_Accuracy', 'Test_F1', 'Test_AUROC', 'Test_Precision', 'Test_Recall',
+    'Train_Samples', 'Val_Samples', 'Test_Samples',
+    'Train_Users', 'Val_Users', 'Test_Users',
+    'Train_PosRatio', 'Val_PosRatio', 'Test_PosRatio',
+    'Best_Epoch', 'Early_Stopped', 'HPO_Best_AUROC',
+    'Total_Wall_S', 'HPO_Wall_S', 'Train_Wall_S',
+    'Device_Name', 'Peak_GPU_MB',
+    'Hparams_JSON', 'Experiment_ID',
 ]
 
 def append_row(path, row, columns):
@@ -149,7 +158,7 @@ def get_args():
     parser.add_argument('--batch_size', type=int, default=64)
     parser.add_argument('--lr', type=float, default=1e-3)
     parser.add_argument('--output', type=str, default='results/benchmark_results_da_hpo.csv')
-    parser.add_argument('--hpo_trials', type=int, default=0)
+    parser.add_argument('--hpo_trials', type=int, default=30)
     parser.add_argument('--hpo_mode', type=str, default='fold1', choices=['fold1', 'cv', 'nested'])
     parser.add_argument('--patience', type=int, default=20)
     parser.add_argument('--efficient_attention', action='store_true')
@@ -191,13 +200,31 @@ def train_model(args, X_train, y_train, d_train, X_val, y_val, d_val,
     nhead = hparams.get('nhead', 4)
 
     if args.model == 'XGB':
-        model = XGBoostWrapper(n_estimators=hparams.get('n_estimators', 100), max_depth=hparams.get('max_depth', 6),
-                               learning_rate=hparams.get('learning_rate', 0.1), subsample=hparams.get('subsample', 1.0),
-                               colsample_bytree=hparams.get('colsample_bytree', 1.0), random_state=seed, patience=patience)
+        model = XGBoostWrapper(
+            n_estimators=hparams.get('n_estimators', 100),
+            max_depth=hparams.get('max_depth', 6),
+            learning_rate=hparams.get('learning_rate', 0.1),
+            min_child_weight=hparams.get('min_child_weight', 1.0),
+            subsample=hparams.get('subsample', 1.0),
+            colsample_bylevel=hparams.get('colsample_bylevel', 1.0),
+            colsample_bytree=hparams.get('colsample_bytree', 1.0),
+            gamma=hparams.get('gamma', 0.0),
+            reg_lambda=hparams.get('reg_lambda', 1.0),
+            reg_alpha=hparams.get('reg_alpha', 0.0),
+            random_state=seed,
+            patience=patience,
+        )
     elif args.model == 'LGB':
-        model = LightGBMWrapper(n_estimators=hparams.get('n_estimators', 100), num_leaves=hparams.get('num_leaves', 31),
-                                learning_rate=hparams.get('learning_rate', 0.1), min_child_samples=hparams.get('min_child_samples', 20),
-                                random_state=seed, patience=patience)
+        model = LightGBMWrapper(
+            n_estimators=hparams.get('n_estimators', 100),
+            num_leaves=hparams.get('num_leaves', 31),
+            learning_rate=hparams.get('learning_rate', 0.1),
+            min_child_samples=hparams.get('min_child_samples', 20),
+            subsample=hparams.get('subsample', 1.0),
+            colsample_bytree=hparams.get('colsample_bytree', 1.0),
+            random_state=seed,
+            patience=patience,
+        )
     elif args.model == 'TabNet':
         opt_params = dict(lr=lr)
         if 'weight_decay' in hparams: opt_params['weight_decay'] = hparams['weight_decay']
@@ -232,33 +259,42 @@ def train_model(args, X_train, y_train, d_train, X_val, y_val, d_val,
                                 efficient_attention=use_efficient, **tt_hparams)
     elif args.model == 'FTTransformer':
         ft_hparams = dict(hparams)
-        _input_dim = ft_hparams.pop('input_dim', 32)
-        _n_heads = ft_hparams.pop('n_heads', 4)
+        _input_dim = ft_hparams.pop('input_dim', 192)
+        _n_heads = ft_hparams.pop('n_heads', 8)
         _n_blocks = ft_hparams.pop('n_blocks', 2)
-        _dropout = ft_hparams.pop('dropout', 0.1)
         model = WidedeepWrapper(model_type='FTTransformer', input_dim=_input_dim, n_heads=_n_heads,
-                                n_blocks=_n_blocks, dropout=_dropout,
+                                n_blocks=_n_blocks,
                                 epochs=epochs, patience=patience, batch_size=batch_size,
                                 efficient_attention=args.efficient_attention, **ft_hparams)
     elif args.model == 'DCN':
-        _dnn_hidden_units = hparams.pop('dnn_hidden_units', (256, 128))
-        _dropout = hparams.pop('dropout', 0.1)
+        dcn_hparams = dict(hparams)
+        dcn_hparams['cross_num'] = dcn_hparams.pop('n_cross_layers', 2)
+        _dnn_hidden_units = dcn_hparams.pop('dnn_hidden_units', (256, 128))
+        _dropout = dcn_hparams.pop('hidden_dropout', dcn_hparams.pop('dropout', 0.1))
+        weight_decay = dcn_hparams.pop('weight_decay', 0.0)
+        dcn_hparams.pop('cross_dropout', None)
+        dcn_hparams.pop('layer_size', None)
+        dcn_hparams['l2_reg_dnn'] = weight_decay
+        dcn_hparams['l2_reg_cross'] = weight_decay
         model = DeepCTRWrapper(model_type='DCN', dnn_hidden_units=_dnn_hidden_units,
-                               dnn_dropout=_dropout, batch_size=batch_size, epochs=epochs, patience=patience, **hparams)
+                               dnn_dropout=_dropout, batch_size=batch_size, epochs=epochs, patience=patience, **dcn_hparams)
     elif args.model == 'AutoInt':
-        _dropout = hparams.pop('dropout', 0.1)
+        autoint_hparams = dict(hparams)
+        _dropout = autoint_hparams.pop('dropout', 0.1)
         # deepctr_torch AutoInt does not support att_embedding_dim in this environment.
-        hparams.pop('att_embedding_dim', None)
+        autoint_hparams.pop('att_embedding_dim', None)
         model = DeepCTRWrapper(model_type='AutoInt', dnn_dropout=_dropout,
-                               batch_size=batch_size, epochs=epochs, patience=patience, **hparams)
+                               batch_size=batch_size, epochs=epochs, patience=patience, **autoint_hparams)
     elif args.model == 'MLP':
         net = MLP(input_dim=input_dim, hidden_dim=hidden_dim, num_layers=num_layers, dropout=dropout)
         model = train_torch_model(net, X_train, y_train, X_val, y_val,
-                                  epochs=epochs, batch_size=batch_size, lr=lr, patience=patience)
+                                  epochs=epochs, batch_size=batch_size, lr=lr,
+                                  weight_decay=hparams.get('weight_decay', 0.0), patience=patience)
     elif args.model == 'ResNet':
         net = ResNet(input_dim=input_dim, hidden_dim=hidden_dim, num_blocks=num_blocks, dropout=dropout)
         model = train_torch_model(net, X_train, y_train, X_val, y_val,
-                                  epochs=epochs, batch_size=batch_size, lr=lr, patience=patience)
+                                  epochs=epochs, batch_size=batch_size, lr=lr,
+                                  weight_decay=hparams.get('weight_decay', 0.0), patience=patience)
     elif args.model == 'DANN':
         net = DANN(input_dim=input_dim, num_classes=2, num_domains=num_domains,
                    hparams={**hparams, 'lr': lr, 'backbone': backbone, 'dropout': dropout,
@@ -343,7 +379,8 @@ def train_model(args, X_train, y_train, d_train, X_val, y_val, d_val,
                            X_val=X_val, y_val=y_val,
                            epochs=epochs, batch_size=batch_size, lr=lr,
                            patience=patience,
-                           weight_decay=hparams.get('weight_decay', 5e-4))
+                           weight_decay=hparams.get('weight_decay', 5e-4),
+                           num_k=hparams.get('num_k', 4))
 
     if args.model in ['XGB', 'LGB', 'TabNet', 'SAINT', 'TabTransformer', 'FTTransformer', 'DCN', 'AutoInt']:
         model.fit(X_train, y_train, X_val, y_val)
@@ -461,7 +498,6 @@ def main():
 
     def _run_hpo(folds_for_hpo, *, label):
         print(f"Starting {label} with {args.hpo_trials} trials...")
-        import optuna
         from src.hparams_registry import get_hparams
 
         def objective(trial):
@@ -496,106 +532,144 @@ def main():
                     return 0.0
             return float(np.mean(scores)) if scores else 0.0
 
-        study = optuna.create_study(direction='maximize', sampler=optuna.samplers.TPESampler(seed=42))
+        import optuna as _optuna
+        _optuna.logging.set_verbosity(_optuna.logging.WARNING)
+        study = _optuna.create_study(direction='maximize', sampler=_optuna.samplers.TPESampler(seed=42))
         study.optimize(objective, n_trials=args.hpo_trials)
         print("Best HPO params:", study.best_params)
-        return study.best_params
+        return study.best_params, study
 
+    hpo_study = None
     if args.hpo_trials > 0 and args.hpo_mode in ("fold1", "cv"):
         folds_for_hpo = fold_data if args.hpo_mode == "cv" else [fold_data[0]]
-        best_hparams = _run_hpo(folds_for_hpo, label="CV-HPO" if args.hpo_mode == "cv" else "Fold-1 HPO")
+        best_hparams, hpo_study = _run_hpo(folds_for_hpo, label="CV-HPO" if args.hpo_mode == "cv" else "Fold-1 HPO")
 
     seeds = [42]
+    records_dir = str(Path(args.output).parent / "records")
 
-    # Collect per-fold results for final aggregation
-    METRIC_KEYS = ['Train_Accuracy', 'Train_AUROC', 'Val_Accuracy', 'Val_AUROC',
-                   'Test_Accuracy', 'Test_F1', 'Test_AUROC']
+    METRIC_KEYS = [
+        'Train_Accuracy', 'Train_AUROC', 'Train_F1', 'Train_Precision', 'Train_Recall',
+        'Val_Accuracy', 'Val_AUROC', 'Val_F1', 'Val_Precision', 'Val_Recall',
+        'Test_Accuracy', 'Test_F1', 'Test_AUROC', 'Test_Precision', 'Test_Recall',
+    ]
     all_fold_results = []
 
     for entry in fold_data:
         fold_id = entry["fold_id"]
         print(f"\n=== Fold {fold_id + 1}/{group_folds} ===")
 
+        fold_hparams = best_hparams
+        fold_study = hpo_study
         if args.hpo_trials > 0 and args.hpo_mode == "nested":
-            best_hparams = _run_hpo([entry], label=f"Nested HPO (Fold {fold_id + 1})")
+            fold_hparams, fold_study = _run_hpo([entry], label=f"Nested HPO (Fold {fold_id + 1})")
 
         d_train, d_val, num_domains, X_target = _prepare_domain_info(entry)
-        if args.model in DG_MODELS:
-            if args.uda:
-                print(f"Preparing UDA Mode for {args.model} (Source=Train, Target=Test)...")
-                print(f"UDA Enabled: X_target shape {entry['X_test'].shape}")
-            else:
-                print(f"Preparing DG Mode for {args.model} (Multi-Source Users)...")
-                print(f"Number of Domains (Users): {num_domains}")
-
         print(f"Data Splits: Train {entry['X_train'].shape}, Val {entry['X_val'].shape}, Test {entry['X_test'].shape}")
 
         for seed in seeds:
             print(f"\n--- Fold {fold_id + 1} | Seed {seed} ---")
+
+            logger = BenchmarkLogger(output_dir=records_dir, benchmark_type="cross_user")
+
+            clip_val = float(max(10.0, np.percentile(np.abs(entry["X_train"].reshape(-1)), 99.9)))
+            logger.set_setting(
+                dataset=args.dataset, label=args.label, model=args.model,
+                backbone=args.backbone, seed=seed, fold_id=fold_id, n_folds=group_folds,
+                split_strategy=args.split_strategy, hpo_trials=args.hpo_trials,
+                hpo_mode=args.hpo_mode, max_epochs=args.epochs, patience=args.patience,
+            )
+            logger.set_preprocessing(clip_value=clip_val)
+            logger.set_split_stats(
+                entry["y_train"], ds.users[entry["train_idx"]],
+                entry["y_val"],   ds.users[entry["val_idx"]],
+                entry["y_test"],  ds.users[entry["test_idx"]],
+            )
+            if fold_study is not None:
+                logger.record_hpo(fold_study, fold_hparams)
+            else:
+                logger.record_hpo_no_study(fold_hparams)
+
             X_val_train = entry["X_val"]
             y_val_train = entry["y_val"]
             if args.uda and args.model in DA_MODELS:
                 X_val_train = entry["X_test"]
                 y_val_train = entry["y_test"]
 
-            model = train_model(
-                args,
-                entry["X_train"], entry["y_train"], d_train,
-                X_val_train, y_val_train, d_val,
-                entry["X_train"].shape[1], 2, num_domains,
-                hparams=best_hparams, seed=seed, patience=args.patience, X_target=X_target,
-            )
+            with logger.time_train():
+                model = train_model(
+                    args,
+                    entry["X_train"], entry["y_train"], d_train,
+                    X_val_train, y_val_train, d_val,
+                    entry["X_train"].shape[1], 2, num_domains,
+                    hparams=fold_hparams, seed=seed, patience=args.patience, X_target=X_target,
+                )
 
-            print("Evaluating on Train, Validation and Test sets...")
+            logger.record_training()
 
-            train_metrics = evaluate_model(model, entry["X_train"], entry["y_train"])
-            val_metrics   = evaluate_model(model, entry["X_val"],   entry["y_val"])
-            test_metrics  = evaluate_model(model, entry["X_test"],  entry["y_test"])
+            with logger.time_eval():
+                train_m = evaluate_extended(model, entry["X_train"], entry["y_train"])
+                val_m   = evaluate_extended(model, entry["X_val"],   entry["y_val"])
+                test_m  = evaluate_extended(model, entry["X_test"],  entry["y_test"])
 
-            print(f"Results for {args.dataset} - {args.model} - Fold {fold_id + 1} - Seed {seed}:")
-            print(f"  Train AUROC: {train_metrics['AUROC']:.4f}, Acc: {train_metrics['Accuracy']:.4f}")
-            print(f"  Val   AUROC: {val_metrics['AUROC']:.4f}, Acc: {val_metrics['Accuracy']:.4f}")
-            print(f"  Test  AUROC: {test_metrics['AUROC']:.4f}, Acc: {test_metrics['Accuracy']:.4f}")
+            logger.record_metrics(train_m, val_m, test_m)
+            record = logger.finalize()
+            rt = record["runtime"]
+            tr = record["training"]
+            ss = record["split_stats"]
+
+            print(f"  Train AUROC={train_m['auroc']:.4f}  Val AUROC={val_m['auroc']:.4f}  Test AUROC={test_m['auroc']:.4f}  wall={rt['total_wall_s']}s")
 
             fold_result = {
-                'Train_Accuracy': train_metrics['Accuracy'], 'Train_AUROC': train_metrics['AUROC'],
-                'Val_Accuracy': val_metrics['Accuracy'], 'Val_AUROC': val_metrics['AUROC'],
-                'Test_Accuracy': test_metrics['Accuracy'], 'Test_F1': test_metrics['F1'],
-                'Test_AUROC': test_metrics['AUROC']
+                'Train_Accuracy': train_m['accuracy'], 'Train_AUROC': train_m['auroc'],
+                'Train_F1': train_m['f1'], 'Train_Precision': train_m['precision'], 'Train_Recall': train_m['recall'],
+                'Val_Accuracy': val_m['accuracy'], 'Val_AUROC': val_m['auroc'],
+                'Val_F1': val_m['f1'], 'Val_Precision': val_m['precision'], 'Val_Recall': val_m['recall'],
+                'Test_Accuracy': test_m['accuracy'], 'Test_F1': test_m['f1'], 'Test_AUROC': test_m['auroc'],
+                'Test_Precision': test_m['precision'], 'Test_Recall': test_m['recall'],
             }
             all_fold_results.append(fold_result)
 
-            # Progress CSV: per-fold immediate save (unchanged)
-            final_progress_row = {
+            progress_row = {
                 'Dataset': args.dataset, 'Label': args.label, 'Model': args.model,
                 'Backbone': args.backbone, 'Seed': seed, 'Fold': fold_id + 1,
                 'Phase': 'final', 'Trial': '',
-                'Train_Accuracy': train_metrics.get('Accuracy'), 'Train_AUROC': train_metrics.get('AUROC'),
-                'Val_Accuracy': val_metrics.get('Accuracy'), 'Val_AUROC': val_metrics.get('AUROC'),
-                'Test_Accuracy': test_metrics.get('Accuracy'), 'Test_F1': test_metrics.get('F1'),
-                'Test_AUROC': test_metrics.get('AUROC'),
-                'Hparams_JSON': json.dumps(best_hparams, default=str)
+                'Train_Accuracy': train_m['accuracy'], 'Train_AUROC': train_m['auroc'],
+                'Train_F1': train_m['f1'], 'Train_Precision': train_m['precision'], 'Train_Recall': train_m['recall'],
+                'Val_Accuracy': val_m['accuracy'], 'Val_AUROC': val_m['auroc'],
+                'Val_F1': val_m['f1'], 'Val_Precision': val_m['precision'], 'Val_Recall': val_m['recall'],
+                'Test_Accuracy': test_m['accuracy'], 'Test_F1': test_m['f1'], 'Test_AUROC': test_m['auroc'],
+                'Test_Precision': test_m['precision'], 'Test_Recall': test_m['recall'],
+                'Train_Samples': ss['train']['n_samples'], 'Val_Samples': ss['val']['n_samples'],
+                'Test_Samples': ss['test']['n_samples'],
+                'Train_Users': ss['train']['n_users'], 'Val_Users': ss['val']['n_users'],
+                'Test_Users': ss['test']['n_users'],
+                'Train_PosRatio': ss['train']['positive_ratio'], 'Val_PosRatio': ss['val']['positive_ratio'],
+                'Test_PosRatio': ss['test']['positive_ratio'],
+                'Best_Epoch': tr.get('best_epoch'), 'Early_Stopped': tr.get('early_stopped'),
+                'HPO_Best_AUROC': record['hpo'].get('best_value'),
+                'Total_Wall_S': rt.get('total_wall_s'), 'HPO_Wall_S': rt.get('hpo_wall_s'),
+                'Train_Wall_S': rt.get('train_wall_s'), 'Device_Name': rt.get('device_name'),
+                'Peak_GPU_MB': rt.get('peak_gpu_memory_mb'),
+                'Hparams_JSON': json.dumps(fold_hparams, default=str),
+                'Experiment_ID': record['experiment_id'],
             }
-            append_row(progress_output_path, final_progress_row, PROGRESS_COLUMNS)
-            print(f"Progress results saved to {progress_output_path}")
+            append_row(progress_output_path, progress_row, PROGRESS_COLUMNS)
 
-    # --- Final CSV: aggregate mean ± std across all folds ---
     if all_fold_results:
-        summary = {'Dataset': args.dataset, 'Label': args.label, 'Model': args.model,
-                   'Backbone': args.backbone, 'N_Folds': len(all_fold_results)}
+        summary = {
+            'Dataset': args.dataset, 'Label': args.label, 'Model': args.model,
+            'Backbone': args.backbone, 'N_Folds': len(all_fold_results),
+        }
         for key in METRIC_KEYS:
             vals = [r[key] for r in all_fold_results]
-            summary[f'{key}_Mean'] = float(np.mean(vals))
-            summary[f'{key}_Std'] = float(np.std(vals))
-
+            summary[f'{key}_Mean'] = round(float(np.mean(vals)), 6)
+            summary[f'{key}_Std']  = round(float(np.std(vals)), 6)
         if os.path.dirname(args.output):
             os.makedirs(os.path.dirname(args.output), exist_ok=True)
-
         header = not os.path.exists(args.output)
-        df_summary = pd.DataFrame([summary])
-        df_summary.to_csv(args.output, mode='a', header=header, index=False)
+        pd.DataFrame([summary]).to_csv(args.output, mode='a', header=header, index=False)
         print(f"\n=== Summary (Mean ± Std over {len(all_fold_results)} folds) ===")
-        for key in METRIC_KEYS:
+        for key in ['Test_AUROC', 'Test_F1', 'Test_Accuracy']:
             print(f"  {key}: {summary[f'{key}_Mean']:.4f} ± {summary[f'{key}_Std']:.4f}")
         print(f"Summary saved to {args.output}")
 

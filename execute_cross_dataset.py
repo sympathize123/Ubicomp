@@ -23,9 +23,11 @@ import torch
 from sklearn.model_selection import StratifiedShuffleSplit
 from sklearn.preprocessing import LabelEncoder
 
+import copy
 from execute_benchmark import train_model
 from src.hparams_registry import get_hparams
 from src.models import evaluate_model
+from benchmark_logger import BenchmarkLogger, evaluate_extended
 
 BASE_DATA_DIR = str((Path(__file__).resolve().parent / 'data').resolve())
 COMMON_LABELS = ['arousal', 'disturbance', 'valence', 'stress_binary']
@@ -36,8 +38,15 @@ RESULT_COLUMNS = [
     'Setting', 'Label', 'Model', 'Backbone', 'Seed', 'Val_Ratio', 'HPO_Trials',
     'Train_Datasets', 'Test_Dataset',
     'Common_Features', 'Train_Samples', 'Val_Samples', 'Test_Samples',
-    'Train_Accuracy', 'Train_AUROC', 'Val_Accuracy', 'Val_AUROC',
-    'Test_Accuracy', 'Test_F1', 'Test_AUROC', 'Hparams_JSON'
+    'Train_Users', 'Val_Users', 'Test_Users',
+    'Train_PosRatio', 'Val_PosRatio', 'Test_PosRatio',
+    'Train_Accuracy', 'Train_AUROC', 'Train_F1', 'Train_Precision', 'Train_Recall',
+    'Val_Accuracy', 'Val_AUROC', 'Val_F1', 'Val_Precision', 'Val_Recall',
+    'Test_Accuracy', 'Test_F1', 'Test_AUROC', 'Test_Precision', 'Test_Recall',
+    'Best_Epoch', 'Early_Stopped', 'HPO_Best_AUROC',
+    'Total_Wall_S', 'HPO_Wall_S', 'Train_Wall_S',
+    'Device_Name', 'Peak_GPU_MB',
+    'Hparams_JSON', 'Experiment_ID',
 ]
 
 
@@ -215,6 +224,7 @@ def _clip_by_train(X_train: np.ndarray, X_val: np.ndarray, X_test: np.ndarray) -
         np.clip(X_train, -clip, clip).astype(np.float32),
         np.clip(X_val,   -clip, clip).astype(np.float32),
         np.clip(X_test,  -clip, clip).astype(np.float32),
+        clip,
     )
 
 
@@ -290,16 +300,17 @@ def _build_cross_dataset_splits(aligned: Dict[str, Dict], train_datasets: List[s
     y_va = y_src[va_idx]
     g_va = g_src[va_idx]
 
-    # Clip outliers based on train stats only (per-user norm already applied above)
-    X_tr, X_va, X_te = _clip_by_train(X_tr, X_va, X_te)
+    X_tr, X_va, X_te, clip_val = _clip_by_train(X_tr, X_va, X_te)
 
     le = LabelEncoder()
     le.fit(g_src)
     d_tr = le.transform(g_tr)
     d_va = le.transform(g_va)
 
+    u_src_tr = u_src[tr_idx]
+    u_src_va = u_src[va_idx]
     num_domains = len(le.classes_)
-    return X_tr, y_tr, d_tr, X_va, y_va, d_va, X_te, y_te, num_domains
+    return X_tr, y_tr, d_tr, u_src_tr, X_va, y_va, d_va, u_src_va, X_te, y_te, u_te, num_domains, clip_val
 
 
 def _sample_hparams(args, train_dataset_key: str, trial):
@@ -313,8 +324,6 @@ def _sample_hparams(args, train_dataset_key: str, trial):
 def _run_hpo(args, train_dataset_key: str, X_tr, y_tr, d_tr, X_va, y_va, d_va, X_target, num_domains):
     if args.hpo_trials <= 0:
         return {}
-
-    import optuna
 
     print(f'  Running HPO on source train/val split only: trials={args.hpo_trials}')
 
@@ -343,83 +352,115 @@ def _run_hpo(args, train_dataset_key: str, X_tr, y_tr, d_tr, X_va, y_va, d_va, X
             print(f'  HPO trial failed: {exc}')
             return 0.0
 
-    study = optuna.create_study(direction='maximize', sampler=optuna.samplers.TPESampler(seed=args.seed))
+    import optuna as _optuna
+    _optuna.logging.set_verbosity(_optuna.logging.WARNING)
+    study = _optuna.create_study(direction='maximize', sampler=_optuna.samplers.TPESampler(seed=args.seed))
     study.optimize(objective, n_trials=args.hpo_trials)
     print(f'  Best HPO params: {study.best_params}')
-    return study.best_params
+    return study.best_params, study
 
 
-def _run_experiment(args, aligned: Dict[str, Dict], common_features: List[str], label: str, train_datasets: List[str], test_dataset: str):
-    X_tr, y_tr, d_tr, X_va, y_va, d_va, X_te, y_te, num_domains = _build_cross_dataset_splits(
-        aligned=aligned,
-        train_datasets=train_datasets,
-        test_dataset=test_dataset,
-        seed=args.seed,
-        val_ratio=args.val_ratio,
-    )
+def _run_experiment(args, aligned: Dict[str, Dict], common_features: List[str],
+                    label: str, train_datasets: List[str], test_dataset: str,
+                    records_dir: str):
+    exp_args = copy.copy(args)
+    exp_args.uda = bool(args.uda or (args.model in DA_MODELS and not args.disable_auto_uda))
 
-    # Enable UDA automatically for DA models unless disabled
-    use_uda = args.uda or (args.model in DA_MODELS and not args.disable_auto_uda)
-    args.uda = bool(use_uda)
-
-    X_target = X_te if args.uda and args.model in DA_MODELS else None
-    best_hparams = _run_hpo(
-        args=args,
-        train_dataset_key=train_datasets[0],
-        X_tr=X_tr,
-        y_tr=y_tr,
-        d_tr=d_tr,
-        X_va=X_va,
-        y_va=y_va,
-        d_va=d_va,
-        X_target=X_target,
-        num_domains=num_domains,
-    )
-
-    model = train_model(
-        args=args,
-        X_train=X_tr,
-        y_train=y_tr,
-        d_train=d_tr,
-        X_val=X_va,
-        y_val=y_va,
-        d_val=d_va,
-        input_dim=X_tr.shape[1],
-        num_classes=2,
-        num_domains=num_domains,
-        hparams=best_hparams,
-        seed=args.seed,
-        patience=args.patience,
-        X_target=X_target,
-    )
-
-    train_metrics = evaluate_model(model, X_tr, y_tr)
-    val_metrics = evaluate_model(model, X_va, y_va)
-    test_metrics = evaluate_model(model, X_te, y_te)
+    X_tr, y_tr, d_tr, u_tr, X_va, y_va, d_va, u_va, X_te, y_te, u_te, num_domains, clip_val = \
+        _build_cross_dataset_splits(aligned, train_datasets, test_dataset, args.seed, args.val_ratio)
 
     setting = 'train2_test1' if len(train_datasets) == 2 else 'train1_test1'
+    logger = BenchmarkLogger(output_dir=records_dir, benchmark_type="cross_dataset")
+    logger.set_setting(
+        label=label, model=args.model, backbone=args.backbone, seed=args.seed,
+        val_ratio=args.val_ratio, hpo_trials=args.hpo_trials,
+        max_epochs=args.epochs, patience=args.patience,
+        train_datasets=train_datasets, test_dataset=test_dataset,
+        setting_type=setting, n_common_features=len(common_features),
+        common_feature_list=common_features,
+    )
+    logger.set_preprocessing(clip_value=clip_val)
+    logger.set_split_stats(y_tr, u_tr, y_va, u_va, y_te, u_te)
+
+    X_target = X_te if exp_args.uda and args.model in DA_MODELS else None
+    with logger.time_hpo():
+        best_hparams, study = _run_hpo(
+            args=exp_args, train_dataset_key=train_datasets[0],
+            X_tr=X_tr, y_tr=y_tr, d_tr=d_tr,
+            X_va=X_va, y_va=y_va, d_va=d_va,
+            X_target=X_target, num_domains=num_domains,
+        )
+    if study is not None:
+        logger.record_hpo(study, best_hparams)
+    else:
+        logger.record_hpo_no_study(best_hparams)
+
+    with logger.time_train():
+        model = train_model(
+            args=exp_args, X_train=X_tr, y_train=y_tr, d_train=d_tr,
+            X_val=X_va, y_val=y_va, d_val=d_va,
+            input_dim=X_tr.shape[1], num_classes=2, num_domains=num_domains,
+            hparams=best_hparams, seed=args.seed, patience=args.patience,
+            X_target=X_target,
+        )
+    logger.record_training()
+
+    with logger.time_eval():
+        train_m = evaluate_extended(model, X_tr, y_tr)
+        val_m   = evaluate_extended(model, X_va, y_va)
+        test_m  = evaluate_extended(model, X_te, y_te)
+
+    logger.record_metrics(train_m, val_m, test_m)
+    record = logger.finalize()
+    rt = record["runtime"]
+    tr = record["training"]
+    ss = record["split_stats"]
+
     return {
-        'Setting': setting,
-        'Label': label,
-        'Model': args.model,
-        'Backbone': args.backbone,
-        'Seed': args.seed,
-        'Val_Ratio': args.val_ratio,
-        'HPO_Trials': args.hpo_trials,
-        'Train_Datasets': '+'.join(train_datasets),
-        'Test_Dataset': test_dataset,
+        'Setting':         setting,
+        'Label':           label,
+        'Model':           args.model,
+        'Backbone':        args.backbone,
+        'Seed':            args.seed,
+        'Val_Ratio':       args.val_ratio,
+        'HPO_Trials':      args.hpo_trials,
+        'Train_Datasets':  '+'.join(train_datasets),
+        'Test_Dataset':    test_dataset,
         'Common_Features': len(common_features),
-        'Train_Samples': int(len(y_tr)),
-        'Val_Samples': int(len(y_va)),
-        'Test_Samples': int(len(y_te)),
-        'Train_Accuracy': train_metrics['Accuracy'],
-        'Train_AUROC': train_metrics['AUROC'],
-        'Val_Accuracy': val_metrics['Accuracy'],
-        'Val_AUROC': val_metrics['AUROC'],
-        'Test_Accuracy': test_metrics['Accuracy'],
-        'Test_F1': test_metrics['F1'],
-        'Test_AUROC': test_metrics['AUROC'],
-        'Hparams_JSON': json.dumps(best_hparams, default=str),
+        'Train_Samples':   ss['train']['n_samples'],
+        'Val_Samples':     ss['val']['n_samples'],
+        'Test_Samples':    ss['test']['n_samples'],
+        'Train_Users':     ss['train']['n_users'],
+        'Val_Users':       ss['val']['n_users'],
+        'Test_Users':      ss['test']['n_users'],
+        'Train_PosRatio':  ss['train']['positive_ratio'],
+        'Val_PosRatio':    ss['val']['positive_ratio'],
+        'Test_PosRatio':   ss['test']['positive_ratio'],
+        'Train_Accuracy':  train_m['accuracy'],
+        'Train_AUROC':     train_m['auroc'],
+        'Train_F1':        train_m['f1'],
+        'Train_Precision': train_m['precision'],
+        'Train_Recall':    train_m['recall'],
+        'Val_Accuracy':    val_m['accuracy'],
+        'Val_AUROC':       val_m['auroc'],
+        'Val_F1':          val_m['f1'],
+        'Val_Precision':   val_m['precision'],
+        'Val_Recall':      val_m['recall'],
+        'Test_Accuracy':   test_m['accuracy'],
+        'Test_F1':         test_m['f1'],
+        'Test_AUROC':      test_m['auroc'],
+        'Test_Precision':  test_m['precision'],
+        'Test_Recall':     test_m['recall'],
+        'Best_Epoch':      tr.get('best_epoch'),
+        'Early_Stopped':   tr.get('early_stopped'),
+        'HPO_Best_AUROC':  record['hpo'].get('best_value'),
+        'Total_Wall_S':    rt.get('total_wall_s'),
+        'HPO_Wall_S':      rt.get('hpo_wall_s'),
+        'Train_Wall_S':    rt.get('train_wall_s'),
+        'Device_Name':     rt.get('device_name'),
+        'Peak_GPU_MB':     rt.get('peak_gpu_memory_mb'),
+        'Hparams_JSON':    json.dumps(best_hparams, default=str),
+        'Experiment_ID':   record['experiment_id'],
     }
 
 
@@ -518,6 +559,8 @@ def main():
         if args.limit_experiments is not None:
             plans = plans[:max(0, args.limit_experiments)]
 
+        out_path = Path(args.output)
+        records_dir = str(out_path.parent / 'records')
         rows = []
         print(
             f'\nRunning {len(plans)} cross-dataset experiments with {len(common_features)} common features '
@@ -525,14 +568,13 @@ def main():
         )
         for i, (train_ds, test_ds) in enumerate(plans, start=1):
             print(f'[{i}/{len(plans)}] Train={"+".join(train_ds)} -> Test={test_ds}')
-            row = _run_experiment(args, aligned, common_features, args.label, train_ds, test_ds)
+            row = _run_experiment(args, aligned, common_features, args.label, train_ds, test_ds, records_dir)
             rows.append(row)
             print(
                 f"  Test AUROC={row['Test_AUROC']:.4f}, Test F1={row['Test_F1']:.4f}, "
                 f"Test ACC={row['Test_Accuracy']:.4f}"
             )
 
-        out_path = Path(args.output)
         out_path.parent.mkdir(parents=True, exist_ok=True)
         pd.DataFrame(rows, columns=RESULT_COLUMNS).to_csv(out_path, index=False)
         print(f'\nCross-dataset results saved to: {out_path}')
