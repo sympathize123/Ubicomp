@@ -12,6 +12,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 
 from src.backbones import MLPFeaturizer, ResNetFeaturizer, TransformerFeaturizer
+from src.models import attach_training_metadata
 
 
 
@@ -979,6 +980,11 @@ def train_dg_model(model, X_train, y_train, d_train, X_val, y_val, d_val,
     best_val_loss = float('inf')
     best_model_state = None
     patience_counter = 0
+    best_epoch = None
+    early_stopped = False
+    early_stop_epoch = None
+    epochs_ran = 0
+    epoch_history = []
 
     from tqdm import tqdm
     epoch_iterator = tqdm(range(epochs), desc="DG Training")
@@ -1023,18 +1029,45 @@ def train_dg_model(model, X_train, y_train, d_train, X_val, y_val, d_val,
             'Val Loss': f'{val_loss:.4f}',
             'Val Acc': f'{val_acc:.4f}'
         })
+        epoch_num = epoch + 1
+        epochs_ran = epoch_num
+        epoch_history.append({
+            'epoch': epoch_num,
+            'train_loss': round(float(epoch_loss / steps_per_epoch), 6),
+            'val_loss': round(float(val_loss), 6),
+            'val_accuracy': round(float(val_acc), 6),
+        })
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             best_model_state = _copy.deepcopy(model.state_dict())
             patience_counter = 0
+            best_epoch = epoch_num
         else:
             patience_counter += 1
             if patience_counter >= patience:
                 epoch_iterator.write(f"Early stopping at epoch {epoch}")
+                early_stopped = True
+                early_stop_epoch = epoch_num
                 break
 
     if best_model_state:
         model.load_state_dict(best_model_state)
 
+    attach_training_metadata(
+        model,
+        optimizer=getattr(getattr(model, 'optimizer', None), '__class__', type('obj', (), {})).__name__
+        if getattr(model, 'optimizer', None) is not None else 'domainbed_optimizer',
+        best_epoch=best_epoch,
+        early_stopped=early_stopped,
+        early_stop_epoch=early_stop_epoch,
+        epochs_ran=epochs_ran,
+        max_epochs=epochs,
+        batch_size=batch_size,
+        patience=patience,
+        model_selection_metric='val_loss',
+        best_metric_value=round(float(best_val_loss), 6) if best_epoch is not None else None,
+        epoch_history=epoch_history,
+        domains_per_batch=domains_per_batch,
+    )
     return model

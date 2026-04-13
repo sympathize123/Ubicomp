@@ -6,6 +6,7 @@ import numpy as np
 import torch.nn.functional as F
 from sklearn.metrics import roc_auc_score
 from src.backbones import MLPFeaturizer, ResNetFeaturizer, TransformerFeaturizer
+from src.models import attach_training_metadata
 from scipy.spatial.distance import cdist
 from src.da_tllib_losses import (
     WarmStartGradientReverseLayer,
@@ -98,6 +99,45 @@ class MCC(DAModel):
         return self.predict(x)
 
 
+def _finalize_training_metadata(
+    model,
+    *,
+    optimizer,
+    best_epoch,
+    early_stopped,
+    early_stop_epoch,
+    epochs_ran,
+    max_epochs,
+    batch_size,
+    patience,
+    lr=None,
+    weight_decay=None,
+    model_selection_metric="val_auroc",
+    best_metric_value=None,
+    epoch_history=None,
+    extra=None,
+):
+    payload = {
+        "optimizer": optimizer,
+        "best_epoch": best_epoch,
+        "early_stopped": early_stopped,
+        "early_stop_epoch": early_stop_epoch,
+        "epochs_ran": epochs_ran,
+        "max_epochs": max_epochs,
+        "batch_size": batch_size,
+        "patience": patience,
+        "lr": lr,
+        "weight_decay": weight_decay,
+        "model_selection_metric": model_selection_metric,
+        "best_metric_value": best_metric_value,
+        "epoch_history": epoch_history or [],
+    }
+    if extra:
+        payload.update(extra)
+    attach_training_metadata(model, **payload)
+    return model
+
+
 # --- CORAL: Deep Correlation Alignment ---
 
 def coral_loss(source, target):
@@ -163,6 +203,11 @@ def train_deepcoral(model, X_train, y_train, d_train, X_val, y_val, d_val,
     best_val_score = -float('inf')
     best_model_state = None
     patience_counter = 0
+    best_epoch = None
+    early_stopped = False
+    early_stop_epoch = None
+    epochs_ran = 0
+    epoch_history = []
 
     epoch_iterator = tqdm(range(epochs), desc="DeepCORAL Training")
     for epoch in epoch_iterator:
@@ -212,25 +257,53 @@ def train_deepcoral(model, X_train, y_train, d_train, X_val, y_val, d_val,
             val_auroc = 0.5
 
         test_acc, test_auroc = _evaluate_test(model, X_test, y_test, device)
+        epoch_num = epoch + 1
+        epochs_ran = epoch_num
 
         if val_auroc > best_val_score:
             best_val_score = val_auroc
             best_model_state = copy.deepcopy(model.state_dict())
             patience_counter = 0
+            best_epoch = epoch_num
         else:
             patience_counter += 1
             if patience_counter >= patience:
                 epoch_iterator.write(f"Early stopping at epoch {epoch} (Best AUROC: {best_val_score:.4f})")
+                early_stopped = True
+                early_stop_epoch = epoch_num
                 break
 
         postfix = {'Loss': f'{train_loss:.4f}', 'Val Loss': f'{val_loss:.4f}', 'Val AUC': f'{val_auroc:.4f}'}
         if test_acc is not None:
             postfix.update({'Test Acc': f'{test_acc:.4f}', 'Test AUC': f'{test_auroc:.4f}'})
         epoch_iterator.set_postfix(postfix)
+        epoch_history.append({
+            'epoch': epoch_num,
+            'train_loss': round(float(train_loss), 6),
+            'val_loss': round(float(val_loss), 6),
+            'val_auroc': round(float(val_auroc), 6),
+            'test_accuracy': round(float(test_acc), 6) if test_acc is not None else None,
+            'test_auroc': round(float(test_auroc), 6) if test_auroc is not None else None,
+        })
 
     if best_model_state:
         model.load_state_dict(best_model_state)
 
+    _finalize_training_metadata(
+        model,
+        optimizer=optimizer.__class__.__name__,
+        best_epoch=best_epoch,
+        early_stopped=early_stopped,
+        early_stop_epoch=early_stop_epoch,
+        epochs_ran=epochs_ran,
+        max_epochs=epochs,
+        batch_size=batch_size,
+        patience=patience,
+        lr=lr,
+        weight_decay=weight_decay,
+        best_metric_value=round(float(best_val_score), 6) if best_epoch is not None else None,
+        epoch_history=epoch_history,
+    )
     return model
 
 # --- CGDM: Cross-Domain Gradient Discrepancy Minimization (CVPR 2021) ---
@@ -547,6 +620,11 @@ def train_cgdm(model, X_source, y_source, X_target, y_target=None,
     best_model_state = None
     patience_counter = 0
     mem_label = None
+    best_epoch = None
+    early_stopped = False
+    early_stop_epoch = None
+    epochs_ran = 0
+    epoch_history = []
 
     epoch_iterator = tqdm(range(epochs), desc="CGDM Training")
     for ep in epoch_iterator:
@@ -638,19 +716,45 @@ def train_cgdm(model, X_source, y_source, X_target, y_target=None,
         val_loss, val_auroc = _eval_val()
         if val_loss is not None:
             epoch_iterator.set_postfix({'Val Loss': f'{val_loss:.4f}', 'Val AUC': f'{val_auroc:.4f}'})
+            epoch_num = ep + 1
+            epochs_ran = epoch_num
+            epoch_history.append({
+                'epoch': epoch_num,
+                'val_loss': round(float(val_loss), 6),
+                'val_auroc': round(float(val_auroc), 6),
+            })
             if val_auroc > best_val_score:
                 best_val_score = val_auroc
                 best_model_state = copy.deepcopy(model.state_dict())
                 patience_counter = 0
+                best_epoch = epoch_num
             else:
                 patience_counter += 1
                 if patience_counter >= patience:
                     epoch_iterator.write(f"Early stopping at epoch {ep}")
+                    early_stopped = True
+                    early_stop_epoch = epoch_num
                     break
 
     if best_model_state is not None:
         model.load_state_dict(best_model_state)
 
+    _finalize_training_metadata(
+        model,
+        optimizer="Adam",
+        best_epoch=best_epoch,
+        early_stopped=early_stopped,
+        early_stop_epoch=early_stop_epoch,
+        epochs_ran=epochs_ran if epochs_ran else epochs,
+        max_epochs=epochs,
+        batch_size=batch_size,
+        patience=patience,
+        lr=lr,
+        weight_decay=weight_decay,
+        best_metric_value=round(float(best_val_score), 6) if best_epoch is not None else None,
+        epoch_history=epoch_history,
+        extra={"num_k": num_k},
+    )
     return model
 
 
@@ -828,6 +932,11 @@ def train_dann(model, X_train, y_train, d_train, X_val, y_val, d_val,
     best_val_score = -float('inf')
     best_model_state = None
     patience_counter = 0
+    best_epoch = None
+    early_stopped = False
+    early_stop_epoch = None
+    epochs_ran = 0
+    epoch_history = []
 
     epoch_iterator = tqdm(range(epochs), desc="DANN Training")
     for epoch in epoch_iterator:
@@ -859,25 +968,54 @@ def train_dann(model, X_train, y_train, d_train, X_val, y_val, d_val,
         val_loss, val_auroc = _evaluate_val(model, val_loader, device)
 
         test_acc, test_auroc = _evaluate_test(model, X_test, y_test, device)
+        epoch_num = epoch + 1
+        epochs_ran = epoch_num
 
         if val_auroc > best_val_score:
             best_val_score = val_auroc
             best_model_state = copy.deepcopy(model.state_dict())
             patience_counter = 0
+            best_epoch = epoch_num
         else:
             patience_counter += 1
             if patience_counter >= patience:
                 epoch_iterator.write(f"Early stopping at epoch {epoch} (Best AUROC: {best_val_score:.4f})")
+                early_stopped = True
+                early_stop_epoch = epoch_num
                 break
 
         postfix = {'Loss': f'{train_loss:.4f}', 'Val Loss': f'{val_loss:.4f}', 'Val AUC': f'{val_auroc:.4f}'}
         if test_acc is not None:
             postfix.update({'Test Acc': f'{test_acc:.4f}', 'Test AUC': f'{test_auroc:.4f}'})
         epoch_iterator.set_postfix(postfix)
+        epoch_history.append({
+            'epoch': epoch_num,
+            'train_loss': round(float(train_loss), 6),
+            'val_loss': round(float(val_loss), 6),
+            'val_auroc': round(float(val_auroc), 6),
+            'test_accuracy': round(float(test_acc), 6) if test_acc is not None else None,
+            'test_auroc': round(float(test_auroc), 6) if test_auroc is not None else None,
+        })
 
     if best_model_state:
         model.load_state_dict(best_model_state)
 
+    _finalize_training_metadata(
+        model,
+        optimizer=optimizer.__class__.__name__,
+        best_epoch=best_epoch,
+        early_stopped=early_stopped,
+        early_stop_epoch=early_stop_epoch,
+        epochs_ran=epochs_ran,
+        max_epochs=epochs,
+        batch_size=batch_size,
+        patience=patience,
+        lr=lr,
+        weight_decay=weight_decay,
+        best_metric_value=round(float(best_val_score), 6) if best_epoch is not None else None,
+        epoch_history=epoch_history,
+        extra={"discriminator_lr": disc_lr},
+    )
     return model
 
 
@@ -935,6 +1073,11 @@ def train_cdan(model, X_train, y_train, d_train, X_val, y_val, d_val,
     best_val_score = -float('inf')
     best_model_state = None
     patience_counter = 0
+    best_epoch = None
+    early_stopped = False
+    early_stop_epoch = None
+    epochs_ran = 0
+    epoch_history = []
 
     epoch_iterator = tqdm(range(epochs), desc="CDAN Training")
     for epoch in epoch_iterator:
@@ -966,25 +1109,54 @@ def train_cdan(model, X_train, y_train, d_train, X_val, y_val, d_val,
         val_loss, val_auroc = _evaluate_val(model, val_loader, device)
 
         test_acc, test_auroc = _evaluate_test(model, X_test, y_test, device)
+        epoch_num = epoch + 1
+        epochs_ran = epoch_num
 
         if val_auroc > best_val_score:
             best_val_score = val_auroc
             best_model_state = copy.deepcopy(model.state_dict())
             patience_counter = 0
+            best_epoch = epoch_num
         else:
             patience_counter += 1
             if patience_counter >= patience:
                 epoch_iterator.write(f"Early stopping at epoch {epoch} (Best AUROC: {best_val_score:.4f})")
+                early_stopped = True
+                early_stop_epoch = epoch_num
                 break
 
         postfix = {'Loss': f'{train_loss:.4f}', 'Val Loss': f'{val_loss:.4f}', 'Val AUC': f'{val_auroc:.4f}'}
         if test_acc is not None:
             postfix.update({'Test Acc': f'{test_acc:.4f}', 'Test AUC': f'{test_auroc:.4f}'})
         epoch_iterator.set_postfix(postfix)
+        epoch_history.append({
+            'epoch': epoch_num,
+            'train_loss': round(float(train_loss), 6),
+            'val_loss': round(float(val_loss), 6),
+            'val_auroc': round(float(val_auroc), 6),
+            'test_accuracy': round(float(test_acc), 6) if test_acc is not None else None,
+            'test_auroc': round(float(test_auroc), 6) if test_auroc is not None else None,
+        })
 
     if best_model_state:
         model.load_state_dict(best_model_state)
 
+    _finalize_training_metadata(
+        model,
+        optimizer=optimizer.__class__.__name__,
+        best_epoch=best_epoch,
+        early_stopped=early_stopped,
+        early_stop_epoch=early_stop_epoch,
+        epochs_ran=epochs_ran,
+        max_epochs=epochs,
+        batch_size=batch_size,
+        patience=patience,
+        lr=lr,
+        weight_decay=weight_decay,
+        best_metric_value=round(float(best_val_score), 6) if best_epoch is not None else None,
+        epoch_history=epoch_history,
+        extra={"discriminator_lr": disc_lr},
+    )
     return model
 
 
@@ -1033,6 +1205,11 @@ def train_mcc(model, X_train, y_train, d_train, X_val, y_val, d_val,
     best_val_score = -float('inf')
     best_model_state = None
     patience_counter = 0
+    best_epoch = None
+    early_stopped = False
+    early_stop_epoch = None
+    epochs_ran = 0
+    epoch_history = []
 
     epoch_iterator = tqdm(range(epochs), desc="MCC Training")
     for epoch in epoch_iterator:
@@ -1061,24 +1238,52 @@ def train_mcc(model, X_train, y_train, d_train, X_val, y_val, d_val,
         val_loss, val_auroc = _evaluate_val(model, val_loader, device)
 
         test_acc, test_auroc = _evaluate_test(model, X_test, y_test, device)
+        epoch_num = epoch + 1
+        epochs_ran = epoch_num
 
         if val_auroc > best_val_score:
             best_val_score = val_auroc
             best_model_state = copy.deepcopy(model.state_dict())
             patience_counter = 0
+            best_epoch = epoch_num
         else:
             patience_counter += 1
             if patience_counter >= patience:
                 epoch_iterator.write(f"Early stopping at epoch {epoch} (Best AUROC: {best_val_score:.4f})")
+                early_stopped = True
+                early_stop_epoch = epoch_num
                 break
 
         postfix = {'Loss': f'{train_loss:.4f}', 'Val Loss': f'{val_loss:.4f}', 'Val AUC': f'{val_auroc:.4f}'}
         if test_acc is not None:
             postfix.update({'Test Acc': f'{test_acc:.4f}', 'Test AUC': f'{test_auroc:.4f}'})
         epoch_iterator.set_postfix(postfix)
+        epoch_history.append({
+            'epoch': epoch_num,
+            'train_loss': round(float(train_loss), 6),
+            'val_loss': round(float(val_loss), 6),
+            'val_auroc': round(float(val_auroc), 6),
+            'test_accuracy': round(float(test_acc), 6) if test_acc is not None else None,
+            'test_auroc': round(float(test_auroc), 6) if test_auroc is not None else None,
+        })
 
     if best_model_state:
         model.load_state_dict(best_model_state)
+    _finalize_training_metadata(
+        model,
+        optimizer=optimizer.__class__.__name__,
+        best_epoch=best_epoch,
+        early_stopped=early_stopped,
+        early_stop_epoch=early_stop_epoch,
+        epochs_ran=epochs_ran,
+        max_epochs=epochs,
+        batch_size=batch_size,
+        patience=patience,
+        lr=lr,
+        weight_decay=weight_decay,
+        best_metric_value=round(float(best_val_score), 6) if best_epoch is not None else None,
+        epoch_history=epoch_history,
+    )
     return model
 
 
@@ -1113,6 +1318,11 @@ def train_dan(model, X_train, y_train, d_train, X_val, y_val, d_val,
     best_val_score = -float('inf')
     best_model_state = None
     patience_counter = 0
+    best_epoch = None
+    early_stopped = False
+    early_stop_epoch = None
+    epochs_ran = 0
+    epoch_history = []
 
     epoch_iterator = tqdm(range(epochs), desc="DAN Training")
     for epoch in epoch_iterator:
@@ -1142,24 +1352,52 @@ def train_dan(model, X_train, y_train, d_train, X_val, y_val, d_val,
         val_loss, val_auroc = _evaluate_val(model, val_loader, device)
 
         test_acc, test_auroc = _evaluate_test(model, X_test, y_test, device)
+        epoch_num = epoch + 1
+        epochs_ran = epoch_num
 
         if val_auroc > best_val_score:
             best_val_score = val_auroc
             best_model_state = copy.deepcopy(model.state_dict())
             patience_counter = 0
+            best_epoch = epoch_num
         else:
             patience_counter += 1
             if patience_counter >= patience:
                 epoch_iterator.write(f"Early stopping at epoch {epoch} (Best AUROC: {best_val_score:.4f})")
+                early_stopped = True
+                early_stop_epoch = epoch_num
                 break
 
         postfix = {'Loss': f'{train_loss:.4f}', 'Val Loss': f'{val_loss:.4f}', 'Val AUC': f'{val_auroc:.4f}'}
         if test_acc is not None:
             postfix.update({'Test Acc': f'{test_acc:.4f}', 'Test AUC': f'{test_auroc:.4f}'})
         epoch_iterator.set_postfix(postfix)
+        epoch_history.append({
+            'epoch': epoch_num,
+            'train_loss': round(float(train_loss), 6),
+            'val_loss': round(float(val_loss), 6),
+            'val_auroc': round(float(val_auroc), 6),
+            'test_accuracy': round(float(test_acc), 6) if test_acc is not None else None,
+            'test_auroc': round(float(test_auroc), 6) if test_auroc is not None else None,
+        })
 
     if best_model_state:
         model.load_state_dict(best_model_state)
+    _finalize_training_metadata(
+        model,
+        optimizer=optimizer.__class__.__name__,
+        best_epoch=best_epoch,
+        early_stopped=early_stopped,
+        early_stop_epoch=early_stop_epoch,
+        epochs_ran=epochs_ran,
+        max_epochs=epochs,
+        batch_size=batch_size,
+        patience=patience,
+        lr=lr,
+        weight_decay=weight_decay,
+        best_metric_value=round(float(best_val_score), 6) if best_epoch is not None else None,
+        epoch_history=epoch_history,
+    )
     return model
 
 class ADDA(nn.Module):
@@ -1252,6 +1490,12 @@ def train_adda(model, X_train, y_train, d_train, X_val, y_val, d_val,
     best_val_score = -float('inf')
     best_model_state = None
     patience_counter = 0
+    source_pretrain_info = dict(getattr(model.source_model, "_training_info", {}))
+    best_epoch = None
+    early_stopped = False
+    early_stop_epoch = None
+    epochs_ran = 0
+    epoch_history = []
 
     epoch_iterator = tqdm(range(epochs), desc="ADDA Training")
     for epoch in epoch_iterator:
@@ -1296,25 +1540,60 @@ def train_adda(model, X_train, y_train, d_train, X_val, y_val, d_val,
         val_loss, val_auroc = _evaluate_val(model, val_loader, device)
 
         test_acc, test_auroc = _evaluate_test(model, X_test, y_test, device)
+        epoch_num = epoch + 1
+        epochs_ran = epoch_num
 
         if val_auroc > best_val_score:
             best_val_score = val_auroc
             best_model_state = copy.deepcopy(model.state_dict())
             patience_counter = 0
+            best_epoch = epoch_num
         else:
             patience_counter += 1
             if patience_counter >= patience:
                 epoch_iterator.write(f"Early stopping at epoch {epoch} (Best AUROC: {best_val_score:.4f})")
+                early_stopped = True
+                early_stop_epoch = epoch_num
                 break
 
         postfix = {'Loss': f'{train_loss:.4f}', 'Val Loss': f'{val_loss:.4f}', 'Val AUC': f'{val_auroc:.4f}'}
         if test_acc is not None:
             postfix.update({'Test Acc': f'{test_acc:.4f}', 'Test AUC': f'{test_auroc:.4f}'})
         epoch_iterator.set_postfix(postfix)
+        epoch_history.append({
+            'epoch': epoch_num,
+            'train_loss': round(float(train_loss), 6),
+            'val_loss': round(float(val_loss), 6),
+            'val_auroc': round(float(val_auroc), 6),
+            'test_accuracy': round(float(test_acc), 6) if test_acc is not None else None,
+            'test_auroc': round(float(test_auroc), 6) if test_auroc is not None else None,
+        })
 
     if best_model_state:
         model.load_state_dict(best_model_state)
 
+    _finalize_training_metadata(
+        model,
+        optimizer=f"{opt_d.__class__.__name__}+{opt_t.__class__.__name__}",
+        best_epoch=best_epoch,
+        early_stopped=early_stopped,
+        early_stop_epoch=early_stop_epoch,
+        epochs_ran=epochs_ran,
+        max_epochs=epochs,
+        batch_size=batch_size,
+        patience=patience,
+        lr=lr,
+        weight_decay=weight_decay,
+        best_metric_value=round(float(best_val_score), 6) if best_epoch is not None else None,
+        epoch_history=epoch_history,
+        extra={
+            "discriminator_lr": disc_lr,
+            "phases": {
+                "source_pretrain": source_pretrain_info,
+                "target_adaptation": {"epochs_ran": epochs_ran},
+            },
+        },
+    )
     return model
 
 
@@ -1389,6 +1668,11 @@ def train_mcd(model, X_train, y_train, d_train, X_val, y_val, d_val,
     best_val_score = -float('inf')
     best_model_state = None
     patience_counter = 0
+    best_epoch = None
+    early_stopped = False
+    early_stop_epoch = None
+    epochs_ran = 0
+    epoch_history = []
 
     epoch_iterator = tqdm(range(epochs), desc="MCD Training")
     for epoch in epoch_iterator:
@@ -1442,24 +1726,53 @@ def train_mcd(model, X_train, y_train, d_train, X_val, y_val, d_val,
         val_loss, val_auroc = _evaluate_val(model, val_loader, device)
 
         test_acc, test_auroc = _evaluate_test(model, X_test, y_test, device)
+        epoch_num = epoch + 1
+        epochs_ran = epoch_num
 
         if val_auroc > best_val_score:
             best_val_score = val_auroc
             best_model_state = copy.deepcopy(model.state_dict())
             patience_counter = 0
+            best_epoch = epoch_num
         else:
             patience_counter += 1
             if patience_counter >= patience:
                 epoch_iterator.write(f"Early stopping at epoch {epoch} (Best AUROC: {best_val_score:.4f})")
+                early_stopped = True
+                early_stop_epoch = epoch_num
                 break
 
         postfix = {'Loss': f'{train_loss:.4f}', 'Val Loss': f'{val_loss:.4f}', 'Val AUC': f'{val_auroc:.4f}'}
         if test_acc is not None:
             postfix.update({'Test Acc': f'{test_acc:.4f}', 'Test AUC': f'{test_auroc:.4f}'})
         epoch_iterator.set_postfix(postfix)
+        epoch_history.append({
+            'epoch': epoch_num,
+            'train_loss': round(float(train_loss), 6),
+            'val_loss': round(float(val_loss), 6),
+            'val_auroc': round(float(val_auroc), 6),
+            'test_accuracy': round(float(test_acc), 6) if test_acc is not None else None,
+            'test_auroc': round(float(test_auroc), 6) if test_auroc is not None else None,
+        })
 
     if best_model_state:
         model.load_state_dict(best_model_state)
+    _finalize_training_metadata(
+        model,
+        optimizer=f"{optimizer_g.__class__.__name__}+{optimizer_c.__class__.__name__}",
+        best_epoch=best_epoch,
+        early_stopped=early_stopped,
+        early_stop_epoch=early_stop_epoch,
+        epochs_ran=epochs_ran,
+        max_epochs=epochs,
+        batch_size=batch_size,
+        patience=patience,
+        lr=lr,
+        weight_decay=weight_decay,
+        best_metric_value=round(float(best_val_score), 6) if best_epoch is not None else None,
+        epoch_history=epoch_history,
+        extra={"mcd_k": k_steps},
+    )
     return model
     
 # --- JAN: Joint Adaptation Network ---
@@ -1508,6 +1821,11 @@ def train_jan(model, X_train, y_train, d_train, X_val, y_val, d_val,
     best_val_score = -float('inf')
     best_model_state = None
     patience_counter = 0
+    best_epoch = None
+    early_stopped = False
+    early_stop_epoch = None
+    epochs_ran = 0
+    epoch_history = []
 
     epoch_iterator = tqdm(range(epochs), desc="JAN Training")
     for epoch in epoch_iterator:
@@ -1539,24 +1857,52 @@ def train_jan(model, X_train, y_train, d_train, X_val, y_val, d_val,
         val_loss, val_auroc = _evaluate_val(model, val_loader, device)
 
         test_acc, test_auroc = _evaluate_test(model, X_test, y_test, device)
+        epoch_num = epoch + 1
+        epochs_ran = epoch_num
 
         if val_auroc > best_val_score:
             best_val_score = val_auroc
             best_model_state = copy.deepcopy(model.state_dict())
             patience_counter = 0
+            best_epoch = epoch_num
         else:
             patience_counter += 1
             if patience_counter >= patience:
                 epoch_iterator.write(f"Early stopping at epoch {epoch} (Best AUROC: {best_val_score:.4f})")
+                early_stopped = True
+                early_stop_epoch = epoch_num
                 break
 
         postfix = {'Loss': f'{train_loss:.4f}', 'Val Loss': f'{val_loss:.4f}', 'Val AUC': f'{val_auroc:.4f}'}
         if test_acc is not None:
             postfix.update({'Test Acc': f'{test_acc:.4f}', 'Test AUC': f'{test_auroc:.4f}'})
         epoch_iterator.set_postfix(postfix)
+        epoch_history.append({
+            'epoch': epoch_num,
+            'train_loss': round(float(train_loss), 6),
+            'val_loss': round(float(val_loss), 6),
+            'val_auroc': round(float(val_auroc), 6),
+            'test_accuracy': round(float(test_acc), 6) if test_acc is not None else None,
+            'test_auroc': round(float(test_auroc), 6) if test_auroc is not None else None,
+        })
 
     if best_model_state:
         model.load_state_dict(best_model_state)
+    _finalize_training_metadata(
+        model,
+        optimizer=optimizer.__class__.__name__,
+        best_epoch=best_epoch,
+        early_stopped=early_stopped,
+        early_stop_epoch=early_stop_epoch,
+        epochs_ran=epochs_ran,
+        max_epochs=epochs,
+        batch_size=batch_size,
+        patience=patience,
+        lr=lr,
+        weight_decay=weight_decay,
+        best_metric_value=round(float(best_val_score), 6) if best_epoch is not None else None,
+        epoch_history=epoch_history,
+    )
     return model
 
 # --- SHOT: Source Hypothesis Transfer ---
@@ -1650,6 +1996,7 @@ def train_shot(model, X_train, y_train, d_train, X_val, y_val, d_val,
         epochs=epochs, batch_size=batch_size, lr=lr, patience=patience, device=device,
         X_test=X_test, y_test=y_test
     )
+    source_pretrain_info = dict(getattr(model, "_training_info", {}))
 
     # Freeze classifier
     for p in model.classifier.parameters():
@@ -1695,6 +2042,11 @@ def train_shot(model, X_train, y_train, d_train, X_val, y_val, d_val,
     best_val_score = -float('inf')
     best_model_state = None
     patience_counter = 0
+    best_epoch = None
+    early_stopped = False
+    early_stop_epoch = None
+    epochs_ran = 0
+    epoch_history = []
 
     epoch_iterator = tqdm(range(adapt_epochs), desc="SHOT Adaptation")
     target_iter = iter(target_loader)
@@ -1758,25 +2110,60 @@ def train_shot(model, X_train, y_train, d_train, X_val, y_val, d_val,
         val_loss, val_auroc = _evaluate_val(model, val_loader, device)
 
         test_acc, test_auroc = _evaluate_test(model, X_test, y_test, device)
+        epoch_num = epoch + 1
+        epochs_ran = epoch_num
 
         if val_auroc > best_val_score:
             best_val_score = val_auroc
             best_model_state = copy.deepcopy(model.state_dict())
             patience_counter = 0
+            best_epoch = epoch_num
         else:
             patience_counter += 1
             if patience_counter >= patience:
                 epoch_iterator.write(f"Early stopping at epoch {epoch} (Best AUROC: {best_val_score:.4f})")
+                early_stopped = True
+                early_stop_epoch = epoch_num
                 break
 
         postfix = {'Loss': f'{train_loss:.4f}', 'Val Loss': f'{val_loss:.4f}', 'Val AUC': f'{val_auroc:.4f}'}
         if test_acc is not None:
             postfix.update({'Test Acc': f'{test_acc:.4f}', 'Test AUC': f'{test_auroc:.4f}'})
         epoch_iterator.set_postfix(postfix)
+        epoch_history.append({
+            'epoch': epoch_num,
+            'train_loss': round(float(train_loss), 6),
+            'val_loss': round(float(val_loss), 6),
+            'val_auroc': round(float(val_auroc), 6),
+            'test_accuracy': round(float(test_acc), 6) if test_acc is not None else None,
+            'test_auroc': round(float(test_auroc), 6) if test_auroc is not None else None,
+        })
 
     if best_model_state:
         model.load_state_dict(best_model_state)
 
+    _finalize_training_metadata(
+        model,
+        optimizer=optimizer.__class__.__name__,
+        best_epoch=best_epoch,
+        early_stopped=early_stopped,
+        early_stop_epoch=early_stop_epoch,
+        epochs_ran=epochs_ran,
+        max_epochs=adapt_epochs,
+        batch_size=batch_size,
+        patience=patience,
+        lr=lr * lr_decay,
+        weight_decay=1e-3,
+        best_metric_value=round(float(best_val_score), 6) if best_epoch is not None else None,
+        epoch_history=epoch_history,
+        extra={
+            "phases": {
+                "source_pretrain": source_pretrain_info,
+                "target_adaptation": {"epochs_ran": epochs_ran},
+            },
+            "shot_interval": interval,
+        },
+    )
     return model
 
 # CBST (Class-Balanced Self-Training)
@@ -1889,4 +2276,26 @@ def train_cbst(model, X_train, y_train, d_train, X_val, y_val, d_val,
                 loss.backward()
                 optimizer.step()
 
+    total_epochs = pretrain_epochs + max_iter * retrain_epochs
+    _finalize_training_metadata(
+        model,
+        optimizer=optimizer.__class__.__name__,
+        best_epoch=None,
+        early_stopped=False,
+        early_stop_epoch=None,
+        epochs_ran=total_epochs,
+        max_epochs=total_epochs,
+        batch_size=batch_size,
+        patience=patience,
+        lr=lr,
+        weight_decay=weight_decay,
+        model_selection_metric="target_self_training",
+        best_metric_value=None,
+        epoch_history=[],
+        extra={
+            "cbst_pretrain_epochs": pretrain_epochs,
+            "cbst_max_iter": max_iter,
+            "cbst_retrain_epochs": retrain_epochs,
+        },
+    )
     return model

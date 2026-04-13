@@ -19,6 +19,16 @@ from tqdm import tqdm
 # from deepctr_torch...
 
 
+def attach_training_metadata(model, **updates):
+    info = dict(getattr(model, "_training_info", {}))
+    for key, value in updates.items():
+        if value is None and key in info:
+            continue
+        info[key] = value
+    setattr(model, "_training_info", info)
+    return model
+
+
 # --- Baseline Models ---
 
 class XGBoostWrapper(BaseEstimator, ClassifierMixin):
@@ -36,6 +46,17 @@ class XGBoostWrapper(BaseEstimator, ClassifierMixin):
         eval_set = [(X_val, y_val)] if X_val is not None else None
         # XGBoost scikit-learn API handles early stopping if early_stopping_rounds is passed to constructor
         self.model.fit(X, y, eval_set=eval_set, verbose=False)
+        best_iteration = getattr(self.model, "best_iteration", None)
+        n_estimators = getattr(self.model, "n_estimators", None)
+        attach_training_metadata(
+            self,
+            optimizer="xgboost",
+            best_epoch=(best_iteration + 1) if best_iteration is not None else None,
+            epochs_ran=(best_iteration + 1) if best_iteration is not None else n_estimators,
+            max_epochs=n_estimators,
+            early_stopped=bool(best_iteration is not None and n_estimators is not None and best_iteration + 1 < n_estimators),
+            model_selection_metric="val_auroc",
+        )
         return self
 
     def predict(self, X):
@@ -58,6 +79,17 @@ class LightGBMWrapper(BaseEstimator, ClassifierMixin):
         eval_set = [(X_valid, y_valid)] if X_valid is not None else None
         callbacks = [lgb.early_stopping(self.patience, verbose=True)] if eval_set else None
         self.model.fit(X_train, y_train, eval_set=eval_set, eval_metric='auc', callbacks=callbacks)
+        best_iteration = getattr(self.model, "best_iteration_", None)
+        n_estimators = getattr(self.model, "n_estimators", None)
+        attach_training_metadata(
+            self,
+            optimizer="lightgbm",
+            best_epoch=best_iteration,
+            epochs_ran=best_iteration or n_estimators,
+            max_epochs=n_estimators,
+            early_stopped=bool(best_iteration is not None and n_estimators is not None and best_iteration < n_estimators),
+            model_selection_metric="val_auroc",
+        )
         return self
 
     def predict(self, X):
@@ -89,6 +121,17 @@ class TabNetWrapper(BaseEstimator, ClassifierMixin):
         self.model = TabNetClassifier(verbose=verbose, **self.kwargs)
         self.model.fit(X, y, eval_set=eval_set, eval_metric=['auc'], patience=self.patience, 
                        max_epochs=self.epochs, batch_size=self.batch_size, num_workers=0)
+        best_epoch = getattr(self.model, "best_epoch", None)
+        attach_training_metadata(
+            self,
+            optimizer="Adam",
+            best_epoch=(best_epoch + 1) if isinstance(best_epoch, int) else best_epoch,
+            epochs_ran=(best_epoch + 1) if isinstance(best_epoch, int) else self.epochs,
+            max_epochs=self.epochs,
+            batch_size=self.batch_size,
+            early_stopped=bool(best_epoch is not None and isinstance(best_epoch, int) and best_epoch + 1 < self.epochs),
+            model_selection_metric="val_auroc",
+        )
         return self
 
     def predict(self, X):
@@ -117,6 +160,7 @@ class WidedeepWrapper(BaseEstimator, ClassifierMixin):
         from pytorch_widedeep.training import Trainer as WideTrainer
         from pytorch_widedeep.metrics import Accuracy as WideAccuracy
         from pytorch_widedeep.callbacks import EarlyStopping as WideEarlyStopping
+        from torchmetrics.classification import BinaryAUROC
 
         # Convert to DataFrame
         self.col_names = [f"col_{i}" for i in range(X.shape[1])]
@@ -302,15 +346,27 @@ class WidedeepWrapper(BaseEstimator, ClassifierMixin):
         from pytorch_widedeep.metrics import Accuracy
         
         if self.patience > 0:
-            # Monitor val_roc_auc (default name for ROCAUC metric in pytorch-widedeep is likely 'roc_auc' or 'rocauc')
-            # Let's try 'val_rocauc'
-            # If uncertain, stick to loss for safety, but user asked for AUROC.
-            # I will use 'val_loss' for now to ensure stability, but log ROCAUC.
-            # Reverting Early Stopping to loss to avoid crashes during verification.
-            callbacks.append(WideEarlyStopping(patience=self.patience, min_delta=1e-4, restore_best_weights=True))
+            # Torchmetrics names are logged as val_<ClassName>, e.g. val_BinaryAUROC.
+            callbacks.append(
+                WideEarlyStopping(
+                    monitor='val_BinaryAUROC',
+                    mode='max',
+                    patience=self.patience,
+                    min_delta=1e-4,
+                    restore_best_weights=True,
+                )
+            )
 
-        # Fix: ROCAUC import failed. Use Accuracy only for internal metrics. Evaluation handles AUROC separately.
-        self.trainer = WideTrainer(model, objective='binary', metrics=[Accuracy], callbacks=callbacks, device=device, verbose=0, num_workers=0)
+        # Keep Accuracy for visibility and add BinaryAUROC so callbacks can monitor val_BinaryAUROC.
+        self.trainer = WideTrainer(
+            model,
+            objective='binary',
+            metrics=[Accuracy, BinaryAUROC()],
+            callbacks=callbacks,
+            device=device,
+            verbose=0,
+            num_workers=0,
+        )
         
         
         
@@ -333,7 +389,20 @@ class WidedeepWrapper(BaseEstimator, ClassifierMixin):
         
         self.trainer.fit(X_train=X_train_dict, target=None, 
                          X_val=X_val_dict, target_val=None,
-                         n_epochs=self.epochs, batch_size=self.batch_size) 
+                         n_epochs=self.epochs, batch_size=self.batch_size)
+        history = getattr(self.trainer, "history", None)
+        best_epoch = getattr(self.trainer, "best_epoch", None)
+        attach_training_metadata(
+            self,
+            optimizer="Adam",
+            best_epoch=best_epoch,
+            epochs_ran=self.epochs,
+            max_epochs=self.epochs,
+            batch_size=self.batch_size,
+            early_stopped=bool(best_epoch is not None and isinstance(best_epoch, int) and best_epoch < self.epochs),
+            model_selection_metric="val_BinaryAUROC",
+            epoch_history=history,
+        )
         return self
 
     def predict(self, X):
@@ -430,6 +499,16 @@ class DeepCTRWrapper(BaseEstimator, ClassifierMixin):
         
         # history = self.model.fit(...)
         self.model.fit(train_model_input, y, batch_size=self.batch_size, epochs=self.epochs, validation_data=val_data, callbacks=callbacks, verbose=0)
+        attach_training_metadata(
+            self,
+            optimizer="Adam",
+            best_epoch=None,
+            epochs_ran=self.epochs,
+            max_epochs=self.epochs,
+            batch_size=self.batch_size,
+            early_stopped=False,
+            model_selection_metric="val_auroc",
+        )
         return self
 
     def predict(self, X):
@@ -508,13 +587,13 @@ class ResNet(nn.Module):
 
 
 def train_torch_model(model, X_train, y_train, X_val, y_val, 
-                      epochs=50, batch_size=64, lr=1e-3, patience=5,
+                      epochs=50, batch_size=64, lr=1e-3, weight_decay=0.0, patience=5,
                       device='cuda' if torch.cuda.is_available() else 'cpu',
                       X_test=None, y_test=None):
     
     model = model.to(device)
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=lr)
+    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     
     train_dataset = TensorDataset(torch.tensor(X_train, dtype=torch.float32), torch.tensor(y_train, dtype=torch.long))
     val_dataset = TensorDataset(torch.tensor(X_val, dtype=torch.float32), torch.tensor(y_val, dtype=torch.long))
@@ -564,6 +643,11 @@ def train_torch_model(model, X_train, y_train, X_val, y_val,
     best_val_score = -float('inf')  # Changed from best_val_loss (inf)
     best_model_state = None
     patience_counter = 0
+    best_epoch = None
+    early_stopped = False
+    early_stop_epoch = None
+    epochs_ran = 0
+    epoch_history = []
 
     for epoch in epoch_iterator:
         model.train()
@@ -603,28 +687,57 @@ def train_torch_model(model, X_train, y_train, X_val, y_val,
             val_auroc = roc_auc_score(val_targets, val_probs)
         except:
             val_auroc = 0.5
-        
+        epoch_num = epoch + 1
+        epochs_ran = epoch_num
+
         # Early stopping (Maximize AUROC)
         if val_auroc > best_val_score:
             best_val_score = val_auroc
             best_model_state = copy.deepcopy(model.state_dict())
             patience_counter = 0
+            best_epoch = epoch_num
             # epoch_iterator.write(f"New Best AUROC: {val_auroc:.4f}")
         else:
             patience_counter += 1
             if patience_counter >= patience:
                 epoch_iterator.write(f"Early stopping at epoch {epoch} (Best AUROC: {best_val_score:.4f})")
+                early_stopped = True
+                early_stop_epoch = epoch_num
                 break
-        
+
         test_acc, test_auroc = _evaluate_test()
         postfix = {'Loss': f'{train_loss:.4f}', 'Val Loss': f'{val_loss:.4f}', 'Val AUC': f'{val_auroc:.4f}'}
         if test_acc is not None:
             postfix.update({'Test Acc': f'{test_acc:.4f}', 'Test AUC': f'{test_auroc:.4f}'})
         epoch_iterator.set_postfix(postfix)
-    
+        epoch_history.append({
+            "epoch": epoch_num,
+            "train_loss": round(float(train_loss), 6),
+            "val_loss": round(float(val_loss), 6),
+            "val_auroc": round(float(val_auroc), 6),
+            "test_accuracy": round(float(test_acc), 6) if test_acc is not None else None,
+            "test_auroc": round(float(test_auroc), 6) if test_auroc is not None else None,
+        })
+
     if best_model_state:
         model.load_state_dict(best_model_state)
-    
+
+    attach_training_metadata(
+        model,
+        optimizer=optimizer.__class__.__name__,
+        best_epoch=best_epoch,
+        early_stopped=early_stopped,
+        early_stop_epoch=early_stop_epoch,
+        epochs_ran=epochs_ran,
+        max_epochs=epochs,
+        batch_size=batch_size,
+        lr=lr,
+        weight_decay=weight_decay,
+        patience=patience,
+        best_metric_value=round(float(best_val_score), 6) if best_epoch is not None else None,
+        model_selection_metric="val_auroc",
+        epoch_history=epoch_history,
+    )
     return model
 
 def evaluate_model(model, X_test, y_test, device='cuda' if torch.cuda.is_available() else 'cpu'):

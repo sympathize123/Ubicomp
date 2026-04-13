@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 from pathlib import Path
 from src.data_loader import BenchmarkDataset
-from src.models import XGBoostWrapper, LightGBMWrapper, MLP, ResNet, TabNetWrapper, WidedeepWrapper, DeepCTRWrapper, train_torch_model, evaluate_model
+from src.models import XGBoostWrapper, LightGBMWrapper, MLP, ResNet, TabNetWrapper, WidedeepWrapper, DeepCTRWrapper, train_torch_model, evaluate_model, attach_training_metadata
 from src.da_models import DANN, CDAN, DAN, DeepCORAL, MCC, ADDA, MCD, JAN, SHOT, CBST, CGDM, MCDInferenceWrapper, train_mcd, train_dann, train_cdan, train_adda, train_jan, train_shot, train_cbst, train_deepcoral, train_mcc, train_dan, train_cgdm
 from src.domainbed_algos import ERM as DG_ERM, IRM, VREx, GroupDRO, MixStyle, MLDG, MASF, Fish, CSD, SagNet, train_dg_model
 from src.hparams_registry import get_hparams
@@ -28,9 +28,17 @@ PROGRESS_COLUMNS = [
     'Train_Samples', 'Val_Samples', 'Test_Samples',
     'Train_Users', 'Val_Users', 'Test_Users',
     'Train_PosRatio', 'Val_PosRatio', 'Test_PosRatio',
-    'Best_Epoch', 'Early_Stopped', 'HPO_Best_AUROC',
-    'Total_Wall_S', 'HPO_Wall_S', 'Train_Wall_S',
-    'Device_Name', 'Peak_GPU_MB',
+    'Best_Epoch', 'Early_Stopped', 'Seed_Count', 'HPO_Best_AUROC',
+    'HPO_Planned_Trials', 'HPO_Completed_Trials',
+    'Configured_Max_Epochs', 'Configured_Default_Batch_Size',
+    'Selected_Batch_Size', 'Selected_LR',
+    'Total_Wall_S', 'HPO_Wall_S', 'Train_Wall_S', 'Eval_Wall_S',
+    'Train_GPU_Hours', 'Eval_GPU_Hours', 'Total_GPU_Hours',
+    'Device_Name', 'GPU_Model', 'GPU_Count', 'GPU_Total_VRAM_GB',
+    'CPU_Model', 'RAM_GB', 'Peak_GPU_MB', 'Peak_CPU_MB',
+    'Param_Count', 'Trainable_Param_Count', 'Artifact_Size_MB',
+    'Inference_Batch_Size', 'Inference_Latency_MS', 'Inference_Throughput_SPS',
+    'FLOPs', 'MACs', 'Energy_KWh', 'Carbon_KgCO2eq',
     'Hparams_JSON', 'Experiment_ID',
 ]
 
@@ -41,6 +49,10 @@ def append_row(path, row, columns):
     header = not path.exists()
     df = pd.DataFrame([row], columns=columns)
     df.to_csv(path, mode='a', header=header, index=False)
+
+
+def parse_seeds(seed_values):
+    return [int(seed) for seed in seed_values]
 
 
 def make_groupwise_val_split(train_idx, labels, groups, seed=42, max_splits=5):
@@ -157,6 +169,7 @@ def get_args():
     parser.add_argument('--epochs', type=int, default=50)
     parser.add_argument('--batch_size', type=int, default=64)
     parser.add_argument('--lr', type=float, default=1e-3)
+    parser.add_argument('--seeds', type=int, nargs='+', default=[42])
     parser.add_argument('--output', type=str, default='results/benchmark_results_da_hpo.csv')
     parser.add_argument('--hpo_trials', type=int, default=30)
     parser.add_argument('--hpo_mode', type=str, default='fold1', choices=['fold1', 'cv', 'nested'])
@@ -336,8 +349,9 @@ def train_model(args, X_train, y_train, d_train, X_val, y_val, d_val,
         net = MCD(input_dim=input_dim, num_classes=2,
                   hparams={**hparams, 'lr': lr, 'backbone': backbone, 'dropout': dropout,
                            'hidden_dim': hidden_dim, 'num_layers': num_layers, 'num_blocks': num_blocks, 'nhead': nhead})
-        model = train_mcd(net, X_train, y_train, d_train, X_val, y_val, d_val, epochs=epochs, batch_size=batch_size, lr=lr, patience=patience, X_target=X_target)
-        model = MCDInferenceWrapper(model)
+        mcd_model = train_mcd(net, X_train, y_train, d_train, X_val, y_val, d_val, epochs=epochs, batch_size=batch_size, lr=lr, patience=patience, X_target=X_target)
+        model = MCDInferenceWrapper(mcd_model)
+        attach_training_metadata(model, **dict(getattr(mcd_model, "_training_info", {})))
     elif args.model == 'JAN':
         net = JAN(input_dim=input_dim, num_classes=2,
                   hparams={**hparams, 'lr': lr, 'backbone': backbone, 'dropout': dropout,
@@ -388,6 +402,20 @@ def train_model(args, X_train, y_train, d_train, X_val, y_val, d_val,
         model = train_dg_model(model, X_train, y_train, d_train, X_val, y_val, d_val,
                                epochs=epochs, batch_size=batch_size, domains_per_batch=8, patience=patience)
 
+    attach_training_metadata(
+        model,
+        seed=seed,
+        selected_lr=lr,
+        selected_batch_size=batch_size,
+        configured_default_batch_size=args.batch_size,
+        configured_max_epochs=args.epochs,
+        max_epochs=epochs,
+        patience=patience,
+        backbone=backbone,
+        model_name=args.model,
+        hparams=dict(hparams),
+        early_stopping_enabled=bool(patience and patience > 0),
+    )
     return model
 
 
@@ -544,8 +572,9 @@ def main():
         folds_for_hpo = fold_data if args.hpo_mode == "cv" else [fold_data[0]]
         best_hparams, hpo_study = _run_hpo(folds_for_hpo, label="CV-HPO" if args.hpo_mode == "cv" else "Fold-1 HPO")
 
-    seeds = [42]
+    seeds = parse_seeds(args.seeds)
     records_dir = str(Path(args.output).parent / "records")
+    configured_max_epochs = args.epochs_override if args.epochs_override else args.epochs
 
     METRIC_KEYS = [
         'Train_Accuracy', 'Train_AUROC', 'Train_F1', 'Train_Precision', 'Train_Recall',
@@ -578,6 +607,14 @@ def main():
                 split_strategy=args.split_strategy, hpo_trials=args.hpo_trials,
                 hpo_mode=args.hpo_mode, max_epochs=args.epochs, patience=args.patience,
             )
+            logger.record_policy(
+                seeds=seeds,
+                planned_hpo_trials=args.hpo_trials,
+                hpo_mode=args.hpo_mode,
+                max_epochs=configured_max_epochs,
+                default_batch_size=args.batch_size,
+                patience=args.patience,
+            )
             logger.set_preprocessing(clip_value=clip_val)
             logger.set_split_stats(
                 entry["y_train"], ds.users[entry["train_idx"]],
@@ -604,18 +641,26 @@ def main():
                     hparams=fold_hparams, seed=seed, patience=args.patience, X_target=X_target,
                 )
 
-            logger.record_training()
+            logger.record_training(model)
+            logger.record_model_stats(model, input_dim=entry["X_train"].shape[1])
+            selected_batch_size = logger._rec["training"].get("batch_size")
 
             with logger.time_eval():
-                train_m = evaluate_extended(model, entry["X_train"], entry["y_train"])
-                val_m   = evaluate_extended(model, entry["X_val"],   entry["y_val"])
-                test_m  = evaluate_extended(model, entry["X_test"],  entry["y_test"])
+                train_m = evaluate_extended(model, entry["X_train"], entry["y_train"], batch_size=selected_batch_size)
+                val_m   = evaluate_extended(model, entry["X_val"],   entry["y_val"], batch_size=selected_batch_size)
+                test_m  = evaluate_extended(model, entry["X_test"],  entry["y_test"], batch_size=selected_batch_size)
 
             logger.record_metrics(train_m, val_m, test_m)
+            logger.record_inference_benchmark(model, entry["X_test"], batch_size=selected_batch_size, split_name="test")
             record = logger.finalize()
             rt = record["runtime"]
             tr = record["training"]
             ss = record["split_stats"]
+            hw = record["hardware"]
+            budget = record["compute_budget"]
+            model_stats = record["model_stats"]
+            infer = record["inference_benchmark"].get("test", {})
+            sustain = record["sustainability"]
 
             print(f"  Train AUROC={train_m['auroc']:.4f}  Val AUROC={val_m['auroc']:.4f}  Test AUROC={test_m['auroc']:.4f}  wall={rt['total_wall_s']}s")
 
@@ -646,10 +691,33 @@ def main():
                 'Train_PosRatio': ss['train']['positive_ratio'], 'Val_PosRatio': ss['val']['positive_ratio'],
                 'Test_PosRatio': ss['test']['positive_ratio'],
                 'Best_Epoch': tr.get('best_epoch'), 'Early_Stopped': tr.get('early_stopped'),
+                'Seed_Count': budget.get('seed_count'),
                 'HPO_Best_AUROC': record['hpo'].get('best_value'),
+                'HPO_Planned_Trials': budget.get('planned_hpo_trials'),
+                'HPO_Completed_Trials': budget.get('completed_hpo_trials'),
+                'Configured_Max_Epochs': budget.get('max_epochs_per_run'),
+                'Configured_Default_Batch_Size': budget.get('default_batch_size'),
+                'Selected_Batch_Size': tr.get('batch_size'),
+                'Selected_LR': tr.get('lr'),
                 'Total_Wall_S': rt.get('total_wall_s'), 'HPO_Wall_S': rt.get('hpo_wall_s'),
-                'Train_Wall_S': rt.get('train_wall_s'), 'Device_Name': rt.get('device_name'),
-                'Peak_GPU_MB': rt.get('peak_gpu_memory_mb'),
+                'Train_Wall_S': rt.get('train_wall_s'), 'Eval_Wall_S': rt.get('eval_wall_s'),
+                'Train_GPU_Hours': rt.get('train_gpu_hours'), 'Eval_GPU_Hours': rt.get('eval_gpu_hours'),
+                'Total_GPU_Hours': rt.get('total_gpu_hours'),
+                'Device_Name': hw.get('device_name'),
+                'GPU_Model': hw.get('gpu_model'), 'GPU_Count': hw.get('gpu_count'),
+                'GPU_Total_VRAM_GB': hw.get('gpu_total_vram_gb'),
+                'CPU_Model': hw.get('cpu_model'), 'RAM_GB': hw.get('ram_gb'),
+                'Peak_GPU_MB': rt.get('peak_gpu_memory_mb'), 'Peak_CPU_MB': rt.get('peak_cpu_memory_mb'),
+                'Param_Count': model_stats.get('parameter_count'),
+                'Trainable_Param_Count': model_stats.get('trainable_parameter_count'),
+                'Artifact_Size_MB': model_stats.get('artifact_size_mb'),
+                'Inference_Batch_Size': infer.get('batch_size'),
+                'Inference_Latency_MS': infer.get('per_batch_latency_ms'),
+                'Inference_Throughput_SPS': infer.get('throughput_samples_per_s'),
+                'FLOPs': model_stats.get('flops'),
+                'MACs': model_stats.get('macs'),
+                'Energy_KWh': sustain.get('energy_kwh'),
+                'Carbon_KgCO2eq': sustain.get('carbon_kg_co2eq'),
                 'Hparams_JSON': json.dumps(fold_hparams, default=str),
                 'Experiment_ID': record['experiment_id'],
             }
@@ -659,6 +727,7 @@ def main():
         summary = {
             'Dataset': args.dataset, 'Label': args.label, 'Model': args.model,
             'Backbone': args.backbone, 'N_Folds': len(all_fold_results),
+            'Seed_Count': len(seeds), 'N_Runs': len(all_fold_results),
         }
         for key in METRIC_KEYS:
             vals = [r[key] for r in all_fold_results]

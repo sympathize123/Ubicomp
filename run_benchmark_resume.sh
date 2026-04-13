@@ -1,200 +1,216 @@
 #!/bin/bash
-# Resume benchmark from progress CSV.
-# Last crash point (from tmux log): D-1 / disturbance / AutoInt.
-# AutoInt is excluded (OOM/instability).
-# This script skips combos that already have >= 5 completed folds in:
-# results/benchmark_results_da_hpo_progress.csv
+# Resume within-dataset benchmark runs across the full supported model matrix.
 
 set -euo pipefail
 
-PROGRESS_CSV="results/benchmark_results_da_hpo_progress.csv"
-SUMMARY_CSV="results/benchmark_results_da_hpo.csv"
-REQUIRED_FOLDS=5
+PYTHON_BIN="${PYTHON_BIN:-python3}"
+SUMMARY_CSV="${SUMMARY_CSV:-results/benchmark_results_da_hpo.csv}"
+PROGRESS_CSV="${PROGRESS_CSV:-results/benchmark_results_da_hpo_progress.csv}"
+REQUIRED_FOLDS="${REQUIRED_FOLDS:-5}"
+HPO_TRIALS="${HPO_TRIALS:-30}"
+HPO_MODE="${HPO_MODE:-fold1}"
+SEEDS_STR="${SEEDS:-42}"
+BACKBONES_STR="${BACKBONES:-MLP}"
+EXCLUDED_MODELS_STR="${EXCLUDED_MODELS:-}"
 
-# DA models (require --uda)
-da_models=("DANN" "CDAN" "DAN" "DeepCORAL" "MCC" "ADDA" "MCD" "JAN" "SHOT" "CBST" "CGDM")
-excluded_models=("AutoInt")
+read -r -a SEED_LIST <<< "$SEEDS_STR"
+read -r -a BACKBONE_LIST <<< "$BACKBONES_STR"
+read -r -a EXCLUDED_MODELS <<< "$EXCLUDED_MODELS_STR"
 
-is_da() {
-    local m="$1"
-    for da in "${da_models[@]}"; do
-        [ "$m" == "$da" ] && return 0
+COMMON_LABELS=("arousal" "disturbance" "stress_binary" "valence")
+D3_EXTRA_LABELS=("angry" "anxious" "cheerful" "content" "depressed" "happy" "relaxed" "sad")
+
+BASELINES=("XGB" "LGB" "MLP" "ResNet")
+TABULAR_DL=("TabNet" "SAINT" "TabTransformer" "FTTransformer" "DCN" "AutoInt")
+DG_MODELS=("ERM_DG" "IRM" "VREx" "GroupDRO" "MixStyle" "MLDG" "MASF" "Fish" "CSD" "SagNet")
+DA_MODELS=("DANN" "CDAN" "DAN" "DeepCORAL" "MCC" "ADDA" "MCD" "JAN" "SHOT" "CBST" "CGDM")
+
+in_list() {
+    local needle="$1"
+    shift || true
+    local item
+    for item in "$@"; do
+        [ "$needle" = "$item" ] && return 0
     done
     return 1
+}
+
+is_da() {
+    in_list "$1" "${DA_MODELS[@]}"
+}
+
+requires_backbone() {
+    in_list "$1" "${DG_MODELS[@]}" || in_list "$1" "${DA_MODELS[@]}"
 }
 
 needs_eff() {
-    local m="$1"
-    [ "$m" == "SAINT" ] || [ "$m" == "TabTransformer" ] || [ "$m" == "FTTransformer" ]
+    local model="$1"
+    [ "$model" = "SAINT" ] || [ "$model" = "TabTransformer" ] || [ "$model" = "FTTransformer" ]
 }
 
 is_excluded() {
-    local m="$1"
-    for x in "${excluded_models[@]}"; do
-        [ "$m" == "$x" ] && return 0
-    done
-    return 1
+    local model="$1"
+    [ "${#EXCLUDED_MODELS[@]}" -gt 0 ] && in_list "$model" "${EXCLUDED_MODELS[@]}"
+}
+
+expected_runs() {
+    echo $(( REQUIRED_FOLDS * ${#SEED_LIST[@]} ))
 }
 
 is_done() {
-    local dataset="$1" label="$2" model="$3" backbone="$4"
-    local folds_progress=0
-    local folds_summary=0
-    local require_backbone=0
+    local dataset="$1"
+    local label="$2"
+    local model="$3"
+    local backbone="$4"
+    local required_runs
+    local progress_runs=0
+    local summary_runs=0
+    local summary_seed_count=0
 
-    if is_da "$model" || [[ "$model" == "IRM" || "$model" == "VREx" || "$model" == "GroupDRO" || "$model" == "MixStyle" || "$model" == "MLDG" || "$model" == "MASF" || "$model" == "Fish" || "$model" == "CSD" || "$model" == "SagNet" ]]; then
-        require_backbone=1
-    fi
+    required_runs="$(expected_runs)"
 
     if [ -f "$PROGRESS_CSV" ]; then
-        folds_progress=$(python3 - "$PROGRESS_CSV" "$dataset" "$label" "$model" "$backbone" "$require_backbone" <<'PY'
-import csv, sys
-path, dataset, label, model, backbone, require_backbone = sys.argv[1:]
-require_backbone = int(require_backbone)
-folds = set()
+        progress_runs=$("$PYTHON_BIN" - "$PROGRESS_CSV" "$dataset" "$label" "$model" "$backbone" <<'PY'
+import csv
+import sys
+
+path, dataset, label, model, backbone = sys.argv[1:]
+runs = set()
 with open(path, newline='') as f:
     for row in csv.DictReader(f):
-        if row.get('Phase') != 'final':
+        if row.get("Phase") != "final":
             continue
-        if not (row.get('Dataset') == dataset and row.get('Label') == label and row.get('Model') == model):
+        if row.get("Dataset") != dataset or row.get("Label") != label or row.get("Model") != model:
             continue
-        if require_backbone and row.get('Backbone') != backbone:
+        if (row.get("Backbone") or "MLP") != backbone:
             continue
-        fold = (row.get('Fold') or '').strip()
-        if fold:
-            folds.add(fold)
-print(len(folds))
+        fold = (row.get("Fold") or "").strip()
+        seed = (row.get("Seed") or "").strip()
+        if fold and seed:
+            runs.add((fold, seed))
+print(len(runs))
 PY
 )
     fi
 
-    # Summary CSV has one row per completed combo (N_Folds should be 5 when done).
     if [ -f "$SUMMARY_CSV" ]; then
-        folds_summary=$(python3 - "$SUMMARY_CSV" "$dataset" "$label" "$model" "$backbone" "$require_backbone" <<'PY'
-import csv, sys
-path, dataset, label, model, backbone, require_backbone = sys.argv[1:]
-require_backbone = int(require_backbone)
-best = 0
+        read -r summary_runs summary_seed_count < <("$PYTHON_BIN" - "$SUMMARY_CSV" "$dataset" "$label" "$model" "$backbone" <<'PY'
+import csv
+import sys
+
+path, dataset, label, model, backbone = sys.argv[1:]
+best_runs = 0
+best_seed_count = 0
 with open(path, newline='') as f:
     for row in csv.DictReader(f):
-        if not (row.get('Dataset') == dataset and row.get('Label') == label and row.get('Model') == model):
+        if row.get("Dataset") != dataset or row.get("Label") != label or row.get("Model") != model:
             continue
-        if require_backbone and row.get('Backbone') != backbone:
+        if (row.get("Backbone") or "MLP") != backbone:
             continue
         try:
-            n_folds = int(float(row.get('N_Folds', '0') or 0))
+            n_runs = int(float(row.get("N_Runs", row.get("N_Folds", "0")) or 0))
         except Exception:
-            n_folds = 0
-        if n_folds > best:
-            best = n_folds
-print(best)
+            n_runs = 0
+        try:
+            seed_count = int(float(row.get("Seed_Count", "0") or 0))
+        except Exception:
+            seed_count = 0
+        if (n_runs, seed_count) > (best_runs, best_seed_count):
+            best_runs = n_runs
+            best_seed_count = seed_count
+print(best_runs, best_seed_count)
 PY
 )
     fi
 
-    [ "${folds_progress:-0}" -ge "$REQUIRED_FOLDS" ] || [ "${folds_summary:-0}" -ge "$REQUIRED_FOLDS" ]
+    [ "${progress_runs:-0}" -ge "$required_runs" ] || {
+        [ "${summary_runs:-0}" -ge "$required_runs" ] && [ "${summary_seed_count:-0}" -ge "${#SEED_LIST[@]}" ]
+    }
 }
 
 run_model() {
-    local dataset="$1" label="$2" model="$3" backbone="${4:-}"
-    local backbone_key="${backbone:-MLP}"
+    local dataset="$1"
+    local label="$2"
+    local model="$3"
+    local backbone="${4:-MLP}"
+    local cmd=(
+        "$PYTHON_BIN" execute_benchmark.py
+        --dataset "$dataset"
+        --label "$label"
+        --model "$model"
+        --hpo_trials "$HPO_TRIALS"
+        --hpo_mode "$HPO_MODE"
+        --output "$SUMMARY_CSV"
+        --seeds "${SEED_LIST[@]}"
+    )
+
     if is_excluded "$model"; then
-        echo "SKIP (excluded): Dataset=$dataset, Label=$label, Model=$model, Backbone=$backbone_key"
+        echo "SKIP (excluded): dataset=$dataset label=$label model=$model backbone=$backbone"
         return 0
     fi
-    if is_done "$dataset" "$label" "$model" "$backbone_key"; then
-        echo "SKIP (already ${REQUIRED_FOLDS} folds): Dataset=$dataset, Label=$label, Model=$model, Backbone=$backbone_key"
+
+    if is_done "$dataset" "$label" "$model" "$backbone"; then
+        echo "SKIP (complete): dataset=$dataset label=$label model=$model backbone=$backbone"
         return 0
     fi
+
+    if needs_eff "$model"; then
+        cmd+=(--efficient_attention)
+    fi
+    if is_da "$model"; then
+        cmd+=(--uda)
+    fi
+    if requires_backbone "$model"; then
+        cmd+=(--backbone "$backbone")
+    fi
+
     echo "================================================"
-    echo "Running: Dataset=$dataset, Label=$label, Model=$model, Backbone=$backbone"
+    echo "Running: dataset=$dataset label=$label model=$model backbone=$backbone seeds=${SEED_LIST[*]}"
     echo "================================================"
-    local extra_args=""
-    if needs_eff "$model"; then extra_args="--efficient_attention"; fi
-    if is_da "$model"; then extra_args="$extra_args --uda"; fi
-    if [ -n "$backbone" ]; then extra_args="$extra_args --backbone $backbone"; fi
-    python3 execute_benchmark.py --dataset "$dataset" --label "$label" --model "$model" \
-        --hpo_trials 5 --hpo_mode nested $extra_args
+    "${cmd[@]}"
 }
 
-# ============================================================
-# 1) D-1 / disturbance — resume from crash point
-# ============================================================
-# AutoInt excluded
+run_label_block() {
+    local dataset="$1"
+    shift
+    local labels=("$@")
+    local label
+    local model
+    local backbone
 
-# D-1 / disturbance — ALL models
-for model in "XGB" "LGB" "MLP" "ResNet"; do
-    run_model "D-1" "disturbance" "$model"
-done
-for model in "TabNet" "SAINT" "TabTransformer" "FTTransformer" "DCN"; do
-    run_model "D-1" "disturbance" "$model"
-done
-for model in "IRM" "VREx" "GroupDRO" "MixStyle" "MLDG" "MASF" "Fish" "CSD" "SagNet" \
-             "DANN" "CDAN" "DAN" "DeepCORAL" "MCC" "ADDA" "MCD" "JAN" "SHOT" "CBST" "CGDM"; do
-    run_model "D-1" "disturbance" "$model" "MLP"
-done
+    for label in "${labels[@]}"; do
+        for model in "${BASELINES[@]}"; do
+            run_model "$dataset" "$label" "$model"
+        done
+        for model in "${TABULAR_DL[@]}"; do
+            run_model "$dataset" "$label" "$model"
+        done
+        for model in "${DG_MODELS[@]}"; do
+            for backbone in "${BACKBONE_LIST[@]}"; do
+                run_model "$dataset" "$label" "$model" "$backbone"
+            done
+        done
+        for model in "${DA_MODELS[@]}"; do
+            for backbone in "${BACKBONE_LIST[@]}"; do
+                run_model "$dataset" "$label" "$model" "$backbone"
+            done
+        done
+    done
+}
 
-# ============================================================
-# 2) D-1 / valence — ALL models
-# ============================================================
-for model in "XGB" "LGB" "MLP" "ResNet"; do
-    run_model "D-1" "valence" "$model"
-done
-for model in "TabNet" "SAINT" "TabTransformer" "FTTransformer" "DCN"; do
-    run_model "D-1" "valence" "$model"
-done
-for model in "IRM" "VREx" "GroupDRO" "MixStyle" "MLDG" "MASF" "Fish" "CSD" "SagNet" \
-             "DANN" "CDAN" "DAN" "DeepCORAL" "MCC" "ADDA" "MCD" "JAN" "SHOT" "CBST" "CGDM"; do
-    run_model "D-1" "valence" "$model" "MLP"
-done
+echo "Starting within-dataset benchmark resume run..."
+echo "Summary CSV:  $SUMMARY_CSV"
+echo "Progress CSV: $PROGRESS_CSV"
+echo "Seeds:        ${SEED_LIST[*]}"
+echo "Backbones:    ${BACKBONE_LIST[*]}"
+echo "HPO:          trials=$HPO_TRIALS mode=$HPO_MODE"
+echo "Required runs per combo: $(expected_runs)"
 
-# ============================================================
-# 2-1) D-1 / stress_binary — ALL models
-# ============================================================
-for model in "XGB" "LGB" "MLP" "ResNet"; do
-    run_model "D-1" "stress_binary" "$model"
-done
-for model in "TabNet" "SAINT" "TabTransformer" "FTTransformer" "DCN"; do
-    run_model "D-1" "stress_binary" "$model"
-done
-for model in "IRM" "VREx" "GroupDRO" "MixStyle" "MLDG" "MASF" "Fish" "CSD" "SagNet" \
-             "DANN" "CDAN" "DAN" "DeepCORAL" "MCC" "ADDA" "MCD" "JAN" "SHOT" "CBST" "CGDM"; do
-    run_model "D-1" "stress_binary" "$model" "MLP"
-done
-
-# ============================================================
-# 3) D-2 — ALL labels × ALL models
-# ============================================================
-for label in "arousal" "disturbance" "stress_binary" "valence"; do
-    for model in "XGB" "LGB" "MLP" "ResNet"; do
-        run_model "D-2" "$label" "$model"
-    done
-    for model in "TabNet" "SAINT" "TabTransformer" "FTTransformer" "DCN"; do
-        run_model "D-2" "$label" "$model"
-    done
-    for model in "IRM" "VREx" "GroupDRO" "MixStyle" "MLDG" "MASF" "Fish" "CSD" "SagNet" \
-                 "DANN" "CDAN" "DAN" "DeepCORAL" "MCC" "ADDA" "MCD" "JAN" "SHOT" "CBST" "CGDM"; do
-        run_model "D-2" "$label" "$model" "MLP"
-    done
-done
-
-# ============================================================
-# 4) D-3 — ALL labels × ALL models
-# ============================================================
-for label in "angry" "anxious" "arousal" "cheerful" "content" "depressed" "disturbance" "happy" "relaxed" "sad" "stress_binary" "valence"; do
-    for model in "XGB" "LGB" "MLP" "ResNet"; do
-        run_model "D-3" "$label" "$model"
-    done
-    for model in "TabNet" "SAINT" "TabTransformer" "FTTransformer" "DCN"; do
-        run_model "D-3" "$label" "$model"
-    done
-    for model in "IRM" "VREx" "GroupDRO" "MixStyle" "MLDG" "MASF" "Fish" "CSD" "SagNet" \
-                 "DANN" "CDAN" "DAN" "DeepCORAL" "MCC" "ADDA" "MCD" "JAN" "SHOT" "CBST" "CGDM"; do
-        run_model "D-3" "$label" "$model" "MLP"
-    done
-done
+run_label_block "D-1" "${COMMON_LABELS[@]}"
+run_label_block "D-2" "${COMMON_LABELS[@]}"
+run_label_block "D-3" "${COMMON_LABELS[@]}" "${D3_EXTRA_LABELS[@]}"
 
 echo ""
 echo "=========================================="
-echo "  ALL REMAINING BENCHMARKS COMPLETED"
+echo "  WITHIN-DATASET BENCHMARK RUN COMPLETED"
 echo "=========================================="
