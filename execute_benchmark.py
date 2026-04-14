@@ -254,7 +254,6 @@ def train_model(args, X_train, y_train, d_train, X_val, y_val, d_val,
         _n_heads = saint_hparams.pop('n_heads', 4)
         _n_blocks = saint_hparams.pop('n_blocks', 2)
         _dropout = saint_hparams.pop('dropout', 0.1)
-        saint_hparams.pop('lr', None)  # lr passed separately via WideTrainer
         model = WidedeepWrapper(model_type='SAINT', input_dim=_input_dim, n_heads=_n_heads,
                                 n_blocks=_n_blocks, dropout=_dropout, mlp_dropout=_dropout,
                                 epochs=epochs, patience=patience, batch_size=batch_size,
@@ -536,6 +535,7 @@ def main():
                     trial_params[k] = v(trial)
                 else:
                     trial_params[k] = v
+            trial.set_user_attr("resolved_hparams", dict(trial_params))
 
             scores = []
             for entry in folds_for_hpo:
@@ -564,8 +564,9 @@ def main():
         _optuna.logging.set_verbosity(_optuna.logging.WARNING)
         study = _optuna.create_study(direction='maximize', sampler=_optuna.samplers.TPESampler(seed=42))
         study.optimize(objective, n_trials=args.hpo_trials)
-        print("Best HPO params:", study.best_params)
-        return study.best_params, study
+        best_params = dict(study.best_trial.user_attrs.get("resolved_hparams", {})) or dict(study.best_params)
+        print("Best HPO params:", best_params)
+        return best_params, study
 
     hpo_study = None
     if args.hpo_trials > 0 and args.hpo_mode in ("fold1", "cv"):

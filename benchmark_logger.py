@@ -586,6 +586,7 @@ class BenchmarkLogger:
                 trials.append({
                     "trial_idx": t.number,
                     "params": {k: (v.item() if hasattr(v, "item") else v) for k, v in t.params.items()},
+                    "resolved_params": dict(t.user_attrs.get("resolved_hparams", {})) or None,
                     "value": float(t.value) if t.value is not None else None,
                     "duration_s": duration_s,
                     "state": str(t.state),

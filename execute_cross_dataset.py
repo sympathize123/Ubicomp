@@ -374,6 +374,7 @@ def _run_hpo(args, train_dataset_key: str, X_tr, y_tr, d_tr, X_va, y_va, d_va, X
 
     def objective(trial):
         trial_hparams = _sample_hparams(args, train_dataset_key, trial)
+        trial.set_user_attr("resolved_hparams", dict(trial_hparams))
         try:
             model = train_model(
                 args=args,
@@ -401,8 +402,9 @@ def _run_hpo(args, train_dataset_key: str, X_tr, y_tr, d_tr, X_va, y_va, d_va, X
     _optuna.logging.set_verbosity(_optuna.logging.WARNING)
     study = _optuna.create_study(direction='maximize', sampler=_optuna.samplers.TPESampler(seed=args.seed))
     study.optimize(objective, n_trials=args.hpo_trials)
-    print(f'  Best HPO params: {study.best_params}')
-    return study.best_params, study
+    best_params = dict(study.best_trial.user_attrs.get("resolved_hparams", {})) or dict(study.best_params)
+    print(f'  Best HPO params: {best_params}')
+    return best_params, study
 
 
 def _run_experiment(args, aligned: Dict[str, Dict], common_features: List[str],
