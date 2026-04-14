@@ -57,7 +57,7 @@ def get_hparams(algorithm, dataset, backbone='MLP'):
 
     if algorithm in ['MLP', 'ResNet']:
         hparams['lr'] = lambda trial: trial.suggest_float('lr', 1e-5, 1e-2, log=True)
-        hparams['weight_decay'] = lambda trial: _zero_or_loguniform(trial, 'weight_decay', 1e-6, 1e-3)
+        hparams['weight_decay'] = lambda trial: trial.suggest_float('weight_decay', 1e-6, 1e-3, log=True)
         hparams['batch_size'] = lambda trial: trial.suggest_categorical('batch_size', [32, 64, 128, 256, 512])
         _add_backbone_hparams(hparams, algorithm, backbone)
 
@@ -174,7 +174,7 @@ def get_hparams(algorithm, dataset, backbone='MLP'):
         hparams['gamma'] = lambda trial: trial.suggest_float('gamma', 1.0, 2.0)
         hparams['lambda_sparse'] = lambda trial: trial.suggest_float('lambda_sparse', 1e-6, 1e-1, log=True)
         hparams['lr'] = lambda trial: trial.suggest_float('lr', 1e-3, 1e-2)
-        hparams['weight_decay'] = lambda trial: _zero_or_loguniform(trial, 'weight_decay', 1e-6, 1e-3)
+        hparams['weight_decay'] = lambda trial: trial.suggest_float('weight_decay', 1e-6, 1e-3, log=True)
         hparams['batch_size'] = lambda trial: trial.suggest_categorical('batch_size', [64, 128, 256, 512, 1024])
 
     elif algorithm in ['TabTransformer', 'SAINT']:
@@ -184,7 +184,7 @@ def get_hparams(algorithm, dataset, backbone='MLP'):
         hparams['attn_dropout'] = lambda trial: trial.suggest_float('attn_dropout', 0.0, 0.3)
         hparams['ff_dropout'] = lambda trial: trial.suggest_float('ff_dropout', 0.0, 0.3)
         hparams['lr'] = lambda trial: trial.suggest_float('lr', 1e-4, 1e-3, log=True)
-        hparams['weight_decay'] = lambda trial: _zero_or_loguniform(trial, 'weight_decay', 1e-6, 1e-3)
+        hparams['weight_decay'] = lambda trial: trial.suggest_float('weight_decay', 1e-6, 1e-3, log=True)
 
     elif algorithm == 'FTTransformer':
         hparams['n_blocks'] = lambda trial: trial.suggest_int('n_blocks', 1, 4)
@@ -207,7 +207,7 @@ def get_hparams(algorithm, dataset, backbone='MLP'):
         hparams['hidden_dropout'] = lambda trial: trial.suggest_float('hidden_dropout', 0.0, 0.5)
         hparams['cross_dropout'] = lambda trial: _zero_or_uniform(trial, 'cross_dropout', 0.0, 0.5)
         hparams['lr'] = lambda trial: trial.suggest_float('lr', 1e-5, 1e-2, log=True)
-        hparams['weight_decay'] = lambda trial: _zero_or_loguniform(trial, 'weight_decay', 1e-6, 1e-3)
+        hparams['weight_decay'] = lambda trial: trial.suggest_float('weight_decay', 1e-6, 1e-3, log=True)
 
     elif algorithm == 'AutoInt':
         hparams['dropout'] = lambda trial: trial.suggest_float('dropout', 0.0, 0.3)
