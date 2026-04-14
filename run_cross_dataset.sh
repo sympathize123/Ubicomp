@@ -11,7 +11,7 @@ RUN_SETTING="${1:-${RUN_SETTING:-all}}"
 HPO_TRIALS="${2:-${HPO_TRIALS:-30}}"
 SEEDS_STR="${SEEDS:-42}"
 BACKBONES_STR="${BACKBONES:-MLP}"
-EXCLUDED_MODELS_STR="${EXCLUDED_MODELS:-}"
+EXCLUDED_MODELS_STR="${EXCLUDED_MODELS:-AutoInt}"
 OUTPUT_DIR="${OUTPUT_DIR:-results}"
 FEATURE_DIR="${FEATURE_DIR:-$OUTPUT_DIR}"
 
@@ -22,7 +22,7 @@ read -r -a EXCLUDED_MODELS <<< "$EXCLUDED_MODELS_STR"
 COMMON_LABELS=("arousal" "disturbance" "valence" "stress_binary")
 
 BASELINES=("XGB" "LGB" "MLP" "ResNet")
-TABULAR_DL=("TabNet" "SAINT" "TabTransformer" "FTTransformer" "DCN" "AutoInt")
+TABULAR_DL=("TabNet" "SAINT" "TabTransformer" "FTTransformer" "DCN")
 DG_MODELS=("ERM_DG" "IRM" "VREx" "GroupDRO" "MixStyle" "MLDG" "MASF" "Fish" "CSD" "SagNet")
 DA_MODELS=("DANN" "CDAN" "DAN" "DeepCORAL" "MCC" "ADDA" "MCD" "JAN" "SHOT" "CBST" "CGDM")
 

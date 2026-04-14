@@ -11,7 +11,7 @@ HPO_TRIALS="${HPO_TRIALS:-30}"
 HPO_MODE="${HPO_MODE:-fold1}"
 SEEDS_STR="${SEEDS:-42}"
 BACKBONES_STR="${BACKBONES:-MLP}"
-EXCLUDED_MODELS_STR="${EXCLUDED_MODELS:-}"
+EXCLUDED_MODELS_STR="${EXCLUDED_MODELS:-AutoInt}"
 
 read -r -a SEED_LIST <<< "$SEEDS_STR"
 read -r -a BACKBONE_LIST <<< "$BACKBONES_STR"
@@ -21,7 +21,7 @@ COMMON_LABELS=("arousal" "disturbance" "stress_binary" "valence")
 D3_EXTRA_LABELS=("angry" "anxious" "cheerful" "content" "depressed" "happy" "relaxed" "sad")
 
 BASELINES=("XGB" "LGB" "MLP" "ResNet")
-TABULAR_DL=("TabNet" "SAINT" "TabTransformer" "FTTransformer" "DCN" "AutoInt")
+TABULAR_DL=("TabNet" "SAINT" "TabTransformer" "FTTransformer" "DCN")
 DG_MODELS=("ERM_DG" "IRM" "VREx" "GroupDRO" "MixStyle" "MLDG" "MASF" "Fish" "CSD" "SagNet")
 DA_MODELS=("DANN" "CDAN" "DAN" "DeepCORAL" "MCC" "ADDA" "MCD" "JAN" "SHOT" "CBST" "CGDM")
 
