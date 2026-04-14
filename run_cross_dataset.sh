@@ -11,7 +11,7 @@ set -euo pipefail
 #   bash run_cross_dataset.sh two_to_one 5
 
 RUN_SETTING="${1:-all}"
-HPO_TRIALS="${2:-5}"
+HPO_TRIALS="${2:-30}"
 
 COMMON_LABELS=("arousal" "disturbance" "valence" "stress_binary")
 
@@ -100,17 +100,17 @@ done
 #     done
 # done
 
-# echo ""
-# echo "========================================="
-# echo "CATEGORY 3: Domain Generalization"
-# echo "========================================="
-# for label in "${COMMON_LABELS[@]}"; do
-#     for model in "${dg_models[@]}"; do
-#         for backbone in "${backbones[@]}"; do
-#             run_experiment "$label" "$model" "$backbone"
-#         done
-#     done
-# done
+echo ""
+echo "========================================="
+echo "CATEGORY 3: Domain Generalization"
+echo "========================================="
+for label in "${COMMON_LABELS[@]}"; do
+    for model in "${dg_models[@]}"; do
+        for backbone in "${backbones[@]}"; do
+            run_experiment "$label" "$model" "$backbone"
+        done
+    done
+done
 
 echo ""
 echo "========================================="
