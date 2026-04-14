@@ -334,6 +334,18 @@ class WidedeepWrapper(BaseEstimator, ClassifierMixin):
                 ft_params.setdefault('ff_dropout', dropout_val)
             ft_params.setdefault('input_dim', 32)
             ft_params.setdefault('n_heads', 4)
+            # Multi-head attention requires the embedding width to be divisible by the number of heads.
+            # Coerce misconfigured HPO suggestions to the nearest valid multiple instead of failing late.
+            input_dim = int(ft_params.get('input_dim', 32))
+            n_heads = int(ft_params.get('n_heads', 4))
+            if n_heads <= 0:
+                n_heads = 4
+            if input_dim % n_heads != 0:
+                adjusted = max(n_heads, int(round(input_dim / n_heads)) * n_heads)
+                if adjusted != input_dim:
+                    print(f"[INFO] FTTransformer: adjusted input_dim from {input_dim} to {adjusted} for n_heads={n_heads}.")
+                ft_params['input_dim'] = adjusted
+                ft_params['n_heads'] = n_heads
             if self.efficient_attention:
                 print("[INFO] FTTransformer: enabling kernel linear-attention path in FT encoder blocks.")
                 import pytorch_widedeep.models.tabular.transformers.ft_transformer as ft_mod

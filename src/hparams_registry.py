@@ -188,7 +188,7 @@ def get_hparams(algorithm, dataset, backbone='MLP'):
 
     elif algorithm == 'FTTransformer':
         hparams['n_blocks'] = lambda trial: trial.suggest_int('n_blocks', 1, 4)
-        hparams['input_dim'] = lambda trial: trial.suggest_int('input_dim', 64, 512)
+        hparams['input_dim'] = lambda trial: trial.suggest_int('input_dim', 64, 512, step=8)
         hparams['attn_dropout'] = lambda trial: trial.suggest_float('attn_dropout', 0.0, 0.5)
         hparams['ff_dropout'] = lambda trial: trial.suggest_float('ff_dropout', 0.0, 0.5)
         hparams['residual_dropout'] = lambda trial: _zero_or_uniform(trial, 'residual_dropout', 0.0, 0.2)
