@@ -168,23 +168,24 @@ def get_hparams(algorithm, dataset, backbone='MLP'):
             hparams['num_k'] = lambda trial: trial.suggest_categorical('num_k', [2, 4])
 
     elif algorithm == 'TabNet':
-        hparams['n_d'] = lambda trial: trial.suggest_categorical('n_d', [8, 16, 32, 64])
-        hparams['n_a'] = lambda trial: trial.suggest_categorical('n_a', [8, 16, 32, 64])
-        hparams['n_steps'] = lambda trial: trial.suggest_int('n_steps', 3, 10)
+        hparams['n_d'] = lambda trial: trial.suggest_categorical('n_d', [8, 16, 32])
+        hparams['n_a'] = lambda trial: trial.suggest_categorical('n_a', [8, 16, 32])
+        hparams['n_steps'] = lambda trial: trial.suggest_int('n_steps', 3, 6)
         hparams['gamma'] = lambda trial: trial.suggest_float('gamma', 1.0, 2.0)
         hparams['lambda_sparse'] = lambda trial: trial.suggest_float('lambda_sparse', 1e-6, 1e-1, log=True)
         hparams['lr'] = lambda trial: trial.suggest_float('lr', 1e-3, 1e-2)
         hparams['weight_decay'] = lambda trial: trial.suggest_float('weight_decay', 1e-6, 1e-3, log=True)
-        hparams['batch_size'] = lambda trial: trial.suggest_categorical('batch_size', [64, 128, 256, 512, 1024])
+        hparams['batch_size'] = lambda trial: trial.suggest_categorical('batch_size', [64, 128, 256])
 
     elif algorithm in ['TabTransformer', 'SAINT']:
-        hparams['input_dim'] = lambda trial: trial.suggest_categorical('input_dim', [16, 32])
-        hparams['n_heads'] = lambda trial: trial.suggest_categorical('n_heads', [2, 4, 8])
-        hparams['n_blocks'] = lambda trial: trial.suggest_int('n_blocks', 1, 4)
+        hparams['input_dim'] = lambda trial: trial.suggest_categorical('input_dim', [8, 16, 32])
+        hparams['n_heads'] = lambda trial: trial.suggest_categorical('n_heads', [2, 4])
+        hparams['n_blocks'] = lambda trial: trial.suggest_int('n_blocks', 1, 3)
         hparams['attn_dropout'] = lambda trial: trial.suggest_float('attn_dropout', 0.0, 0.3)
         hparams['ff_dropout'] = lambda trial: trial.suggest_float('ff_dropout', 0.0, 0.3)
         hparams['lr'] = lambda trial: trial.suggest_float('lr', 1e-4, 1e-3, log=True)
         hparams['weight_decay'] = lambda trial: trial.suggest_float('weight_decay', 1e-6, 1e-3, log=True)
+        hparams['batch_size'] = lambda trial: trial.suggest_categorical('batch_size', [16, 32, 64])
 
     elif algorithm == 'FTTransformer':
         hparams['n_blocks'] = lambda trial: trial.suggest_int('n_blocks', 1, 3)
@@ -199,21 +200,26 @@ def get_hparams(algorithm, dataset, backbone='MLP'):
 
     elif algorithm == 'DCN':
         def _dcn_hidden_units(trial):
-            n_hidden_layers = trial.suggest_int('n_hidden_layers', 1, 8)
-            layer_size = trial.suggest_int('layer_size', 64, 512)
+            n_hidden_layers = trial.suggest_int('n_hidden_layers', 1, 4)
+            layer_size = trial.suggest_int('layer_size', 64, 256)
             return tuple([layer_size] * n_hidden_layers)
 
-        hparams['n_cross_layers'] = lambda trial: trial.suggest_int('n_cross_layers', 1, 8)
+        hparams['n_cross_layers'] = lambda trial: trial.suggest_int('n_cross_layers', 1, 4)
         hparams['dnn_hidden_units'] = _dcn_hidden_units
         hparams['hidden_dropout'] = lambda trial: trial.suggest_float('hidden_dropout', 0.0, 0.5)
         hparams['cross_dropout'] = lambda trial: _zero_or_uniform(trial, 'cross_dropout', 0.0, 0.5)
         hparams['lr'] = lambda trial: trial.suggest_float('lr', 1e-5, 1e-2, log=True)
         hparams['weight_decay'] = lambda trial: trial.suggest_float('weight_decay', 1e-6, 1e-3, log=True)
+        hparams['batch_size'] = lambda trial: trial.suggest_categorical('batch_size', [32, 64, 128])
 
     elif algorithm == 'AutoInt':
         hparams['dropout'] = lambda trial: trial.suggest_float('dropout', 0.0, 0.3)
-        hparams['att_layer_num'] = lambda trial: trial.suggest_int('att_layer_num', 1, 4)
-        hparams['att_head_num'] = lambda trial: trial.suggest_categorical('att_head_num', [2, 4, 8])
+        hparams['att_layer_num'] = lambda trial: trial.suggest_int('att_layer_num', 1, 3)
+        hparams['att_head_num'] = lambda trial: trial.suggest_categorical('att_head_num', [2, 4])
+        hparams['autoint_bins'] = lambda trial: trial.suggest_categorical('autoint_bins', [8, 16])
+        hparams['lr'] = lambda trial: trial.suggest_float('lr', 1e-5, 1e-3, log=True)
+        hparams['weight_decay'] = lambda trial: trial.suggest_float('weight_decay', 1e-6, 1e-3, log=True)
+        hparams['batch_size'] = lambda trial: trial.suggest_categorical('batch_size', [32, 64, 128])
 
     elif algorithm == 'XGB':
         hparams['learning_rate'] = lambda trial: trial.suggest_float('learning_rate', 1e-5, 1.0, log=True)

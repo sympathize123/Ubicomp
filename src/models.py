@@ -153,6 +153,19 @@ class TabNetWrapper(BaseEstimator, ClassifierMixin):
         if 'verbose' in params: verbose = params.pop('verbose')
         else: verbose = 1
 
+        if 'n_d' in params and int(params['n_d']) > 32:
+            print(f"[INFO] TabNet: capped n_d from {params['n_d']} to 32.")
+            params['n_d'] = 32
+        if 'n_a' in params and int(params['n_a']) > 32:
+            print(f"[INFO] TabNet: capped n_a from {params['n_a']} to 32.")
+            params['n_a'] = 32
+        if 'n_steps' in params and int(params['n_steps']) > 6:
+            print(f"[INFO] TabNet: capped n_steps from {params['n_steps']} to 6.")
+            params['n_steps'] = 6
+        if self.batch_size > 256:
+            print(f"[INFO] TabNet: capped batch_size from {self.batch_size} to 256.")
+            self.batch_size = 256
+
         tabnet_params = _filter_supported_kwargs(TabNetClassifier.__init__, params)
         self.model = TabNetClassifier(verbose=verbose, **tabnet_params)
         self.model.fit(X, y, eval_set=eval_set, eval_metric=['auc'], patience=self.patience, 
@@ -167,6 +180,7 @@ class TabNetWrapper(BaseEstimator, ClassifierMixin):
             batch_size=self.batch_size,
             early_stopped=bool(best_epoch is not None and isinstance(best_epoch, int) and best_epoch + 1 < self.epochs),
             model_selection_metric="val_auroc",
+            architecture_params=tabnet_params,
         )
         return self
 
@@ -220,6 +234,42 @@ class WidedeepWrapper(BaseEstimator, ClassifierMixin):
             X_val_tab = None
             df_val = None
 
+        def _cap_transformer_params(params, model_name, max_input_dim=32, max_heads=4, max_blocks=3,
+                                    token_element_budget=24_000_000):
+            params.setdefault('input_dim', max_input_dim)
+            params.setdefault('n_heads', min(4, max_heads))
+            params.setdefault('n_blocks', 2)
+
+            input_dim = min(int(params.get('input_dim', max_input_dim)), max_input_dim)
+            n_heads = min(max(1, int(params.get('n_heads', 4))), max_heads, input_dim)
+            n_blocks = min(max(1, int(params.get('n_blocks', 2))), max_blocks)
+
+            if input_dim % n_heads != 0:
+                input_dim = max(n_heads, (input_dim // n_heads) * n_heads)
+
+            n_features = max(1, len(self.col_names))
+            max_dim = max(n_heads, token_element_budget // max(1, n_features * max(1, self.batch_size)))
+            max_dim = max(n_heads, (max_dim // n_heads) * n_heads)
+            if input_dim > max_dim:
+                print(
+                    f"[INFO] {model_name}: capped input_dim from {params.get('input_dim')} to {max_dim} "
+                    f"for {n_features} features and batch_size={self.batch_size}."
+                )
+                input_dim = max_dim
+
+            max_batch = max(1, token_element_budget // max(1, n_features * max(1, input_dim)))
+            if self.batch_size > max_batch:
+                adjusted_batch = next((candidate for candidate in (64, 32, 16, 8) if candidate <= max_batch), 8)
+                print(
+                    f"[INFO] {model_name}: capped batch_size from {self.batch_size} to {adjusted_batch} "
+                    f"for {n_features} features and input_dim={input_dim}."
+                )
+                self.batch_size = adjusted_batch
+
+            params['input_dim'] = input_dim
+            params['n_heads'] = n_heads
+            params['n_blocks'] = n_blocks
+
         # Define Model
         if self.model_type == 'SAINT':
             saint_params = training_params.copy()
@@ -230,6 +280,7 @@ class WidedeepWrapper(BaseEstimator, ClassifierMixin):
                 dropout_val = saint_params.pop('dropout')
                 saint_params.setdefault('attn_dropout', dropout_val)
                 saint_params.setdefault('ff_dropout', dropout_val)
+            _cap_transformer_params(saint_params, 'SAINT')
             if self.efficient_attention:
                 print("[INFO] SAINT: enabling linear-attention path for SAINT encoder blocks.")
                 import einops
@@ -313,6 +364,7 @@ class WidedeepWrapper(BaseEstimator, ClassifierMixin):
             tt_params.setdefault('input_dim', 32)
             tt_params.setdefault('n_heads', 4)
             tt_params.setdefault('n_blocks', 2)
+            _cap_transformer_params(tt_params, 'TabTransformer')
             tt_params['use_linear_attention'] = bool(self.efficient_attention)
             if self.efficient_attention:
                 print("[INFO] TabTransformer: use_linear_attention=True (architecture preserved).")
@@ -337,6 +389,9 @@ class WidedeepWrapper(BaseEstimator, ClassifierMixin):
                 ft_params.setdefault('ff_dropout', dropout_val)
             ft_params.setdefault('input_dim', 32)
             ft_params.setdefault('n_heads', 4)
+            if int(ft_params.get('n_blocks', 2)) > 3:
+                print(f"[INFO] FTTransformer: capped n_blocks from {ft_params.get('n_blocks')} to 3.")
+                ft_params['n_blocks'] = 3
             # Multi-head attention requires the embedding width to be divisible by the number of heads.
             # Coerce misconfigured HPO suggestions to the nearest valid multiple instead of failing late.
             input_dim = int(ft_params.get('input_dim', 32))
@@ -349,6 +404,13 @@ class WidedeepWrapper(BaseEstimator, ClassifierMixin):
                     print(f"[INFO] FTTransformer: adjusted input_dim from {input_dim} to {adjusted} for n_heads={n_heads}.")
                 ft_params['input_dim'] = adjusted
                 ft_params['n_heads'] = n_heads
+                input_dim = adjusted
+
+            max_ft_input_dim = 64
+            if input_dim > max_ft_input_dim:
+                adjusted = max(n_heads, (max_ft_input_dim // n_heads) * n_heads)
+                print(f"[INFO] FTTransformer: capped input_dim from {input_dim} to {adjusted}.")
+                ft_params['input_dim'] = adjusted
                 input_dim = adjusted
 
             n_features = max(1, len(self.col_names))
@@ -560,6 +622,7 @@ class DeepCTRWrapper(BaseEstimator, ClassifierMixin):
         params = _drop_optuna_helper_params(self.kwargs)
         lr = float(params.pop("lr", 1e-3))
         weight_decay = float(params.pop("weight_decay", 0.0) or 0.0)
+        effective_model_params = {}
 
         feature_names = [f"feat_{i}" for i in range(X.shape[1])]
         self.feature_names = feature_names
@@ -581,6 +644,18 @@ class DeepCTRWrapper(BaseEstimator, ClassifierMixin):
                 dcn_params['dnn_hidden_units'] = tuple(
                     [int(dcn_params.pop('layer_size'))] * int(dcn_params.pop('n_hidden_layers'))
                 )
+            if 'dnn_hidden_units' in dcn_params:
+                original_units = tuple(int(v) for v in dcn_params['dnn_hidden_units'])
+                capped_units = tuple(min(v, 256) for v in original_units[:4])
+                if capped_units != original_units:
+                    print(f"[INFO] DCN: capped dnn_hidden_units from {original_units} to {capped_units}.")
+                dcn_params['dnn_hidden_units'] = capped_units
+            if 'cross_num' in dcn_params and int(dcn_params['cross_num']) > 4:
+                print(f"[INFO] DCN: capped cross_num from {dcn_params['cross_num']} to 4.")
+                dcn_params['cross_num'] = 4
+            if self.batch_size > 128:
+                print(f"[INFO] DCN: capped batch_size from {self.batch_size} to 128.")
+                self.batch_size = 128
             dcn_params.pop('cross_dropout', None)
             dcn_params.pop('layer_size', None)
             dcn_params.pop('n_hidden_layers', None)
@@ -590,6 +665,7 @@ class DeepCTRWrapper(BaseEstimator, ClassifierMixin):
             dcn_params.setdefault('l2_reg_dnn', weight_decay)
             self.feature_columns = [DenseFeat(name, 1) for name in feature_names]
             dcn_params = _filter_supported_kwargs(DCN.__init__, dcn_params)
+            effective_model_params = dict(dcn_params)
             self.model = DCN(
                 self.feature_columns,
                 self.feature_columns,
@@ -601,13 +677,26 @@ class DeepCTRWrapper(BaseEstimator, ClassifierMixin):
             from deepctr_torch.models import AutoInt
             autoint_params = params.copy()
             n_bins = int(autoint_params.pop('autoint_bins', 16))
+            if n_bins > 16:
+                print(f"[INFO] AutoInt: capped autoint_bins from {n_bins} to 16.")
+                n_bins = 16
             if 'dropout' in autoint_params and 'dnn_dropout' not in autoint_params:
                 autoint_params['dnn_dropout'] = autoint_params.pop('dropout')
+            if 'att_layer_num' in autoint_params and int(autoint_params['att_layer_num']) > 3:
+                print(f"[INFO] AutoInt: capped att_layer_num from {autoint_params['att_layer_num']} to 3.")
+                autoint_params['att_layer_num'] = 3
+            if 'att_head_num' in autoint_params and int(autoint_params['att_head_num']) > 4:
+                print(f"[INFO] AutoInt: capped att_head_num from {autoint_params['att_head_num']} to 4.")
+                autoint_params['att_head_num'] = 4
+            if self.batch_size > 128:
+                print(f"[INFO] AutoInt: capped batch_size from {self.batch_size} to 128.")
+                self.batch_size = 128
             autoint_params.setdefault('l2_reg_dnn', weight_decay)
             autoint_params.setdefault('l2_reg_embedding', weight_decay)
             autoint_params.pop('att_embedding_dim', None)
             self.feature_columns, train_model_input = self._fit_autoint_input(X, feature_names, n_bins=n_bins)
             autoint_params = _filter_supported_kwargs(AutoInt.__init__, autoint_params)
+            effective_model_params = dict(autoint_params)
             self.model = AutoInt(
                 self.feature_columns,
                 self.feature_columns,
@@ -646,6 +735,7 @@ class DeepCTRWrapper(BaseEstimator, ClassifierMixin):
             weight_decay=weight_decay,
             early_stopped=False,
             model_selection_metric="val_auroc",
+            architecture_params=effective_model_params,
         )
         return self
 

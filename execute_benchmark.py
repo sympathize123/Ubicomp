@@ -261,6 +261,7 @@ def train_model(args, X_train, y_train, d_train, X_val, y_val, d_val,
         _n_heads = saint_hparams.pop('n_heads', 4)
         _n_blocks = saint_hparams.pop('n_blocks', 2)
         _dropout = saint_hparams.pop('dropout', 0.1)
+        saint_hparams.pop('batch_size', None)
         model = WidedeepWrapper(model_type='SAINT', input_dim=_input_dim, n_heads=_n_heads,
                                 n_blocks=_n_blocks, dropout=_dropout, mlp_dropout=_dropout,
                                 epochs=epochs, patience=patience, batch_size=batch_size,
@@ -272,6 +273,7 @@ def train_model(args, X_train, y_train, d_train, X_val, y_val, d_val,
         _n_heads = tt_hparams.pop('n_heads', 4)
         _n_blocks = tt_hparams.pop('n_blocks', 2)
         _dropout = tt_hparams.pop('dropout', 0.1)
+        tt_hparams.pop('batch_size', None)
         model = WidedeepWrapper(model_type='TabTransformer', input_dim=_input_dim, n_heads=_n_heads,
                                 n_blocks=_n_blocks, dropout=_dropout,
                                 epochs=epochs, patience=patience, batch_size=batch_size,
@@ -292,6 +294,7 @@ def train_model(args, X_train, y_train, d_train, X_val, y_val, d_val,
         _dnn_hidden_units = dcn_hparams.pop('dnn_hidden_units', (256, 128))
         _dropout = dcn_hparams.pop('hidden_dropout', dcn_hparams.pop('dropout', 0.1))
         weight_decay = dcn_hparams.pop('weight_decay', 0.0)
+        dcn_hparams.pop('batch_size', None)
         dcn_hparams.pop('cross_dropout', None)
         dcn_hparams.pop('layer_size', None)
         dcn_hparams['l2_reg_dnn'] = weight_decay
@@ -303,6 +306,7 @@ def train_model(args, X_train, y_train, d_train, X_val, y_val, d_val,
         _dropout = autoint_hparams.pop('dropout', 0.1)
         # deepctr_torch AutoInt does not support att_embedding_dim in this environment.
         autoint_hparams.pop('att_embedding_dim', None)
+        autoint_hparams.pop('batch_size', None)
         model = DeepCTRWrapper(model_type='AutoInt', dnn_dropout=_dropout,
                                batch_size=batch_size, epochs=epochs, patience=patience, **autoint_hparams)
     elif args.model == 'MLP':
