@@ -646,6 +646,7 @@ class BenchmarkLogger:
             "best_metric_value": info.get("best_metric_value"),
             "epoch_history": info.get("epoch_history", []),
             "phases": info.get("phases"),
+            "architecture_params": info.get("architecture_params"),
         }
         if self._rec["compute_budget"]:
             self._rec["compute_budget"]["selected_batch_size"] = self._rec["training"].get("batch_size")

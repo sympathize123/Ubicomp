@@ -200,6 +200,7 @@ class WidedeepWrapper(BaseEstimator, ClassifierMixin):
         training_params = _drop_optuna_helper_params(self.kwargs)
         train_lr = float(training_params.get("lr", 1e-3))
         train_weight_decay = float(training_params.get("weight_decay", 0.0) or 0.0)
+        effective_model_params = {}
 
         # Convert to DataFrame
         self.col_names = [f"col_{i}" for i in range(X.shape[1])]
@@ -292,6 +293,7 @@ class WidedeepWrapper(BaseEstimator, ClassifierMixin):
                     saint_mod._ubicomp_linear_saint_patch = True
 
             saint_params = _filter_supported_kwargs(SAINT.__init__, saint_params)
+            effective_model_params = dict(saint_params)
             deeptabular = SAINT(
                 column_idx=self.preprocessor.column_idx,
                 continuous_cols=self.col_names,
@@ -315,6 +317,7 @@ class WidedeepWrapper(BaseEstimator, ClassifierMixin):
             if self.efficient_attention:
                 print("[INFO] TabTransformer: use_linear_attention=True (architecture preserved).")
             tt_params = _filter_supported_kwargs(TabTransformer.__init__, tt_params)
+            effective_model_params = dict(tt_params)
             deeptabular = TabTransformer(
                 column_idx=self.preprocessor.column_idx,
                 continuous_cols=self.col_names,
@@ -346,6 +349,28 @@ class WidedeepWrapper(BaseEstimator, ClassifierMixin):
                     print(f"[INFO] FTTransformer: adjusted input_dim from {input_dim} to {adjusted} for n_heads={n_heads}.")
                 ft_params['input_dim'] = adjusted
                 ft_params['n_heads'] = n_heads
+                input_dim = adjusted
+
+            n_features = max(1, len(self.col_names))
+            token_element_budget = 36_000_000
+            max_dim = max(n_heads, token_element_budget // max(1, n_features * max(1, self.batch_size)))
+            max_dim = max(n_heads, (max_dim // n_heads) * n_heads)
+            if input_dim > max_dim:
+                print(
+                    f"[INFO] FTTransformer: capped input_dim from {input_dim} to {max_dim} "
+                    f"for {n_features} features and batch_size={self.batch_size}."
+                )
+                ft_params['input_dim'] = max_dim
+                input_dim = max_dim
+
+            max_batch = max(1, token_element_budget // max(1, n_features * max(1, input_dim)))
+            if self.batch_size > max_batch:
+                adjusted_batch = next((candidate for candidate in (64, 32, 16, 8) if candidate <= max_batch), 8)
+                print(
+                    f"[INFO] FTTransformer: capped batch_size from {self.batch_size} to {adjusted_batch} "
+                    f"for {n_features} features and input_dim={input_dim}."
+                )
+                self.batch_size = adjusted_batch
             if self.efficient_attention:
                 print("[INFO] FTTransformer: enabling kernel linear-attention path in FT encoder blocks.")
                 import pytorch_widedeep.models.tabular.transformers.ft_transformer as ft_mod
@@ -393,6 +418,7 @@ class WidedeepWrapper(BaseEstimator, ClassifierMixin):
                     ft_mod._ubicomp_linear_ft_patch = True
 
             ft_params = _filter_supported_kwargs(FTTransformer.__init__, ft_params)
+            effective_model_params = dict(ft_params)
             deeptabular = FTTransformer(
                 column_idx=self.preprocessor.column_idx,
                 continuous_cols=self.col_names,
@@ -470,6 +496,7 @@ class WidedeepWrapper(BaseEstimator, ClassifierMixin):
             early_stopped=bool(best_epoch is not None and isinstance(best_epoch, int) and best_epoch < self.epochs),
             model_selection_metric="val_BinaryAUROC",
             epoch_history=history,
+            architecture_params=effective_model_params,
         )
         return self
 
@@ -710,7 +737,8 @@ def train_torch_model(model, X_train, y_train, X_val, y_val,
     val_dataset = TensorDataset(torch.tensor(X_val, dtype=torch.float32), torch.tensor(y_val, dtype=torch.long))
     
     pin = torch.cuda.is_available()
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=True, pin_memory=pin, num_workers=4, persistent_workers=True)
+    train_drop_last = len(train_dataset) > batch_size
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=train_drop_last, pin_memory=pin, num_workers=4, persistent_workers=True)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, pin_memory=pin, num_workers=2, persistent_workers=True)
     
     criterion = nn.CrossEntropyLoss()
@@ -773,7 +801,7 @@ def train_torch_model(model, X_train, y_train, X_val, y_val,
             optimizer.step()
             train_loss += loss.item()
             
-        train_loss /= len(train_loader)
+        train_loss /= max(1, len(train_loader))
         
         # Validation
         model.eval()
@@ -793,7 +821,7 @@ def train_torch_model(model, X_train, y_train, X_val, y_val,
                 val_probs.extend(probs.cpu().numpy())
                 val_targets.extend(y_batch.cpu().numpy())
         
-        val_loss /= len(val_loader)
+        val_loss /= max(1, len(val_loader))
         try:
             val_auroc = roc_auc_score(val_targets, val_probs)
         except:

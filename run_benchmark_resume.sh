@@ -4,6 +4,7 @@
 set -euo pipefail
 
 PYTHON_BIN="${PYTHON_BIN:-python3}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 SUMMARY_CSV="${SUMMARY_CSV:-results/benchmark_results_da_hpo.csv}"
 PROGRESS_CSV="${PROGRESS_CSV:-results/benchmark_results_da_hpo_progress.csv}"
 REQUIRED_FOLDS="${REQUIRED_FOLDS:-5}"

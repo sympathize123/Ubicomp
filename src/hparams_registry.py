@@ -187,14 +187,15 @@ def get_hparams(algorithm, dataset, backbone='MLP'):
         hparams['weight_decay'] = lambda trial: trial.suggest_float('weight_decay', 1e-6, 1e-3, log=True)
 
     elif algorithm == 'FTTransformer':
-        hparams['n_blocks'] = lambda trial: trial.suggest_int('n_blocks', 1, 4)
-        hparams['input_dim'] = lambda trial: trial.suggest_int('input_dim', 64, 512, step=8)
+        hparams['n_blocks'] = lambda trial: trial.suggest_int('n_blocks', 1, 3)
+        hparams['input_dim'] = lambda trial: trial.suggest_categorical('input_dim', [16, 32, 64])
         hparams['attn_dropout'] = lambda trial: trial.suggest_float('attn_dropout', 0.0, 0.5)
         hparams['ff_dropout'] = lambda trial: trial.suggest_float('ff_dropout', 0.0, 0.5)
         hparams['residual_dropout'] = lambda trial: _zero_or_uniform(trial, 'residual_dropout', 0.0, 0.2)
         hparams['ff_factor'] = lambda trial: trial.suggest_float('ff_factor', 2.0 / 3.0, 8.0 / 3.0)
         hparams['lr'] = lambda trial: trial.suggest_float('lr', 1e-5, 1e-3, log=True)
         hparams['weight_decay'] = lambda trial: trial.suggest_float('weight_decay', 1e-6, 1e-3, log=True)
+        hparams['batch_size'] = lambda trial: trial.suggest_categorical('batch_size', [16, 32, 64])
 
     elif algorithm == 'DCN':
         def _dcn_hidden_units(trial):

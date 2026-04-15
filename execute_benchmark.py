@@ -1,6 +1,7 @@
 import os
 import argparse
 import json
+import gc
 from typing import Dict, Tuple
 import pandas as pd
 import numpy as np
@@ -19,6 +20,12 @@ from benchmark_logger import BenchmarkLogger, evaluate_extended
 os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'
 
 BASE_DATA_DIR = str((Path(__file__).resolve().parent / 'data').resolve())
+
+
+def release_torch_memory():
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 PROGRESS_COLUMNS = [
     'Dataset', 'Label', 'Model', 'Backbone', 'Seed', 'Fold', 'Phase', 'Trial',
@@ -545,6 +552,7 @@ def main():
                 if args.uda and args.model in DA_MODELS:
                     X_val_eval = entry["X_test"]
                     y_val_eval = entry["y_test"]
+                model = None
                 try:
                     model = train_model(
                         args,
@@ -558,6 +566,9 @@ def main():
                 except Exception as e:
                     print(f"HPO Trial failed on fold {entry['fold_id'] + 1}: {e}")
                     return 0.0
+                finally:
+                    model = None
+                    release_torch_memory()
             return float(np.mean(scores)) if scores else 0.0
 
         import optuna as _optuna
@@ -723,6 +734,8 @@ def main():
                 'Experiment_ID': record['experiment_id'],
             }
             append_row(progress_output_path, progress_row, PROGRESS_COLUMNS)
+            model = None
+            release_torch_memory()
 
     if all_fold_results:
         summary = {

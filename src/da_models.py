@@ -2033,8 +2033,8 @@ def train_shot(model, X_train, y_train, d_train, X_val, y_val, d_val,
     optimizer = torch.optim.SGD(model.feature_extractor.parameters(), lr=lr * lr_decay)
     optimizer = _shot_op_copy(optimizer)
 
-    max_iter = adapt_epochs * len(target_loader)
-    interval_iter = max_iter // interval if interval > 0 else max_iter
+    max_iter = max(1, adapt_epochs * len(target_loader))
+    interval_iter = max(1, max_iter // interval) if interval > 0 else max_iter
     iter_num = 0
 
     import copy

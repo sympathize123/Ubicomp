@@ -10,6 +10,7 @@ Supports:
 """
 
 import argparse
+import gc
 import json
 import os
 import pickle
@@ -33,6 +34,12 @@ BASE_DATA_DIR = str((Path(__file__).resolve().parent / 'data').resolve())
 COMMON_LABELS = ['arousal', 'disturbance', 'valence', 'stress_binary']
 
 DA_MODELS = ['DANN', 'CDAN', 'DAN', 'DeepCORAL', 'MCC', 'ADDA', 'MCD', 'JAN', 'SHOT', 'CBST', 'CGDM']
+
+
+def release_torch_memory():
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 RESULT_COLUMNS = [
     'Setting', 'Label', 'Model', 'Backbone', 'Seed', 'Val_Ratio', 'HPO_Trials',
@@ -375,6 +382,7 @@ def _run_hpo(args, train_dataset_key: str, X_tr, y_tr, d_tr, X_va, y_va, d_va, X
     def objective(trial):
         trial_hparams = _sample_hparams(args, train_dataset_key, trial)
         trial.set_user_attr("resolved_hparams", dict(trial_hparams))
+        model = None
         try:
             model = train_model(
                 args=args,
@@ -397,6 +405,9 @@ def _run_hpo(args, train_dataset_key: str, X_tr, y_tr, d_tr, X_va, y_va, d_va, X
         except Exception as exc:
             print(f'  HPO trial failed: {exc}')
             return 0.0
+        finally:
+            model = None
+            release_torch_memory()
 
     import optuna as _optuna
     _optuna.logging.set_verbosity(_optuna.logging.WARNING)
@@ -479,7 +490,7 @@ def _run_experiment(args, aligned: Dict[str, Dict], common_features: List[str],
     infer = record["inference_benchmark"].get("test", {})
     sustain = record["sustainability"]
 
-    return {
+    result = {
         'Setting':         setting,
         'Label':           label,
         'Model':           args.model,
@@ -552,6 +563,9 @@ def _run_experiment(args, aligned: Dict[str, Dict], common_features: List[str],
         'Hparams_JSON':    json.dumps(best_hparams, default=str),
         'Experiment_ID':   record['experiment_id'],
     }
+    model = None
+    release_torch_memory()
+    return result
 
 
 def _experiment_plan():

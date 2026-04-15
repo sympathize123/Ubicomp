@@ -7,6 +7,7 @@
 set -euo pipefail
 
 PYTHON_BIN="${PYTHON_BIN:-python3}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 RUN_SETTING="${1:-${RUN_SETTING:-all}}"
 HPO_TRIALS="${2:-${HPO_TRIALS:-30}}"
 SEEDS_STR="${SEEDS:-42}"
