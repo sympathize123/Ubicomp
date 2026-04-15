@@ -281,6 +281,7 @@ def train_model(args, X_train, y_train, d_train, X_val, y_val, d_val,
         _input_dim = ft_hparams.pop('input_dim', 192)
         _n_heads = ft_hparams.pop('n_heads', 8)
         _n_blocks = ft_hparams.pop('n_blocks', 2)
+        ft_hparams.pop('batch_size', None)
         model = WidedeepWrapper(model_type='FTTransformer', input_dim=_input_dim, n_heads=_n_heads,
                                 n_blocks=_n_blocks,
                                 epochs=epochs, patience=patience, batch_size=batch_size,
