@@ -1,3 +1,6 @@
+FIXED_BATCH_SIZE = 16
+
+
 def _zero_or_loguniform(trial, name, low, high):
     if trial.suggest_categorical(f"{name}_is_zero", [False, True]):
         return 0.0
@@ -50,7 +53,7 @@ def _add_backbone_hparams(hparams, algorithm, backbone):
 def get_hparams(algorithm, dataset, backbone='MLP'):
     """
     Return a dictionary of Optuna search spaces for a given algorithm/dataset.
-    Batch-size candidates are intentionally left unchanged to avoid VRAM regressions.
+    Batch size is fixed across all models for controlled compute comparisons.
     """
 
     hparams = {}
@@ -58,16 +61,13 @@ def get_hparams(algorithm, dataset, backbone='MLP'):
     if algorithm in ['MLP', 'ResNet']:
         hparams['lr'] = lambda trial: trial.suggest_float('lr', 1e-5, 1e-2, log=True)
         hparams['weight_decay'] = lambda trial: trial.suggest_float('weight_decay', 1e-6, 1e-3, log=True)
-        hparams['batch_size'] = lambda trial: trial.suggest_categorical('batch_size', [32, 64, 128, 256, 512])
+        hparams['batch_size'] = FIXED_BATCH_SIZE
         _add_backbone_hparams(hparams, algorithm, backbone)
 
     elif algorithm in ['ERM_DG', 'IRM', 'VREx', 'GroupDRO', 'MixStyle', 'MLDG', 'MASF', 'Fish', 'CSD', 'SagNet']:
         hparams['lr'] = lambda trial: trial.suggest_float('lr', 3e-5, 3e-4, log=True)
         hparams['weight_decay'] = lambda trial: trial.suggest_float('weight_decay', 1e-6, 1e-2, log=True)
-        if algorithm in ['IRM', 'VREx']:
-            hparams['batch_size'] = lambda trial: trial.suggest_categorical('batch_size', [32, 64])
-        else:
-            hparams['batch_size'] = lambda trial: trial.suggest_categorical('batch_size', [32, 64, 128, 256, 512])
+        hparams['batch_size'] = FIXED_BATCH_SIZE
         hparams['dropout'] = lambda trial: trial.suggest_categorical('dropout', [0.0, 0.1, 0.5])
         _add_backbone_hparams(hparams, algorithm, backbone)
 
@@ -112,7 +112,7 @@ def get_hparams(algorithm, dataset, backbone='MLP'):
     elif algorithm in ['DANN', 'CDAN', 'DAN', 'DeepCORAL', 'MCC', 'ADDA', 'MCD', 'JAN', 'SHOT', 'CBST', 'CGDM']:
         hparams['lr'] = lambda trial: trial.suggest_float('lr', 1e-5, 1e-2, log=True)
         hparams['weight_decay'] = lambda trial: trial.suggest_float('weight_decay', 1e-6, 1e-3, log=True)
-        hparams['batch_size'] = lambda trial: trial.suggest_categorical('batch_size', [32, 64, 128, 256, 512])
+        hparams['batch_size'] = FIXED_BATCH_SIZE
         _add_backbone_hparams(hparams, algorithm, backbone)
 
         if algorithm in ['DANN', 'CDAN', 'ADDA']:
@@ -175,7 +175,7 @@ def get_hparams(algorithm, dataset, backbone='MLP'):
         hparams['lambda_sparse'] = lambda trial: trial.suggest_float('lambda_sparse', 1e-6, 1e-1, log=True)
         hparams['lr'] = lambda trial: trial.suggest_float('lr', 1e-3, 1e-2)
         hparams['weight_decay'] = lambda trial: trial.suggest_float('weight_decay', 1e-6, 1e-3, log=True)
-        hparams['batch_size'] = lambda trial: trial.suggest_categorical('batch_size', [64, 128, 256])
+        hparams['batch_size'] = FIXED_BATCH_SIZE
 
     elif algorithm in ['TabTransformer', 'SAINT']:
         hparams['input_dim'] = lambda trial: trial.suggest_categorical('input_dim', [8, 16, 32])
@@ -185,7 +185,7 @@ def get_hparams(algorithm, dataset, backbone='MLP'):
         hparams['ff_dropout'] = lambda trial: trial.suggest_float('ff_dropout', 0.0, 0.3)
         hparams['lr'] = lambda trial: trial.suggest_float('lr', 1e-4, 1e-3, log=True)
         hparams['weight_decay'] = lambda trial: trial.suggest_float('weight_decay', 1e-6, 1e-3, log=True)
-        hparams['batch_size'] = lambda trial: trial.suggest_categorical('batch_size', [16, 32, 64])
+        hparams['batch_size'] = FIXED_BATCH_SIZE
 
     elif algorithm == 'FTTransformer':
         hparams['n_blocks'] = lambda trial: trial.suggest_int('n_blocks', 1, 3)
@@ -196,7 +196,7 @@ def get_hparams(algorithm, dataset, backbone='MLP'):
         hparams['ff_factor'] = lambda trial: trial.suggest_float('ff_factor', 2.0 / 3.0, 8.0 / 3.0)
         hparams['lr'] = lambda trial: trial.suggest_float('lr', 1e-5, 1e-3, log=True)
         hparams['weight_decay'] = lambda trial: trial.suggest_float('weight_decay', 1e-6, 1e-3, log=True)
-        hparams['batch_size'] = lambda trial: trial.suggest_categorical('batch_size', [16, 32, 64])
+        hparams['batch_size'] = FIXED_BATCH_SIZE
 
     elif algorithm == 'DCN':
         def _dcn_hidden_units(trial):
@@ -210,7 +210,7 @@ def get_hparams(algorithm, dataset, backbone='MLP'):
         hparams['cross_dropout'] = lambda trial: _zero_or_uniform(trial, 'cross_dropout', 0.0, 0.5)
         hparams['lr'] = lambda trial: trial.suggest_float('lr', 1e-5, 1e-2, log=True)
         hparams['weight_decay'] = lambda trial: trial.suggest_float('weight_decay', 1e-6, 1e-3, log=True)
-        hparams['batch_size'] = lambda trial: trial.suggest_categorical('batch_size', [32, 64, 128])
+        hparams['batch_size'] = FIXED_BATCH_SIZE
 
     elif algorithm == 'AutoInt':
         hparams['dropout'] = lambda trial: trial.suggest_float('dropout', 0.0, 0.3)
@@ -219,7 +219,7 @@ def get_hparams(algorithm, dataset, backbone='MLP'):
         hparams['autoint_bins'] = lambda trial: trial.suggest_categorical('autoint_bins', [8, 16])
         hparams['lr'] = lambda trial: trial.suggest_float('lr', 1e-5, 1e-3, log=True)
         hparams['weight_decay'] = lambda trial: trial.suggest_float('weight_decay', 1e-6, 1e-3, log=True)
-        hparams['batch_size'] = lambda trial: trial.suggest_categorical('batch_size', [32, 64, 128])
+        hparams['batch_size'] = FIXED_BATCH_SIZE
 
     elif algorithm == 'XGB':
         hparams['learning_rate'] = lambda trial: trial.suggest_float('learning_rate', 1e-5, 1.0, log=True)

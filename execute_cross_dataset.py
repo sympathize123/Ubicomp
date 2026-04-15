@@ -31,6 +31,7 @@ from src.models import evaluate_model
 from benchmark_logger import BenchmarkLogger, evaluate_extended
 
 BASE_DATA_DIR = str((Path(__file__).resolve().parent / 'data').resolve())
+FIXED_BATCH_SIZE = 16
 COMMON_LABELS = ['arousal', 'disturbance', 'valence', 'stress_binary']
 
 DA_MODELS = ['DANN', 'CDAN', 'DAN', 'DeepCORAL', 'MCC', 'ADDA', 'MCD', 'JAN', 'SHOT', 'CBST', 'CGDM']
@@ -595,7 +596,7 @@ def get_args():
                                  'MixStyle', 'ERM_DG', 'MLDG', 'MASF', 'Fish', 'CSD', 'SagNet'])
     parser.add_argument('--backbone', type=str, default='MLP', choices=['MLP', 'ResNet', 'Transformer'])
     parser.add_argument('--epochs', type=int, default=50)
-    parser.add_argument('--batch_size', type=int, default=64)
+    parser.add_argument('--batch_size', type=int, default=FIXED_BATCH_SIZE)
     parser.add_argument('--lr', type=float, default=1e-3)
     parser.add_argument('--patience', type=int, default=20)
     parser.add_argument('--efficient_attention', action='store_true')
@@ -621,7 +622,9 @@ def get_args():
     parser.add_argument('--max_folds', type=int, default=None)
     parser.add_argument('--epochs_override', type=int, default=None)
 
-    return parser.parse_args()
+    args = parser.parse_args()
+    args.batch_size = FIXED_BATCH_SIZE
+    return args
 
 
 def main():

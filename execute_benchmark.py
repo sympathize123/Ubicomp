@@ -20,6 +20,7 @@ from benchmark_logger import BenchmarkLogger, evaluate_extended
 os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'
 
 BASE_DATA_DIR = str((Path(__file__).resolve().parent / 'data').resolve())
+FIXED_BATCH_SIZE = 16
 
 
 def release_torch_memory():
@@ -174,7 +175,7 @@ def get_args():
     parser.add_argument('--model', type=str, required=True, choices=['XGB', 'LGB', 'MLP', 'ResNet', 'DANN', 'CDAN', 'DAN', 'DeepCORAL', 'MCC', 'ADDA', 'MCD', 'JAN', 'SHOT', 'CBST', 'CGDM', 'TabNet', 'SAINT', 'TabTransformer', 'FTTransformer', 'TFTransformer', 'TF-transformer', 'DCN', 'AutoInt', 'IRM', 'VREx', 'GroupDRO', 'MixStyle', 'ERM_DG', 'MLDG', 'MASF', 'Fish', 'CSD', 'SagNet'])
     parser.add_argument('--backbone', type=str, default='MLP', choices=['MLP', 'ResNet', 'Transformer'])
     parser.add_argument('--epochs', type=int, default=50)
-    parser.add_argument('--batch_size', type=int, default=64)
+    parser.add_argument('--batch_size', type=int, default=FIXED_BATCH_SIZE)
     parser.add_argument('--lr', type=float, default=1e-3)
     parser.add_argument('--seeds', type=int, nargs='+', default=[42])
     parser.add_argument('--output', type=str, default='results/benchmark_results_da_hpo.csv')
@@ -195,7 +196,9 @@ def get_args():
     parser.add_argument('--temporal_train_ratio', type=float, default=0.6)
     parser.add_argument('--temporal_val_ratio', type=float, default=0.2)
     parser.add_argument('--temporal_drop_days', type=int, default=30)
-    return parser.parse_args()
+    args = parser.parse_args()
+    args.batch_size = FIXED_BATCH_SIZE
+    return args
 
 
 def train_model(args, X_train, y_train, d_train, X_val, y_val, d_val,
@@ -211,7 +214,7 @@ def train_model(args, X_train, y_train, d_train, X_val, y_val, d_val,
 
     backbone = hparams.get('backbone', args.backbone)
     lr = hparams.get('lr', args.lr)
-    batch_size = hparams.get('batch_size', args.batch_size)
+    batch_size = FIXED_BATCH_SIZE
     epochs = args.epochs_override if args.epochs_override else args.epochs
     dropout = hparams.get('dropout', 0.3)
     hidden_dim = hparams.get('hidden_dim', 256)

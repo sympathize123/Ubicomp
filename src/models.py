@@ -13,6 +13,8 @@ import copy
 from typing import Dict, Any, Optional
 from tqdm import tqdm
 
+FIXED_BATCH_SIZE = 16
+
 # Imports for new libraries: Moved to inside wrappers for lazy loading and memory safety
 # import pandas as pd # Already imported at top
 # from pytorch_widedeep... 
@@ -133,7 +135,7 @@ class LightGBMWrapper(BaseEstimator, ClassifierMixin):
         return self.model.predict_proba(X)
 
 class TabNetWrapper(BaseEstimator, ClassifierMixin):
-    def __init__(self, batch_size=1024, epochs=50, patience=20, **kwargs):
+    def __init__(self, batch_size=FIXED_BATCH_SIZE, epochs=50, patience=20, **kwargs):
         self.batch_size = batch_size
         self.epochs = epochs
         self.patience = patience
@@ -162,9 +164,7 @@ class TabNetWrapper(BaseEstimator, ClassifierMixin):
         if 'n_steps' in params and int(params['n_steps']) > 6:
             print(f"[INFO] TabNet: capped n_steps from {params['n_steps']} to 6.")
             params['n_steps'] = 6
-        if self.batch_size > 256:
-            print(f"[INFO] TabNet: capped batch_size from {self.batch_size} to 256.")
-            self.batch_size = 256
+        self.batch_size = FIXED_BATCH_SIZE
 
         tabnet_params = _filter_supported_kwargs(TabNetClassifier.__init__, params)
         self.model = TabNetClassifier(verbose=verbose, **tabnet_params)
@@ -193,7 +193,7 @@ class TabNetWrapper(BaseEstimator, ClassifierMixin):
 # --- Wrappers for Advanced Tabular DL ---
 
 class WidedeepWrapper(BaseEstimator, ClassifierMixin):
-    def __init__(self, model_type='SAINT', batch_size=64, epochs=50, patience=20, efficient_attention=False, **kwargs):
+    def __init__(self, model_type='SAINT', batch_size=FIXED_BATCH_SIZE, epochs=50, patience=20, efficient_attention=False, **kwargs):
         self.model_type = model_type
         self.batch_size = batch_size
         self.epochs = epochs
@@ -215,6 +215,7 @@ class WidedeepWrapper(BaseEstimator, ClassifierMixin):
         train_lr = float(training_params.get("lr", 1e-3))
         train_weight_decay = float(training_params.get("weight_decay", 0.0) or 0.0)
         effective_model_params = {}
+        self.batch_size = FIXED_BATCH_SIZE
 
         # Convert to DataFrame
         self.col_names = [f"col_{i}" for i in range(X.shape[1])]
@@ -575,7 +576,7 @@ class WidedeepWrapper(BaseEstimator, ClassifierMixin):
 
 
 class DeepCTRWrapper(BaseEstimator, ClassifierMixin):
-    def __init__(self, model_type='DCN', batch_size=64, epochs=50, patience=20, **kwargs):
+    def __init__(self, model_type='DCN', batch_size=FIXED_BATCH_SIZE, epochs=50, patience=20, **kwargs):
         self.model_type = model_type
         self.batch_size = batch_size
         self.epochs = epochs
@@ -623,6 +624,7 @@ class DeepCTRWrapper(BaseEstimator, ClassifierMixin):
         lr = float(params.pop("lr", 1e-3))
         weight_decay = float(params.pop("weight_decay", 0.0) or 0.0)
         effective_model_params = {}
+        self.batch_size = FIXED_BATCH_SIZE
 
         feature_names = [f"feat_{i}" for i in range(X.shape[1])]
         self.feature_names = feature_names
@@ -653,9 +655,6 @@ class DeepCTRWrapper(BaseEstimator, ClassifierMixin):
             if 'cross_num' in dcn_params and int(dcn_params['cross_num']) > 4:
                 print(f"[INFO] DCN: capped cross_num from {dcn_params['cross_num']} to 4.")
                 dcn_params['cross_num'] = 4
-            if self.batch_size > 128:
-                print(f"[INFO] DCN: capped batch_size from {self.batch_size} to 128.")
-                self.batch_size = 128
             dcn_params.pop('cross_dropout', None)
             dcn_params.pop('layer_size', None)
             dcn_params.pop('n_hidden_layers', None)
@@ -688,9 +687,6 @@ class DeepCTRWrapper(BaseEstimator, ClassifierMixin):
             if 'att_head_num' in autoint_params and int(autoint_params['att_head_num']) > 4:
                 print(f"[INFO] AutoInt: capped att_head_num from {autoint_params['att_head_num']} to 4.")
                 autoint_params['att_head_num'] = 4
-            if self.batch_size > 128:
-                print(f"[INFO] AutoInt: capped batch_size from {self.batch_size} to 128.")
-                self.batch_size = 128
             autoint_params.setdefault('l2_reg_dnn', weight_decay)
             autoint_params.setdefault('l2_reg_embedding', weight_decay)
             autoint_params.pop('att_embedding_dim', None)
@@ -815,11 +811,12 @@ class ResNet(nn.Module):
 
 
 def train_torch_model(model, X_train, y_train, X_val, y_val, 
-                      epochs=50, batch_size=64, lr=1e-3, weight_decay=0.0, patience=5,
+                      epochs=50, batch_size=FIXED_BATCH_SIZE, lr=1e-3, weight_decay=0.0, patience=5,
                       device='cuda' if torch.cuda.is_available() else 'cpu',
                       X_test=None, y_test=None):
     
     model = model.to(device)
+    batch_size = FIXED_BATCH_SIZE
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     
