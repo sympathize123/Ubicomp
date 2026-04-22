@@ -25,7 +25,7 @@ from sklearn.model_selection import StratifiedShuffleSplit
 from sklearn.preprocessing import LabelEncoder
 
 import copy
-from execute_benchmark import train_model
+from execute_benchmark import MODEL_PCA_COMPONENTS, apply_model_pca, get_default_batch_size, train_model
 from src.hparams_registry import get_hparams
 from src.models import evaluate_model
 from benchmark_logger import BenchmarkLogger, evaluate_extended
@@ -407,6 +407,19 @@ def _run_experiment(args, aligned: Dict[str, Dict], common_features: List[str],
     X_tr, y_tr, d_tr, u_tr, X_va, y_va, d_va, u_va, X_te, y_te, u_te, num_domains, clip_val = \
         _build_cross_dataset_splits(aligned, train_datasets, test_dataset, args.seed, args.val_ratio)
 
+    model_pca_components = MODEL_PCA_COMPONENTS.get(args.model)
+    if model_pca_components is not None:
+        split_data = [{
+            "fold_id": 0,
+            "X_train": X_tr,
+            "X_val": X_va,
+            "X_test": X_te,
+        }]
+        apply_model_pca(split_data, args.model, n_components=model_pca_components)
+        X_tr = split_data[0]["X_train"]
+        X_va = split_data[0]["X_val"]
+        X_te = split_data[0]["X_test"]
+
     setting = 'train2_test1' if len(train_datasets) == 2 else 'train1_test1'
     logger = BenchmarkLogger(output_dir=records_dir, benchmark_type="cross_dataset")
     logger.set_setting(
@@ -602,7 +615,8 @@ def get_args():
     parser.add_argument('--epochs_override', type=int, default=None)
 
     args = parser.parse_args()
-    args.batch_size = FIXED_BATCH_SIZE
+    if args.batch_size == FIXED_BATCH_SIZE:
+        args.batch_size = get_default_batch_size(args.model)
     return args
 
 
