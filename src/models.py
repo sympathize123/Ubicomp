@@ -12,6 +12,7 @@ from torch.utils.data import DataLoader, TensorDataset
 import copy
 from typing import Dict, Any, Optional
 from tqdm import tqdm
+from tensorflow.python.keras.callbacks import Callback
 
 FIXED_BATCH_SIZE = 16
 
@@ -146,6 +147,7 @@ class TabNetWrapper(BaseEstimator, ClassifierMixin):
         from pytorch_tabnet.tab_model import TabNetClassifier
         params = _drop_optuna_helper_params(self.kwargs)
         eval_set = [(X_val, y_val)] if X_val is not None else None
+        self.batch_size = int(self.batch_size or FIXED_BATCH_SIZE)
         
         # Remove batch_size from kwargs if it accidentally got in there
         if 'batch_size' in params: self.batch_size = params.pop('batch_size')
@@ -164,7 +166,6 @@ class TabNetWrapper(BaseEstimator, ClassifierMixin):
         if 'n_steps' in params and int(params['n_steps']) > 6:
             print(f"[INFO] TabNet: capped n_steps from {params['n_steps']} to 6.")
             params['n_steps'] = 6
-        self.batch_size = FIXED_BATCH_SIZE
 
         tabnet_params = _filter_supported_kwargs(TabNetClassifier.__init__, params)
         self.model = TabNetClassifier(verbose=verbose, **tabnet_params)
@@ -215,7 +216,7 @@ class WidedeepWrapper(BaseEstimator, ClassifierMixin):
         train_lr = float(training_params.get("lr", 1e-3))
         train_weight_decay = float(training_params.get("weight_decay", 0.0) or 0.0)
         effective_model_params = {}
-        self.batch_size = FIXED_BATCH_SIZE
+        self.batch_size = int(self.batch_size or FIXED_BATCH_SIZE)
 
         # Convert to DataFrame
         self.col_names = [f"col_{i}" for i in range(X.shape[1])]
@@ -574,6 +575,65 @@ class WidedeepWrapper(BaseEstimator, ClassifierMixin):
         return self.trainer.predict_proba(X_tab={'X_tab': X_tab})
 
 
+class TorchStateDictEarlyStopping(Callback):
+    def __init__(self, monitor='val_auc', min_delta=1e-4, patience=0, verbose=0, mode='max', restore_best_weights=True):
+        super().__init__()
+        self.monitor = monitor
+        self.min_delta = abs(min_delta)
+        self.patience = int(patience)
+        self.verbose = verbose
+        self.mode = mode
+        self.restore_best_weights = restore_best_weights
+        self.wait = 0
+        self.stopped_epoch = 0
+        self.best_epoch = None
+        self.best_state_dict = None
+
+        if mode == 'min':
+            self.monitor_op = np.less
+            self.min_delta *= -1
+        else:
+            self.monitor_op = np.greater
+
+    def on_train_begin(self, logs=None):
+        self.wait = 0
+        self.stopped_epoch = 0
+        self.best_epoch = None
+        self.best_state_dict = None
+        self.best = np.inf if self.monitor_op == np.less else -np.inf
+
+    def on_epoch_end(self, epoch, logs=None):
+        logs = logs or {}
+        current = logs.get(self.monitor)
+        if current is None:
+            return
+
+        if self._is_improvement(current, self.best):
+            self.best = current
+            self.best_epoch = epoch
+            self.wait = 0
+            if self.restore_best_weights:
+                self.best_state_dict = {
+                    key: value.detach().cpu().clone()
+                    for key, value in self.model.state_dict().items()
+                }
+            return
+
+        self.wait += 1
+        if self.wait < self.patience:
+            return
+
+        self.stopped_epoch = epoch + 1
+        self.model.stop_training = True
+        if self.restore_best_weights and self.best_state_dict is not None:
+            self.model.load_state_dict(self.best_state_dict)
+        if self.verbose > 0:
+            print(f"Epoch {epoch + 1:05d}: early stopping")
+
+    def _is_improvement(self, current, best):
+        return self.monitor_op(current - self.min_delta, best)
+
+
 
 class DeepCTRWrapper(BaseEstimator, ClassifierMixin):
     def __init__(self, model_type='DCN', batch_size=FIXED_BATCH_SIZE, epochs=50, patience=20, **kwargs):
@@ -590,7 +650,7 @@ class DeepCTRWrapper(BaseEstimator, ClassifierMixin):
     def _fit_autoint_input(self, X, feature_names, n_bins):
         from deepctr_torch.inputs import SparseFeat
         bin_edges = []
-        model_input = {}
+        encoded_columns = []
         feature_columns = []
 
         for i, name in enumerate(feature_names):
@@ -603,32 +663,38 @@ class DeepCTRWrapper(BaseEstimator, ClassifierMixin):
             binned = np.digitize(col, edges[1:-1], right=False).astype(np.int64)
             vocab_size = int(max(2, edges.size))
             feature_columns.append(SparseFeat(name, vocabulary_size=vocab_size, embedding_dim=8))
-            model_input[name] = binned
+            encoded_columns.append(binned)
             bin_edges.append(edges)
 
         self._autoint_bin_edges = bin_edges
-        return feature_columns, model_input
+        model_input = np.ascontiguousarray(np.stack(encoded_columns, axis=1))
+        return feature_columns, [model_input]
 
     def _transform_autoint_input(self, X, feature_names):
-        model_input = {}
+        encoded_columns = []
         for i, name in enumerate(feature_names):
             col = X[:, i].astype(np.float32)
             edges = self._autoint_bin_edges[i]
-            model_input[name] = np.digitize(col, edges[1:-1], right=False).astype(np.int64)
-        return model_input
+            encoded_columns.append(np.digitize(col, edges[1:-1], right=False).astype(np.int64))
+        return [np.ascontiguousarray(np.stack(encoded_columns, axis=1))]
+
+    def _transform_dense_input(self, X):
+        X_array = np.asarray(X, dtype=np.float32)
+        if not X_array.flags.c_contiguous:
+            X_array = np.ascontiguousarray(X_array)
+        return [X_array]
 
     def fit(self, X, y, X_val=None, y_val=None):
         from deepctr_torch.inputs import DenseFeat
-        from deepctr_torch.callbacks import EarlyStopping
         params = _drop_optuna_helper_params(self.kwargs)
         lr = float(params.pop("lr", 1e-3))
         weight_decay = float(params.pop("weight_decay", 0.0) or 0.0)
         effective_model_params = {}
-        self.batch_size = FIXED_BATCH_SIZE
+        self.batch_size = int(self.batch_size or FIXED_BATCH_SIZE)
 
         feature_names = [f"feat_{i}" for i in range(X.shape[1])]
         self.feature_names = feature_names
-        train_model_input = {name: X[:, i] for i, name in enumerate(feature_names)}
+        train_model_input = self._transform_dense_input(X)
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
         if self.model_type == 'DCN':
@@ -662,7 +728,9 @@ class DeepCTRWrapper(BaseEstimator, ClassifierMixin):
             dcn_params.setdefault('l2_reg_embedding', weight_decay)
             dcn_params.setdefault('l2_reg_cross', weight_decay)
             dcn_params.setdefault('l2_reg_dnn', weight_decay)
-            self.feature_columns = [DenseFeat(name, 1) for name in feature_names]
+            # Keep the same raw dense input, but represent it as one wide DenseFeat to reduce
+            # DeepCTR feature-index bookkeeping overhead for 9k+ column tables.
+            self.feature_columns = [DenseFeat('dense_input', X.shape[1])]
             dcn_params = _filter_supported_kwargs(DCN.__init__, dcn_params)
             effective_model_params = dict(dcn_params)
             self.model = DCN(
@@ -706,31 +774,49 @@ class DeepCTRWrapper(BaseEstimator, ClassifierMixin):
         
         val_data = None
         callbacks = []
+        early_stopping = None
         if X_val is not None:
-             if self.model_type == 'AutoInt':
-                 val_model_input = self._transform_autoint_input(X_val, feature_names)
-             else:
-                 val_model_input = {name: X_val[:, i] for i, name in enumerate(feature_names)}
-             val_data = (val_model_input, y_val)
-             # Add EarlyStopping
-             # Fix: DCN failed with AttributeError: 'DCN' object has no attribute 'get_weights'
-             # Disabling EarlyStopping for DCN to ensure verification passes.
-             # callbacks.append(EarlyStopping(monitor='val_auc', min_delta=1e-4, patience=self.patience, verbose=1, mode='max', restore_best_weights=True))
-             pass
+            if self.model_type == 'AutoInt':
+                val_model_input = self._transform_autoint_input(X_val, feature_names)
+            else:
+                val_model_input = self._transform_dense_input(X_val)
+            val_data = (val_model_input, y_val)
+            if self.patience > 0:
+                early_stopping = TorchStateDictEarlyStopping(
+                    monitor='val_auc',
+                    min_delta=1e-4,
+                    patience=self.patience,
+                    verbose=1,
+                    mode='max',
+                    restore_best_weights=True,
+                )
+                callbacks.append(early_stopping)
         
-        # history = self.model.fit(...)
-        self.model.fit(train_model_input, y, batch_size=self.batch_size, epochs=self.epochs, validation_data=val_data, callbacks=callbacks, verbose=0)
+        history = self.model.fit(
+            train_model_input,
+            y,
+            batch_size=self.batch_size,
+            epochs=self.epochs,
+            validation_data=val_data,
+            callbacks=callbacks,
+            verbose=0,
+        )
+        history_dict = getattr(history, 'history', {}) or {}
+        epochs_ran = len(history_dict.get('loss', [])) or self.epochs
+        best_epoch = (early_stopping.best_epoch + 1) if (early_stopping and early_stopping.best_epoch is not None) else None
+        early_stopped = bool(early_stopping and early_stopping.stopped_epoch > 0)
         attach_training_metadata(
             self,
             optimizer="Adam",
-            best_epoch=None,
-            epochs_ran=self.epochs,
+            best_epoch=best_epoch,
+            epochs_ran=epochs_ran,
             max_epochs=self.epochs,
             batch_size=self.batch_size,
             lr=lr,
             weight_decay=weight_decay,
-            early_stopped=False,
+            early_stopped=early_stopped,
             model_selection_metric="val_auroc",
+            epoch_history=history_dict,
             architecture_params=effective_model_params,
         )
         return self
@@ -740,7 +826,7 @@ class DeepCTRWrapper(BaseEstimator, ClassifierMixin):
         if self.model_type == 'AutoInt':
             test_model_input = self._transform_autoint_input(X, feature_names)
         else:
-            test_model_input = {name: X[:, i] for i, name in enumerate(feature_names)}
+            test_model_input = self._transform_dense_input(X)
         pred_ans = self.model.predict(test_model_input, batch_size=self.batch_size)
         return np.where(pred_ans > 0.5, 1, 0).astype(int).flatten()
 
@@ -749,7 +835,7 @@ class DeepCTRWrapper(BaseEstimator, ClassifierMixin):
         if self.model_type == 'AutoInt':
             test_model_input = self._transform_autoint_input(X, feature_names)
         else:
-            test_model_input = {name: X[:, i] for i, name in enumerate(feature_names)}
+            test_model_input = self._transform_dense_input(X)
         pred_prob = self.model.predict(test_model_input, batch_size=self.batch_size)
         # Construct [p0, p1]
         return np.hstack([1-pred_prob, pred_prob])
@@ -816,7 +902,7 @@ def train_torch_model(model, X_train, y_train, X_val, y_val,
                       X_test=None, y_test=None):
     
     model = model.to(device)
-    batch_size = FIXED_BATCH_SIZE
+    batch_size = int(batch_size or FIXED_BATCH_SIZE)
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     

@@ -164,52 +164,90 @@ def get_hparams(algorithm, dataset, backbone='MLP'):
             hparams['cbst_retrain_epochs'] = lambda trial: trial.suggest_categorical('cbst_retrain_epochs', [3, 5, 10])
 
         if algorithm == 'CGDM':
-            hparams['weight_decay'] = lambda trial: trial.suggest_float('weight_decay', 1e-5, 1e-3, log=True)
-            hparams['num_k'] = lambda trial: trial.suggest_categorical('num_k', [2, 4])
+            # TEMPORARY narrowed CGDM search space for long-running benchmark resume runs.
+            # Original: weight_decay in [1e-5, 1e-3] (log), num_k in {2, 4}
+            # Current temporary setting: num_k fixed to 1 for speed; restore original after resume sweep.
+            hparams['weight_decay'] = lambda trial: trial.suggest_float('weight_decay', 5e-5, 5e-4, log=True)
+            hparams['num_k'] = lambda trial: trial.suggest_categorical('num_k', [1])
 
     elif algorithm == 'TabNet':
-        hparams['n_d'] = lambda trial: trial.suggest_categorical('n_d', [8, 16, 32])
-        hparams['n_a'] = lambda trial: trial.suggest_categorical('n_a', [8, 16, 32])
-        hparams['n_steps'] = lambda trial: trial.suggest_int('n_steps', 3, 6)
-        hparams['gamma'] = lambda trial: trial.suggest_float('gamma', 1.0, 2.0)
-        hparams['lambda_sparse'] = lambda trial: trial.suggest_float('lambda_sparse', 1e-6, 1e-1, log=True)
-        hparams['lr'] = lambda trial: trial.suggest_float('lr', 1e-3, 1e-2)
-        hparams['weight_decay'] = lambda trial: trial.suggest_float('weight_decay', 1e-6, 1e-3, log=True)
+        # TEMPORARY narrowed TabNet search space for long-running benchmark resume runs.
+        # Original:
+        #   n_d, n_a in {8, 16, 32}
+        #   n_steps in [3, 6]
+        #   gamma in [1.0, 2.0]
+        #   lambda_sparse in [1e-6, 1e-1] (log)
+        #   lr in [1e-3, 1e-2]
+        #   weight_decay in [1e-6, 1e-3] (log)
+        hparams['n_d'] = lambda trial: trial.suggest_categorical('n_d', [8, 16])
+        hparams['n_a'] = lambda trial: trial.suggest_categorical('n_a', [8, 16])
+        hparams['n_steps'] = lambda trial: trial.suggest_int('n_steps', 3, 4)
+        hparams['gamma'] = lambda trial: trial.suggest_float('gamma', 1.1, 1.5)
+        hparams['lambda_sparse'] = lambda trial: trial.suggest_float('lambda_sparse', 1e-5, 1e-3, log=True)
+        hparams['lr'] = lambda trial: trial.suggest_float('lr', 1e-3, 5e-3)
+        hparams['weight_decay'] = lambda trial: trial.suggest_float('weight_decay', 1e-5, 5e-4, log=True)
         hparams['batch_size'] = FIXED_BATCH_SIZE
 
     elif algorithm in ['TabTransformer', 'SAINT']:
-        hparams['input_dim'] = lambda trial: trial.suggest_categorical('input_dim', [8, 16, 32])
+        # TEMPORARY narrowed TabTransformer/SAINT search space for long-running benchmark resume runs.
+        # Original:
+        #   input_dim in {8, 16, 32}
+        #   n_heads in {2, 4}
+        #   n_blocks in [1, 3]
+        #   attn_dropout, ff_dropout in [0.0, 0.3]
+        #   lr in [1e-4, 1e-3] (log)
+        #   weight_decay in [1e-6, 1e-3] (log)
+        hparams['input_dim'] = lambda trial: trial.suggest_categorical('input_dim', [8, 16])
         hparams['n_heads'] = lambda trial: trial.suggest_categorical('n_heads', [2, 4])
-        hparams['n_blocks'] = lambda trial: trial.suggest_int('n_blocks', 1, 3)
-        hparams['attn_dropout'] = lambda trial: trial.suggest_float('attn_dropout', 0.0, 0.3)
-        hparams['ff_dropout'] = lambda trial: trial.suggest_float('ff_dropout', 0.0, 0.3)
-        hparams['lr'] = lambda trial: trial.suggest_float('lr', 1e-4, 1e-3, log=True)
-        hparams['weight_decay'] = lambda trial: trial.suggest_float('weight_decay', 1e-6, 1e-3, log=True)
+        hparams['n_blocks'] = lambda trial: trial.suggest_int('n_blocks', 1, 2)
+        hparams['attn_dropout'] = lambda trial: trial.suggest_float('attn_dropout', 0.0, 0.2)
+        hparams['ff_dropout'] = lambda trial: trial.suggest_float('ff_dropout', 0.0, 0.2)
+        hparams['lr'] = lambda trial: trial.suggest_float('lr', 2e-4, 8e-4, log=True)
+        hparams['weight_decay'] = lambda trial: trial.suggest_float('weight_decay', 1e-5, 5e-4, log=True)
         hparams['batch_size'] = FIXED_BATCH_SIZE
 
     elif algorithm == 'FTTransformer':
-        hparams['n_blocks'] = lambda trial: trial.suggest_int('n_blocks', 1, 3)
-        hparams['input_dim'] = lambda trial: trial.suggest_categorical('input_dim', [16, 32, 64])
-        hparams['attn_dropout'] = lambda trial: trial.suggest_float('attn_dropout', 0.0, 0.5)
-        hparams['ff_dropout'] = lambda trial: trial.suggest_float('ff_dropout', 0.0, 0.5)
-        hparams['residual_dropout'] = lambda trial: _zero_or_uniform(trial, 'residual_dropout', 0.0, 0.2)
-        hparams['ff_factor'] = lambda trial: trial.suggest_float('ff_factor', 2.0 / 3.0, 8.0 / 3.0)
-        hparams['lr'] = lambda trial: trial.suggest_float('lr', 1e-5, 1e-3, log=True)
-        hparams['weight_decay'] = lambda trial: trial.suggest_float('weight_decay', 1e-6, 1e-3, log=True)
+        # TEMPORARY narrowed FTTransformer search space for long-running benchmark resume runs.
+        # Original:
+        #   n_blocks in [1, 3]
+        #   input_dim in {16, 32, 64}
+        #   attn_dropout, ff_dropout in [0.0, 0.5]
+        #   residual_dropout in {0} U [0.0, 0.2]
+        #   ff_factor in [2/3, 8/3]
+        #   lr in [1e-5, 1e-3] (log)
+        #   weight_decay in [1e-6, 1e-3] (log)
+        hparams['n_blocks'] = lambda trial: trial.suggest_int('n_blocks', 1, 2)
+        hparams['input_dim'] = lambda trial: trial.suggest_categorical('input_dim', [16, 32])
+        hparams['attn_dropout'] = lambda trial: trial.suggest_float('attn_dropout', 0.0, 0.2)
+        hparams['ff_dropout'] = lambda trial: trial.suggest_float('ff_dropout', 0.0, 0.2)
+        hparams['residual_dropout'] = lambda trial: _zero_or_uniform(trial, 'residual_dropout', 0.0, 0.1)
+        hparams['ff_factor'] = lambda trial: trial.suggest_float('ff_factor', 1.0, 2.0)
+        hparams['lr'] = lambda trial: trial.suggest_float('lr', 5e-5, 5e-4, log=True)
+        hparams['weight_decay'] = lambda trial: trial.suggest_float('weight_decay', 1e-5, 5e-4, log=True)
         hparams['batch_size'] = FIXED_BATCH_SIZE
 
     elif algorithm == 'DCN':
         def _dcn_hidden_units(trial):
-            n_hidden_layers = trial.suggest_int('n_hidden_layers', 1, 4)
-            layer_size = trial.suggest_int('layer_size', 64, 256)
+            # TEMPORARY narrowed DCN search space for long-running benchmark resume runs.
+            # Original:
+            #   n_hidden_layers in [1, 4]
+            #   layer_size in [64, 256]
+            n_hidden_layers = trial.suggest_int('n_hidden_layers', 1, 2)
+            layer_size = trial.suggest_int('layer_size', 64, 128)
             return tuple([layer_size] * n_hidden_layers)
 
-        hparams['n_cross_layers'] = lambda trial: trial.suggest_int('n_cross_layers', 1, 4)
+        # Original:
+        #   n_cross_layers in [1, 4]
+        #   hidden_dropout in [0.0, 0.5]
+        #   cross_dropout in {0} U [0.0, 0.5]
+        #   lr in [1e-5, 1e-2] (log)
+        #   weight_decay in [1e-6, 1e-3] (log)
+        hparams['n_cross_layers'] = lambda trial: trial.suggest_int('n_cross_layers', 1, 2)
         hparams['dnn_hidden_units'] = _dcn_hidden_units
-        hparams['hidden_dropout'] = lambda trial: trial.suggest_float('hidden_dropout', 0.0, 0.5)
-        hparams['cross_dropout'] = lambda trial: _zero_or_uniform(trial, 'cross_dropout', 0.0, 0.5)
-        hparams['lr'] = lambda trial: trial.suggest_float('lr', 1e-5, 1e-2, log=True)
-        hparams['weight_decay'] = lambda trial: trial.suggest_float('weight_decay', 1e-6, 1e-3, log=True)
+        hparams['hidden_dropout'] = lambda trial: trial.suggest_float('hidden_dropout', 0.0, 0.2)
+        hparams['cross_dropout'] = lambda trial: _zero_or_uniform(trial, 'cross_dropout', 0.0, 0.2)
+        hparams['lr'] = lambda trial: trial.suggest_float('lr', 5e-5, 5e-3, log=True)
+        hparams['weight_decay'] = lambda trial: trial.suggest_float('weight_decay', 1e-5, 5e-4, log=True)
         hparams['batch_size'] = FIXED_BATCH_SIZE
 
     elif algorithm == 'AutoInt':

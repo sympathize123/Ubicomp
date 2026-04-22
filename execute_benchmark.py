@@ -8,6 +8,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from pathlib import Path
+from sklearn.decomposition import PCA
 from src.data_loader import BenchmarkDataset
 from src.models import XGBoostWrapper, LightGBMWrapper, MLP, ResNet, TabNetWrapper, WidedeepWrapper, DeepCTRWrapper, train_torch_model, evaluate_model, attach_training_metadata
 from src.da_models import DANN, CDAN, DAN, DeepCORAL, MCC, ADDA, MCD, JAN, SHOT, CBST, CGDM, MCDInferenceWrapper, train_mcd, train_dann, train_cdan, train_adda, train_jan, train_shot, train_cbst, train_deepcoral, train_mcc, train_dan, train_cgdm
@@ -21,12 +22,54 @@ os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'
 
 BASE_DATA_DIR = str((Path(__file__).resolve().parent / 'data').resolve())
 FIXED_BATCH_SIZE = 16
+MODEL_PCA_COMPONENTS = {
+    'TabNet': 512,
+    'SAINT': 512,
+    'TabTransformer': 512,
+    'FTTransformer': 512,
+    'DCN': 512,
+    'CGDM': 512,
+}
+MODEL_DEFAULT_BATCH_SIZES = {
+    'TabNet': 128,
+    'DCN': 128,
+    'AutoInt': 128,
+    'MLP': 128,
+    'ResNet': 128,
+    'CGDM': 32,
+}
 
 
 def release_torch_memory():
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+
+
+def get_default_batch_size(model_name: str) -> int:
+    return MODEL_DEFAULT_BATCH_SIZES.get(model_name, FIXED_BATCH_SIZE)
+
+
+def apply_model_pca(fold_data, model_name: str, n_components: int, random_state: int = 42):
+    print(f"[INFO] {model_name} PCA: fitting per-fold randomized PCA with up to {n_components} components.")
+    for entry in fold_data:
+        X_train = np.asarray(entry["X_train"], dtype=np.float32)
+        input_dim = int(X_train.shape[1])
+        target_dim = int(min(n_components, X_train.shape[0], input_dim))
+
+        if target_dim >= input_dim:
+            print(f"[INFO] {model_name} PCA skipped on fold {entry['fold_id'] + 1}: input_dim={input_dim}.")
+            continue
+
+        pca = PCA(n_components=target_dim, svd_solver='randomized', random_state=random_state)
+        entry["X_train"] = pca.fit_transform(X_train).astype(np.float32, copy=False)
+        entry["X_val"] = pca.transform(np.asarray(entry["X_val"], dtype=np.float32)).astype(np.float32, copy=False)
+        entry["X_test"] = pca.transform(np.asarray(entry["X_test"], dtype=np.float32)).astype(np.float32, copy=False)
+        explained = float(np.sum(getattr(pca, "explained_variance_ratio_", [])))
+        print(
+            f"[INFO] {model_name} PCA fold {entry['fold_id'] + 1}: "
+            f"{input_dim} -> {target_dim} dims, explained_variance={explained:.4f}"
+        )
 
 PROGRESS_COLUMNS = [
     'Dataset', 'Label', 'Model', 'Backbone', 'Seed', 'Fold', 'Phase', 'Trial',
@@ -197,7 +240,8 @@ def get_args():
     parser.add_argument('--temporal_val_ratio', type=float, default=0.2)
     parser.add_argument('--temporal_drop_days', type=int, default=30)
     args = parser.parse_args()
-    args.batch_size = FIXED_BATCH_SIZE
+    if args.batch_size == FIXED_BATCH_SIZE:
+        args.batch_size = get_default_batch_size(args.model)
     return args
 
 
@@ -214,7 +258,7 @@ def train_model(args, X_train, y_train, d_train, X_val, y_val, d_val,
 
     backbone = hparams.get('backbone', args.backbone)
     lr = hparams.get('lr', args.lr)
-    batch_size = FIXED_BATCH_SIZE
+    batch_size = args.batch_size
     epochs = args.epochs_override if args.epochs_override else args.epochs
     dropout = hparams.get('dropout', 0.3)
     hidden_dim = hparams.get('hidden_dim', 256)
@@ -408,13 +452,16 @@ def train_model(args, X_train, y_train, d_train, X_val, y_val, d_val,
                            epochs=epochs, batch_size=batch_size, lr=lr,
                            patience=patience,
                            weight_decay=hparams.get('weight_decay', 5e-4),
-                           num_k=hparams.get('num_k', 4))
+                           num_k=hparams.get('num_k', 1))
 
     if args.model in ['XGB', 'LGB', 'TabNet', 'SAINT', 'TabTransformer', 'FTTransformer', 'DCN', 'AutoInt']:
         model.fit(X_train, y_train, X_val, y_val)
     elif args.model in ['IRM', 'VREx', 'GroupDRO', 'MixStyle', 'MLDG', 'MASF', 'Fish', 'CSD', 'SagNet']:
         model = train_dg_model(model, X_train, y_train, d_train, X_val, y_val, d_val,
                                epochs=epochs, batch_size=batch_size, domains_per_batch=8, patience=patience)
+
+    logged_hparams = dict(hparams)
+    logged_hparams['batch_size'] = batch_size
 
     attach_training_metadata(
         model,
@@ -427,7 +474,7 @@ def train_model(args, X_train, y_train, d_train, X_val, y_val, d_val,
         patience=patience,
         backbone=backbone,
         model_name=args.model,
-        hparams=dict(hparams),
+        hparams=logged_hparams,
         early_stopping_enabled=bool(patience and patience > 0),
     )
     return model
@@ -521,6 +568,10 @@ def main():
             "X_test": ds.X[test_idx],
             "y_test": ds.y[test_idx],
         })
+
+    model_pca_components = MODEL_PCA_COMPONENTS.get(args.model)
+    if model_pca_components is not None:
+        apply_model_pca(fold_data, args.model, n_components=model_pca_components)
 
     DG_MODELS = ['DANN', 'CDAN', 'DAN', 'DeepCORAL', 'MCC', 'CGDM', 'IRM', 'VREx', 'GroupDRO', 'MixStyle', 'ERM_DG', 'MLDG', 'MASF', 'ADDA', 'MCD', 'JAN', 'SHOT', 'CBST', 'Fish', 'CSD', 'SagNet']
     DA_MODELS = ['DANN', 'CDAN', 'DAN', 'DeepCORAL', 'MCC', 'ADDA', 'MCD', 'JAN', 'SHOT', 'CBST', 'CGDM']
