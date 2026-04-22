@@ -269,34 +269,23 @@ def _select_common_features(bundles: Dict[str, Dict], common_features: List[str]
     return out
 
 
-def _clip_by_train(X_train: np.ndarray, X_val: np.ndarray, X_test: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Clip outliers using the 99.9th percentile of absolute train values."""
-    clip = float(np.percentile(np.abs(X_train.reshape(-1)), 99.9))
-    clip = max(10.0, clip)
-    return (
-        np.clip(X_train, -clip, clip).astype(np.float32),
-        np.clip(X_val,   -clip, clip).astype(np.float32),
-        np.clip(X_test,  -clip, clip).astype(np.float32),
-        clip,
-    )
+def _standardize_by_train(X_train: np.ndarray, X_val: np.ndarray, X_test: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+    mean = np.mean(X_train, axis=0)
+    std = np.std(X_train, axis=0)
+    std[std < 1e-6] = 1.0
 
+    X_train_n = (X_train - mean) / std
+    X_val_n = (X_val - mean) / std
+    X_test_n = (X_test - mean) / std
 
-def _normalize_per_user(X: np.ndarray, users: np.ndarray, train_mask: np.ndarray) -> np.ndarray:
-    """Per-user z-score normalization: compute mean/std from each user's train samples,
-    apply to all of that user's samples."""
-    X_out = X.copy()
-    for user in np.unique(users):
-        u_mask = users == user
-        u_train_mask = u_mask & train_mask
-        if u_train_mask.any():
-            mean = X[u_train_mask].mean(axis=0)
-            std = X[u_train_mask].std(axis=0)
-        else:
-            mean = X[u_mask].mean(axis=0)
-            std = X[u_mask].std(axis=0)
-        std[std < 1e-6] = 1.0
-        X_out[u_mask] = (X[u_mask] - mean) / std
-    return X_out.astype(np.float32)
+    # Robust clipping by train stats only
+    clip = np.percentile(np.abs(X_train_n.reshape(-1)), 99.9)
+    clip = max(10.0, float(clip))
+
+    X_train_n = np.clip(X_train_n, -clip, clip).astype(np.float32)
+    X_val_n = np.clip(X_val_n, -clip, clip).astype(np.float32)
+    X_test_n = np.clip(X_test_n, -clip, clip).astype(np.float32)
+    return X_train_n, X_val_n, X_test_n, clip
 
 
 def _make_stratified_split(y: np.ndarray, seed: int, val_ratio: float) -> Tuple[np.ndarray, np.ndarray]:
@@ -319,7 +308,6 @@ def _build_cross_dataset_splits(aligned: Dict[str, Dict], train_datasets: List[s
     for ds in train_datasets:
         X_train_parts.append(aligned[ds]['X'])
         y_train_parts.append(aligned[ds]['y'])
-        # Prefix user IDs with dataset name to avoid collisions across datasets
         users = aligned[ds]['users']
         u_train_parts.append(np.array([f'{ds}:{u}' for u in users], dtype=object))
         groups = np.array([f'{ds}:{u}' for u in users], dtype=object)
@@ -330,30 +318,21 @@ def _build_cross_dataset_splits(aligned: Dict[str, Dict], train_datasets: List[s
     u_src = np.concatenate(u_train_parts, axis=0)
     g_src = np.concatenate(g_train_parts, axis=0)
 
-    # Per-user normalization on source data (train mask covers all source samples for initial norm,
-    # then val split is carved out; users entirely in val use their own mean/std)
     tr_idx, va_idx = _make_stratified_split(y_src, seed=seed, val_ratio=val_ratio)
-    train_mask_src = np.zeros(len(y_src), dtype=bool)
-    train_mask_src[tr_idx] = True
 
-    X_src = _normalize_per_user(X_src, u_src, train_mask_src)
-
-    # Per-user normalization on test dataset (no train samples — uses own stats)
+    X_tr_raw = X_src[tr_idx]
+    X_va_raw = X_src[va_idx]
     X_te_raw = aligned[test_dataset]['X']
-    y_te = aligned[test_dataset]['y']
-    u_te = np.array([f'{test_dataset}:{u}' for u in aligned[test_dataset]['users']], dtype=object)
-    train_mask_te = np.zeros(len(u_te), dtype=bool)  # all False: test users normalize by themselves
-    X_te = _normalize_per_user(X_te_raw, u_te, train_mask_te)
 
-    X_tr = X_src[tr_idx]
+    X_tr, X_va, X_te, clip_val = _standardize_by_train(X_tr_raw, X_va_raw, X_te_raw)
+
     y_tr = y_src[tr_idx]
     g_tr = g_src[tr_idx]
-
-    X_va = X_src[va_idx]
     y_va = y_src[va_idx]
     g_va = g_src[va_idx]
+    y_te = aligned[test_dataset]['y']
 
-    X_tr, X_va, X_te, clip_val = _clip_by_train(X_tr, X_va, X_te)
+    u_te = np.array([f'{test_dataset}:{u}' for u in aligned[test_dataset]['users']], dtype=object)
 
     le = LabelEncoder()
     le.fit(g_src)
