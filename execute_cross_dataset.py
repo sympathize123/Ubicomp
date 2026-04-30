@@ -16,7 +16,7 @@ import os
 import pickle
 import warnings
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -25,16 +25,56 @@ from sklearn.model_selection import StratifiedShuffleSplit
 from sklearn.preprocessing import LabelEncoder
 
 import copy
-from execute_benchmark import MODEL_PCA_COMPONENTS, apply_model_pca, get_default_batch_size, train_model
+from execute_benchmark import (
+    MODEL_PCA_COMPONENTS,
+    apply_model_pca,
+    get_default_batch_size as get_within_dataset_default_batch_size,
+    train_model,
+)
 from src.hparams_registry import get_hparams
 from src.models import evaluate_model
 from benchmark_logger import BenchmarkLogger, evaluate_extended
 
 BASE_DATA_DIR = str((Path(__file__).resolve().parent / 'data').resolve())
-FIXED_BATCH_SIZE = 16
+FIXED_BATCH_SIZE = 512
 COMMON_LABELS = ['arousal', 'disturbance', 'valence', 'stress_binary']
-
+DG_MODELS = ['IRM', 'VREx', 'GroupDRO', 'MixStyle', 'ERM_DG', 'MLDG', 'MASF', 'Fish', 'CSD', 'SagNet']
 DA_MODELS = ['DANN', 'CDAN', 'DAN', 'DeepCORAL', 'MCC', 'ADDA', 'MCD', 'JAN', 'SHOT', 'CBST', 'CGDM']
+CROSS_DATASET_MODEL_DEFAULT_BATCH_SIZES = {
+    'IRM': 256,
+    'VREx': 512,
+    'GroupDRO': 512,
+    'MixStyle': 512,
+    'ERM_DG': 512,
+    'MLDG': 1024,
+    'MASF': 512,
+    'Fish': 1024,
+    'CSD': 512,
+    'SagNet': 512,
+    'DANN': 256,
+    'CDAN': 512,
+    'DAN': 256,
+    'DeepCORAL': 1024,
+    'MCC': 512,
+    'ADDA': 256,
+    'MCD': 256,
+    'JAN': 256,
+    'SHOT': 512,
+    'CBST': 512,
+    'CGDM': 512,
+    'TabNet': 1024,
+    'SAINT': 256,
+    'TabTransformer': 256,
+    'FTTransformer': 256,
+    'DCN': 256,
+}
+
+
+def get_default_batch_size(model_name: str) -> int:
+    return CROSS_DATASET_MODEL_DEFAULT_BATCH_SIZES.get(
+        model_name,
+        get_within_dataset_default_batch_size(model_name),
+    )
 
 
 def release_torch_memory():
@@ -101,6 +141,123 @@ def build_summary_rows(rows: List[Dict]) -> List[Dict]:
             row[f'{col}_Std'] = round(float(values.std(ddof=0)), 6) if not values.empty else None
         summary_rows.append(row)
     return summary_rows
+
+
+def _plan_key(train_datasets: List[str], test_dataset: str, seed: int) -> Tuple[str, str, int]:
+    return '+'.join(train_datasets), test_dataset, int(seed)
+
+
+def _record_prefix(model: str, label: str, train_datasets: List[str], test_dataset: str, seed: int) -> str:
+    trains = "_".join(train_datasets)
+    return f"{model}_{label}_{trains}_test{test_dataset}_seed{seed}_"
+
+
+def _find_existing_record(
+    records_dir: str,
+    model: str,
+    label: str,
+    train_datasets: List[str],
+    test_dataset: str,
+    seed: int,
+) -> Optional[Path]:
+    prefix = _record_prefix(model, label, train_datasets, test_dataset, seed)
+    matches = sorted(Path(records_dir).glob(f"{prefix}*.json"))
+    return matches[0] if matches else None
+
+
+def _row_from_record_path(record_path: Path) -> Dict:
+    with open(record_path, 'r') as f:
+        record = json.load(f)
+
+    setting = record.get('setting', {})
+    metrics = record.get('metrics', {})
+    train_m = metrics.get('train', {})
+    val_m = metrics.get('val', {})
+    test_m = metrics.get('test', {})
+    training = record.get('training', {})
+    runtime = record.get('runtime', {})
+    hardware = record.get('hardware', {})
+    budget = record.get('compute_budget', {})
+    model_stats = record.get('model_stats', {})
+    infer = record.get('inference_benchmark', {}).get('test', {})
+    sustainability = record.get('sustainability', {})
+    split_stats = record.get('split_stats', {})
+    hpo = record.get('hpo', {})
+    best_hparams = hpo.get('best_params', {})
+
+    return {
+        'Setting':         setting.get('setting_type'),
+        'Label':           setting.get('label'),
+        'Model':           setting.get('model'),
+        'Backbone':        setting.get('backbone'),
+        'Seed':            setting.get('seed'),
+        'Val_Ratio':       setting.get('val_ratio'),
+        'HPO_Trials':      setting.get('hpo_trials'),
+        'Train_Datasets':  '+'.join(setting.get('train_datasets', [])),
+        'Test_Dataset':    setting.get('test_dataset'),
+        'Common_Features': setting.get('n_common_features'),
+        'Train_Samples':   split_stats.get('train', {}).get('n_samples'),
+        'Val_Samples':     split_stats.get('val', {}).get('n_samples'),
+        'Test_Samples':    split_stats.get('test', {}).get('n_samples'),
+        'Train_Users':     split_stats.get('train', {}).get('n_users'),
+        'Val_Users':       split_stats.get('val', {}).get('n_users'),
+        'Test_Users':      split_stats.get('test', {}).get('n_users'),
+        'Train_PosRatio':  split_stats.get('train', {}).get('positive_ratio'),
+        'Val_PosRatio':    split_stats.get('val', {}).get('positive_ratio'),
+        'Test_PosRatio':   split_stats.get('test', {}).get('positive_ratio'),
+        'Train_Accuracy':  train_m.get('accuracy'),
+        'Train_AUROC':     train_m.get('auroc'),
+        'Train_F1':        train_m.get('f1'),
+        'Train_Precision': train_m.get('precision'),
+        'Train_Recall':    train_m.get('recall'),
+        'Val_Accuracy':    val_m.get('accuracy'),
+        'Val_AUROC':       val_m.get('auroc'),
+        'Val_F1':          val_m.get('f1'),
+        'Val_Precision':   val_m.get('precision'),
+        'Val_Recall':      val_m.get('recall'),
+        'Test_Accuracy':   test_m.get('accuracy'),
+        'Test_F1':         test_m.get('f1'),
+        'Test_AUROC':      test_m.get('auroc'),
+        'Test_Precision':  test_m.get('precision'),
+        'Test_Recall':     test_m.get('recall'),
+        'Best_Epoch':      training.get('best_epoch'),
+        'Early_Stopped':   training.get('early_stopped'),
+        'Seed_Count':      budget.get('seed_count'),
+        'HPO_Best_AUROC':  hpo.get('best_value'),
+        'HPO_Planned_Trials': budget.get('planned_hpo_trials'),
+        'HPO_Completed_Trials': budget.get('completed_hpo_trials'),
+        'Configured_Max_Epochs': budget.get('max_epochs_per_run'),
+        'Configured_Default_Batch_Size': budget.get('default_batch_size'),
+        'Selected_Batch_Size': training.get('batch_size'),
+        'Selected_LR':     training.get('lr'),
+        'Total_Wall_S':    runtime.get('total_wall_s'),
+        'HPO_Wall_S':      runtime.get('hpo_wall_s'),
+        'Train_Wall_S':    runtime.get('train_wall_s'),
+        'Eval_Wall_S':     runtime.get('eval_wall_s'),
+        'Train_GPU_Hours': runtime.get('train_gpu_hours'),
+        'Eval_GPU_Hours':  runtime.get('eval_gpu_hours'),
+        'Total_GPU_Hours': runtime.get('total_gpu_hours'),
+        'Device_Name':     hardware.get('device_name'),
+        'GPU_Model':       hardware.get('gpu_model'),
+        'GPU_Count':       hardware.get('gpu_count'),
+        'GPU_Total_VRAM_GB': hardware.get('gpu_total_vram_gb'),
+        'CPU_Model':       hardware.get('cpu_model'),
+        'RAM_GB':          hardware.get('ram_gb'),
+        'Peak_GPU_MB':     runtime.get('peak_gpu_memory_mb'),
+        'Peak_CPU_MB':     runtime.get('peak_cpu_memory_mb'),
+        'Param_Count':     model_stats.get('parameter_count'),
+        'Trainable_Param_Count': model_stats.get('trainable_parameter_count'),
+        'Artifact_Size_MB': model_stats.get('artifact_size_mb'),
+        'Inference_Batch_Size': infer.get('batch_size'),
+        'Inference_Latency_MS': infer.get('per_batch_latency_ms'),
+        'Inference_Throughput_SPS': infer.get('throughput_samples_per_s'),
+        'FLOPs':           model_stats.get('flops'),
+        'MACs':            model_stats.get('macs'),
+        'Energy_KWh':      sustainability.get('energy_kwh'),
+        'Carbon_KgCO2eq':  sustainability.get('carbon_kg_co2eq'),
+        'Hparams_JSON':    json.dumps(best_hparams, default=str),
+        'Experiment_ID':   record.get('experiment_id'),
+    }
 
 
 def canonicalize_feature_name(name: str) -> str:
@@ -664,6 +821,16 @@ def main():
         out_path = Path(args.output)
         records_dir = str(out_path.parent / 'records')
         rows = []
+        existing_rows_by_plan = {}
+        if out_path.exists():
+            existing_df = pd.read_csv(out_path)
+            for _, row in existing_df.iterrows():
+                key = _plan_key(
+                    str(row['Train_Datasets']).split('+'),
+                    str(row['Test_Dataset']),
+                    int(row['Seed']),
+                )
+                existing_rows_by_plan[key] = row.to_dict()
         print(
             f'\nRunning {len(plans)} cross-dataset experiments with {len(common_features)} common features '
             f'(val_ratio={args.val_ratio}, hpo_trials={args.hpo_trials})...'
@@ -673,6 +840,16 @@ def main():
                 args_for_seed = copy.copy(args)
                 args_for_seed.seed = seed
                 print(f'[{i}/{len(plans)}] Train={"+".join(train_ds)} -> Test={test_ds} | seed={seed}')
+                plan = _plan_key(train_ds, test_ds, seed)
+                if plan in existing_rows_by_plan:
+                    print('  Skip: output row already exists')
+                    rows.append(existing_rows_by_plan[plan])
+                    continue
+                record_path = _find_existing_record(records_dir, args.model, args.label, train_ds, test_ds, seed)
+                if record_path is not None:
+                    print('  Skip: record already exists')
+                    rows.append(_row_from_record_path(record_path))
+                    continue
                 row = _run_experiment(args_for_seed, aligned, common_features, args.label, train_ds, test_ds, records_dir, seeds)
                 rows.append(row)
                 print(

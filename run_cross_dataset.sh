@@ -24,10 +24,13 @@ COMMON_LABELS=("arousal" "disturbance" "valence" "stress_binary")
 
 BASELINES=("XGB" "LGB" "MLP" "ResNet")
 TABULAR_DL=("TabNet" "SAINT" "TabTransformer" "FTTransformer" "DCN")
-DG_MODELS=("ERM_DG" "IRM" "VREx" "GroupDRO" "MixStyle" "MLDG" "MASF" "Fish" "CSD" "SagNet")
-DA_MODELS=("DANN" "CDAN" "DAN" "DeepCORAL" "MCC" "ADDA" "MCD" "JAN" "SHOT" "CBST" "CGDM")
+DG_MODELS=("IRM" "VREx" "GroupDRO" "MixStyle" "MLDG" "Fish" "CSD" "SagNet")
+DA_MODELS=("DANN" "CDAN" "DAN" "DeepCORAL" "MCC" "ADDA" "MCD" "JAN" "SHOT" "CBST")
 
 mkdir -p "$OUTPUT_DIR" "$FEATURE_DIR"
+
+RECORDS_DIR="${RECORDS_DIR:-$OUTPUT_DIR/records}"
+mkdir -p "$RECORDS_DIR"
 
 in_list() {
     local needle="$1"
@@ -100,6 +103,94 @@ sys.exit(0 if rows >= expected_rows and len(settings) >= expected_settings and l
 PY
 }
 
+is_complete_records() {
+    local label="$1"
+    local model="$2"
+    local backbone="$3"
+    local records_dir="$4"
+
+    [ -d "$records_dir" ] || return 1
+
+    "$PYTHON_BIN" - "$records_dir" "$label" "$model" "$backbone" "$RUN_SETTING" "${SEED_LIST[@]}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+records_dir, label, model, backbone, run_setting, *seed_args = sys.argv[1:]
+expected_seeds = {str(int(seed)) for seed in seed_args}
+
+if run_setting == "two_to_one":
+    expected_pairs = {
+        ("D-1+D-3", "D-2"),
+        ("D-1+D-2", "D-3"),
+        ("D-2+D-3", "D-1"),
+    }
+elif run_setting == "one_to_one":
+    expected_pairs = {
+        ("D-1", "D-2"),
+        ("D-3", "D-2"),
+        ("D-1", "D-3"),
+        ("D-2", "D-3"),
+        ("D-2", "D-1"),
+        ("D-3", "D-1"),
+    }
+elif run_setting == "all":
+    expected_pairs = {
+        ("D-1+D-3", "D-2"),
+        ("D-1+D-2", "D-3"),
+        ("D-2+D-3", "D-1"),
+        ("D-1", "D-2"),
+        ("D-3", "D-2"),
+        ("D-1", "D-3"),
+        ("D-2", "D-3"),
+        ("D-2", "D-1"),
+        ("D-3", "D-1"),
+    }
+else:
+    sys.exit(1)
+
+seen = set()
+for path in Path(records_dir).glob("*.json"):
+    try:
+        with path.open() as f:
+            record = json.load(f)
+    except Exception:
+        continue
+
+    setting = record.get("setting", {})
+    if setting.get("label") != label:
+        continue
+    if setting.get("model") != model:
+        continue
+    if (setting.get("backbone") or "MLP") != backbone:
+        continue
+
+    train_datasets = setting.get("train_datasets") or []
+    test_dataset = setting.get("test_dataset")
+    seed = setting.get("seed")
+    pair = ("+".join(train_datasets), test_dataset)
+    if pair not in expected_pairs:
+        continue
+    if seed is None:
+        continue
+
+    runtime = record.get("runtime", {})
+    total_wall_s = runtime.get("total_wall_s")
+    if total_wall_s is None:
+        continue
+
+    seen.add((pair[0], pair[1], str(int(seed))))
+
+expected = {
+    (train_ds, test_ds, seed)
+    for (train_ds, test_ds) in expected_pairs
+    for seed in expected_seeds
+}
+
+sys.exit(0 if expected.issubset(seen) else 1)
+PY
+}
+
 analyze_label() {
     local label="$1"
     local feature_report="${FEATURE_DIR}/cross_dataset_feature_report_${label}.csv"
@@ -144,6 +235,11 @@ run_model() {
         return 0
     fi
 
+    if is_complete_records "$label" "$model" "$backbone" "$RECORDS_DIR"; then
+        echo "[SKIP RECORDS] label=$label model=$model backbone=$backbone"
+        return 0
+    fi
+
     if needs_eff "$model"; then
         cmd+=(--efficient_attention)
     fi
@@ -164,22 +260,22 @@ run_label_block() {
 
     analyze_label "$label"
 
-    for model in "${BASELINES[@]}"; do
-        run_model "$label" "$model" "MLP"
-    done
-    for model in "${TABULAR_DL[@]}"; do
-        run_model "$label" "$model" "MLP"
-    done
+    # for model in "${BASELINES[@]}"; do
+    #     run_model "$label" "$model" "MLP"
+    # done
+    # for model in "${TABULAR_DL[@]}"; do
+    #     run_model "$label" "$model" "MLP"
+    # done
     for model in "${DG_MODELS[@]}"; do
         for backbone in "${BACKBONE_LIST[@]}"; do
             run_model "$label" "$model" "$backbone"
         done
     done
-    for model in "${DA_MODELS[@]}"; do
-        for backbone in "${BACKBONE_LIST[@]}"; do
-            run_model "$label" "$model" "$backbone"
-        done
-    done
+    # for model in "${DA_MODELS[@]}"; do
+    #     for backbone in "${BACKBONE_LIST[@]}"; do
+    #         run_model "$label" "$model" "$backbone"
+    #     done
+    # done
 }
 
 echo "Starting cross-dataset benchmark driver..."
@@ -188,6 +284,7 @@ echo "HPO trials:  $HPO_TRIALS"
 echo "Seeds:       ${SEED_LIST[*]}"
 echo "Backbones:   ${BACKBONE_LIST[*]}"
 echo "Output dir:  $OUTPUT_DIR"
+echo "Records dir: $RECORDS_DIR"
 echo "Expected source-target settings per model: $(expected_settings)"
 
 for label in "${COMMON_LABELS[@]}"; do

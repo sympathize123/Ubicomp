@@ -1,4 +1,4 @@
-FIXED_BATCH_SIZE = 16
+FIXED_BATCH_SIZE = 1024
 
 
 def _zero_or_loguniform(trial, name, low, high):

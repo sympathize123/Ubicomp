@@ -23,9 +23,9 @@ read -r -a EXCLUDED_MODELS <<< "$EXCLUDED_MODELS_STR"
 COMMON_LABELS=("arousal" "disturbance" "valence" "stress_binary")
 
 BASELINES=("XGB" "LGB" "MLP" "ResNet")
-TABULAR_DL=("TabNet" "SAINT" "TabTransformer" "DCN")
+TABULAR_DL=("TabNet" "SAINT" "TabTransformer" "FTTransformer" "DCN")
 DG_MODELS=("IRM" "VREx" "GroupDRO" "MixStyle" "MLDG" "Fish" "CSD" "SagNet")
-DA_MODELS=("DeepCORAL" "MCC" "ADDA" "MCD" "JAN" "SHOT" "CBST")
+DA_MODELS=("DANN" "CDAN" "DAN")
 
 mkdir -p "$OUTPUT_DIR" "$FEATURE_DIR"
 
@@ -263,9 +263,9 @@ run_label_block() {
     # for model in "${BASELINES[@]}"; do
     #     run_model "$label" "$model" "MLP"
     # done
-    for model in "${TABULAR_DL[@]}"; do
-        run_model "$label" "$model" "MLP"
-    done
+    # for model in "${TABULAR_DL[@]}"; do
+    #     run_model "$label" "$model" "MLP"
+    # done
     # for model in "${DG_MODELS[@]}"; do
     #     for backbone in "${BACKBONE_LIST[@]}"; do
     #         run_model "$label" "$model" "$backbone"
